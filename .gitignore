@@ -1,0 +1,13 @@
+node_modules/
+
+.env
+
+*.log
+
+uploads/
+
+.vscode/
+
+.idea/
+
+*backup*
