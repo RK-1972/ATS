@@ -11,6 +11,7 @@ const { Pool } = require("pg");
 const Minio = require("minio");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const path = require("path");
 
 const app = express();
 
@@ -7370,6 +7371,14 @@ app.get(
 
 );
 
+app.get("/", (req, res) => {
+  res.sendFile(
+    path.join(
+      __dirname,
+      "../ATS-Frontend/dist/index.html"
+    )
+  );
+});
 
 // =====================================================
 // Start Server
