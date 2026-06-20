@@ -7371,13 +7371,30 @@ app.get(
 
 );
 
-app.get("/", (req, res) => {
+// =====================================================
+// Serve React Frontend
+// =====================================================
+
+app.use(
+  express.static(
+    path.join(
+      __dirname,
+      "../ATS-Frontend/dist"
+    )
+  )
+);
+
+app.get(/^\/(?!api).*/, (req, res) => {
+
   res.sendFile(
+
     path.join(
       __dirname,
       "../ATS-Frontend/dist/index.html"
     )
+
   );
+
 });
 
 // =====================================================
