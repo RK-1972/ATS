@@ -7659,7 +7659,7 @@ app.post(
 
         const resetLink =
 
-          `http://localhost:5173/reset-password/${resetToken}`;
+          `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
 
         await sendPasswordResetEmail(
 
@@ -7727,6 +7727,7 @@ app.post(
         new_password
 
       } = req.body;
+
 
       const tokenResult =
         await pool.query(
