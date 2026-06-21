@@ -12,6 +12,7 @@ const Minio = require("minio");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -4719,8 +4720,6 @@ app.get(
 // API 40 - Test Email
 // =====================================================
 
-const sendEmail =
-  require("./utils/emailService");
 
 app.get(
 
@@ -7397,6 +7396,504 @@ app.get(/^\/(?!api).*/, (req, res) => {
 
 });
 
+// =====================================================
+// Send Password Reset Email
+// =====================================================
+
+async function sendPasswordResetEmail(
+
+  userEmail,
+  userName,
+  resetLink
+
+) {
+
+  try {
+
+    const token =
+      await getGraphToken();
+
+    await axios.post(
+
+      `https://graph.microsoft.com/v1.0/users/${process.env.EMAIL_USER}/sendMail`,
+
+      {
+
+        message: {
+
+          subject:
+            "ATS Password Reset",
+
+          body: {
+
+            contentType: "HTML",
+
+            content: `
+
+              <p>Hello ${userName},</p>
+
+              <p>
+                A password reset request
+                was received for your ATS account.
+              </p>
+
+              <p>
+                Click the link below to reset your password:
+              </p>
+
+              <p>
+                <a href="${resetLink}">
+                  Reset Password
+                </a>
+              </p>
+
+              <p>
+                This link will expire in
+                30 minutes.
+              </p>
+
+              <p>
+                If you did not request
+                this change, please ignore
+                this email.
+              </p>
+
+              <br/>
+
+              <p>
+                Regards,<br/>
+                ATS Administration Team
+              </p>
+
+            `
+
+          },
+
+          toRecipients: [
+
+            {
+
+              emailAddress: {
+
+                address:
+                  userEmail
+
+              }
+
+            }
+
+          ]
+
+        },
+
+        saveToSentItems: true
+
+      },
+
+      {
+
+        headers: {
+
+          Authorization:
+            `Bearer ${token}`,
+
+          "Content-Type":
+            "application/json"
+
+        }
+
+      }
+
+    );
+
+    console.log(
+      `Password reset email sent to ${userEmail}`
+    );
+
+  }
+
+  catch (error) {
+
+    console.log(
+      "Password Reset Email Error"
+    );
+
+    console.log(
+
+      error?.response?.data ||
+
+      error.message
+
+    );
+
+    throw error;
+
+  }
+
+}
+
+// =====================================================
+// API 53 - Forgot Password
+// =====================================================
+
+app.post(
+
+  "/forgot-password",
+
+  async (req, res) => {
+
+    try {
+
+      const { email_id } =
+        req.body;
+
+      const userResult =
+        await pool.query(
+
+          `
+
+          SELECT
+
+            user_id,
+            full_name,
+            email_id
+
+          FROM user_mstr
+
+          WHERE LOWER(email_id) =
+                LOWER($1)
+
+          `,
+
+          [email_id]
+
+        );
+
+      if (
+        userResult.rows.length > 0
+      ) {
+
+        const user =
+          userResult.rows[0];
+
+          await pool.query(
+
+  `
+
+  UPDATE
+    password_reset_tokens
+
+  SET
+    is_used = true
+
+  WHERE
+    user_id = $1
+
+  AND
+    is_used = false
+
+  `,
+
+  [
+
+    user.user_id
+
+  ]
+
+);
+
+        const resetToken =
+
+          crypto
+            .randomBytes(32)
+            .toString("hex");
+
+        const expiresOn =
+
+          new Date(
+
+            Date.now() +
+
+            30 * 60 * 1000
+
+          );
+
+        await pool.query(
+
+          `
+
+          INSERT INTO
+          password_reset_tokens
+
+          (
+
+            user_id,
+            reset_token,
+            expires_on
+
+          )
+
+          VALUES
+
+          (
+
+            $1,
+            $2,
+            $3
+
+          )
+
+          `,
+
+          [
+
+            user.user_id,
+
+            resetToken,
+
+            expiresOn
+
+          ]
+
+        );
+
+        const resetLink =
+
+          `http://localhost:5173/reset-password/${resetToken}`;
+
+        await sendPasswordResetEmail(
+
+          user.email_id,
+
+          user.full_name,
+
+          resetLink
+
+        );
+
+      }
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+
+          "If the email is registered, a reset link has been sent."
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log(
+        "❌ Forgot Password Error"
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Error Processing Request"
+
+      });
+
+    }
+
+  }
+
+);
+
+
+// =====================================================
+// API 54 - Reset Password
+// =====================================================
+
+app.post(
+
+  "/reset-password",
+
+  async (req, res) => {
+
+    try {
+
+      const {
+
+        token,
+        new_password
+
+      } = req.body;
+
+      const tokenResult =
+        await pool.query(
+
+          `
+
+          SELECT
+
+            prt.*,
+            um.user_id
+
+          FROM password_reset_tokens prt
+
+          INNER JOIN user_mstr um
+
+            ON um.user_id =
+               prt.user_id
+
+          WHERE
+
+            prt.reset_token = $1
+
+            AND prt.is_used = false
+
+            AND prt.expires_on > NOW()
+
+          `,
+
+          [token]
+
+        );
+
+      if (
+        tokenResult.rows.length === 0
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Invalid or Expired Token"
+
+        });
+
+      }
+
+      const tokenData =
+        tokenResult.rows[0];
+
+      // ==========================
+// Password Validation
+// ==========================
+
+const passwordRegex =
+
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+
+if (
+
+  !passwordRegex.test(
+    new_password
+  )
+
+) {
+
+  return res.status(400).json({
+
+    success: false,
+
+    message:
+      "Password does not meet security requirements"
+
+  });
+
+}
+
+
+      const passwordHash =
+
+        await bcrypt.hash(
+
+          new_password,
+
+          10
+
+        );
+
+      await pool.query(
+
+        `
+
+        UPDATE user_mstr
+
+        SET
+
+          password_hash = $1,
+          updated_on = CURRENT_TIMESTAMP
+
+        WHERE user_id = $2
+
+        `,
+
+        [
+
+          passwordHash,
+          tokenData.user_id
+
+        ]
+
+      );
+
+      await pool.query(
+
+        `
+
+        UPDATE password_reset_tokens
+
+        SET
+
+          is_used = true
+
+        WHERE token_id = $1
+
+        `,
+
+        [
+
+          tokenData.token_id
+
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+          "Password Updated Successfully"
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log(
+        "❌ Reset Password Error"
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Error Resetting Password"
+
+      });
+
+    }
+
+  }
+
+);
 // =====================================================
 // Start Server
 // =====================================================
