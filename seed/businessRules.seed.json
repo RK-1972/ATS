@@ -1,0 +1,326 @@
+{
+  "meta": {
+    "org_name": "IGS Engineering Quality",
+    "last_published": "2026-06-22T09:15:00Z",
+    "environment": "Production"
+  },
+  "kpis": {
+    "total_rules": 10,
+    "active_rules": 8,
+    "draft_rules": 1,
+    "pending_approval_rules": 1
+  },
+  "categories": [
+    { "key": "recruitment", "label": "Recruitment", "rule_count": 2 },
+    { "key": "requisition", "label": "Requisition", "rule_count": 2 },
+    { "key": "interview", "label": "Interview", "rule_count": 2 },
+    { "key": "offer", "label": "Offer", "rule_count": 2 },
+    { "key": "vendor", "label": "Vendor", "rule_count": 1 },
+    { "key": "budget", "label": "Budget", "rule_count": 1 },
+    { "key": "notifications", "label": "Notifications", "rule_count": 0 },
+    { "key": "ai", "label": "AI", "rule_count": 0 }
+  ],
+  "rules": [
+    {
+      "id": "rule-001",
+      "rule_code": "OFFER_ABOVE_BUDGET",
+      "name": "Offer Above Budget",
+      "description": "Route offers exceeding approved budget through exception workflow.",
+      "category": "Budget",
+      "priority": "High",
+      "status": "Active",
+      "last_modified": "2026-06-20T11:30:00Z",
+      "version": "2.1",
+      "trigger_event": "Offer CTC Updated",
+      "conditions": ["Offered CTC > Approved Budget by 10%"],
+      "actions": [
+        "Start Budget Exception Workflow",
+        "Assign Finance Approver",
+        "Notify TA Lead"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-002",
+      "rule_code": "DUPLICATE_CANDIDATE_DETECTION",
+      "name": "Duplicate Candidate Detection",
+      "description": "Detect duplicate profiles by email, phone, or PAN.",
+      "category": "Recruitment",
+      "priority": "Medium",
+      "status": "Active",
+      "last_modified": "2026-06-18T14:00:00Z",
+      "version": "1.4",
+      "trigger_event": "Candidate Created",
+      "conditions": [
+        "Email matches existing candidate",
+        "OR Phone matches existing candidate"
+      ],
+      "actions": [
+        "Flag as duplicate",
+        "Notify assigned recruiter",
+        "Block pipeline advance"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-003",
+      "rule_code": "MANDATORY_L2_INTERVIEW",
+      "name": "Mandatory L2 Interview",
+      "description": "Require L2 interview for all G8+ grade requisitions.",
+      "category": "Interview",
+      "priority": "High",
+      "status": "Active",
+      "last_modified": "2026-06-15T09:45:00Z",
+      "version": "1.0",
+      "trigger_event": "Stage Transition Requested",
+      "conditions": [
+        "Target stage = Client Interview",
+        "Grade >= G8",
+        "L2 interview not completed"
+      ],
+      "actions": [
+        "Block stage transition",
+        "Schedule L2 interview",
+        "Notify TA Lead"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-004",
+      "rule_code": "VENDOR_SLA_ESCALATION",
+      "name": "Vendor SLA Escalation",
+      "description": "Escalate vendor submissions pending beyond SLA.",
+      "category": "Vendor",
+      "priority": "Medium",
+      "status": "Active",
+      "last_modified": "2026-06-12T16:20:00Z",
+      "version": "1.2",
+      "trigger_event": "Vendor Submission Pending",
+      "conditions": [
+        "Pending duration > 48 hours",
+        "Vendor tier = Preferred"
+      ],
+      "actions": [
+        "Escalate to Vendor Manager",
+        "Send SLA breach notification",
+        "Log compliance event"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-005",
+      "rule_code": "AUTO_REJECT_INACTIVE_CANDIDATE",
+      "name": "Auto Reject Inactive Candidate",
+      "description": "Automatically reject candidates inactive beyond threshold.",
+      "category": "Recruitment",
+      "priority": "Low",
+      "status": "Draft",
+      "last_modified": "2026-06-10T10:00:00Z",
+      "version": "0.3",
+      "trigger_event": "Scheduled Job — Daily",
+      "conditions": [
+        "No activity for 90 days",
+        "Stage not in Offer or Joined"
+      ],
+      "actions": [
+        "Move to Rejected",
+        "Send rejection notification",
+        "Archive candidate profile"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-006",
+      "rule_code": "AUTO_CLOSE_FILLED_REQUISITION",
+      "name": "Auto Close Filled Requisition",
+      "description": "Close requisition when all positions are filled.",
+      "category": "Requisition",
+      "priority": "Medium",
+      "status": "Active",
+      "last_modified": "2026-06-08T13:15:00Z",
+      "version": "1.1",
+      "trigger_event": "Candidate Joined",
+      "conditions": ["Filled positions >= Approved headcount"],
+      "actions": [
+        "Close requisition",
+        "Notify hiring manager",
+        "Release unfilled budget"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-007",
+      "rule_code": "INTERVIEW_FEEDBACK_REMINDER",
+      "name": "Interview Feedback Reminder",
+      "description": "Remind interviewers to submit feedback within SLA.",
+      "category": "Interview",
+      "priority": "Low",
+      "status": "Active",
+      "last_modified": "2026-06-05T08:30:00Z",
+      "version": "1.3",
+      "trigger_event": "Interview Completed",
+      "conditions": ["Feedback not submitted within 24 hours"],
+      "actions": [
+        "Send reminder to interviewer",
+        "Notify TA Lead after 48 hours",
+        "Escalate to Hiring Manager after 72 hours"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-008",
+      "rule_code": "OFFER_APPROVAL_BASED_ON_GRADE",
+      "name": "Offer Approval Based on Grade",
+      "description": "Dynamic approval chain based on candidate grade band.",
+      "category": "Offer",
+      "priority": "High",
+      "status": "Active",
+      "last_modified": "2026-06-01T15:00:00Z",
+      "version": "2.0",
+      "trigger_event": "Offer Submitted for Approval",
+      "conditions": ["Grade >= G10"],
+      "actions": [
+        "Require TA Lead approval",
+        "Require Finance approval for G12+",
+        "Notify TA Leader"
+      ],
+      "depends_on": ["rule-001"]
+    },
+    {
+      "id": "rule-009",
+      "rule_code": "LOCATION_BASED_HIRING_APPROVAL",
+      "name": "Location Based Hiring Approval",
+      "description": "Additional approval for hires in restricted locations.",
+      "category": "Requisition",
+      "priority": "Medium",
+      "status": "Pending Approval",
+      "last_modified": "2026-05-28T11:00:00Z",
+      "version": "0.9",
+      "trigger_event": "Requisition Submitted",
+      "conditions": [
+        "Location in restricted list",
+        "Headcount > 0"
+      ],
+      "actions": [
+        "Require HRBP approval",
+        "Notify Compliance team",
+        "Hold requisition until approved"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "rule-010",
+      "rule_code": "REFERRAL_BONUS_ELIGIBILITY",
+      "name": "Referral Bonus Eligibility",
+      "description": "Validate referral bonus eligibility at offer stage.",
+      "category": "Offer",
+      "priority": "Low",
+      "status": "Active",
+      "last_modified": "2026-05-25T09:00:00Z",
+      "version": "1.0",
+      "trigger_event": "Offer Released",
+      "conditions": [
+        "Candidate source = Employee Referral",
+        "Referrer still employed",
+        "Referral within 90-day window"
+      ],
+      "actions": [
+        "Mark referral eligible",
+        "Notify HR Operations",
+        "Queue bonus payout workflow"
+      ],
+      "depends_on": []
+    }
+  ],
+  "approval_matrix": [
+    {
+      "id": "am-001",
+      "department": "Engineering",
+      "grade": "G7",
+      "budget_limit_lpa": 10,
+      "required_approvers": ["Hiring Manager"],
+      "escalation": "TA Lead after 48h"
+    },
+    {
+      "id": "am-002",
+      "department": "Engineering",
+      "grade": "G10",
+      "budget_limit_lpa": 20,
+      "required_approvers": ["Hiring Manager", "TA Lead"],
+      "escalation": "TA Leader after 48h"
+    },
+    {
+      "id": "am-003",
+      "department": "Engineering",
+      "grade": "G12",
+      "budget_limit_lpa": 40,
+      "required_approvers": [
+        "Hiring Manager",
+        "TA Leader",
+        "Finance Director"
+      ],
+      "escalation": "CFO Office after 24h"
+    },
+    {
+      "id": "am-004",
+      "department": "Sales",
+      "grade": "G8",
+      "budget_limit_lpa": 12,
+      "required_approvers": ["Hiring Manager", "Sales Director"],
+      "escalation": "TA Lead after 48h"
+    },
+    {
+      "id": "am-005",
+      "department": "Operations",
+      "grade": "G6",
+      "budget_limit_lpa": 8,
+      "required_approvers": ["Hiring Manager"],
+      "escalation": "TA Lead after 72h"
+    },
+    {
+      "id": "am-006",
+      "department": "Finance",
+      "grade": "G11",
+      "budget_limit_lpa": 25,
+      "required_approvers": ["Hiring Manager", "Finance Director"],
+      "escalation": "CFO Office after 48h"
+    }
+  ],
+  "version_history": [
+    {
+      "id": "vh-001",
+      "version": "2.1",
+      "published_by": "Priya Sharma",
+      "date": "2026-06-22T09:15:00Z",
+      "description": "Added Offer Above Budget escalation policy"
+    },
+    {
+      "id": "vh-002",
+      "version": "2.0",
+      "published_by": "Rajesh Kumar",
+      "date": "2026-06-15T14:30:00Z",
+      "description": "Grade-based offer approval matrix update"
+    },
+    {
+      "id": "vh-003",
+      "version": "1.9",
+      "published_by": "Priya Sharma",
+      "date": "2026-06-08T11:00:00Z",
+      "description": "Interview feedback reminder SLA adjustment"
+    },
+    {
+      "id": "vh-004",
+      "version": "1.8",
+      "published_by": "Anita Desai",
+      "date": "2026-05-30T16:45:00Z",
+      "description": "Vendor SLA escalation thresholds"
+    },
+    {
+      "id": "vh-005",
+      "version": "1.7",
+      "published_by": "Rajesh Kumar",
+      "date": "2026-05-22T10:20:00Z",
+      "description": "Duplicate candidate detection rules"
+    }
+  ]
+}

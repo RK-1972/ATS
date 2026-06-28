@@ -1,0 +1,328 @@
+{
+  "meta": {
+    "org_name": "IGS Engineering Quality",
+    "last_published": "2026-06-22T10:00:00Z",
+    "environment": "Production"
+  },
+  "definitions": [
+    {
+      "workflow_code": "REQUISITION",
+      "workflow_key": "requisition",
+      "title": "Requisition Workflow",
+      "description": "Req lifecycle from draft to closed",
+      "enabled": true,
+      "status": "Published",
+      "version": "1.2",
+      "sla_hours": 48,
+      "stages": [
+        {
+          "stage_key": "draft",
+          "stage_name": "Draft",
+          "sequence_order": 1,
+          "is_approval_stage": false,
+          "sla_hours": 48
+        },
+        {
+          "stage_key": "ta_review",
+          "stage_name": "TA Review",
+          "sequence_order": 2,
+          "is_approval_stage": true,
+          "sla_hours": 48
+        },
+        {
+          "stage_key": "open",
+          "stage_name": "Open",
+          "sequence_order": 3,
+          "is_approval_stage": false,
+          "sla_hours": 48
+        },
+        {
+          "stage_key": "on_hold",
+          "stage_name": "On Hold",
+          "sequence_order": 4,
+          "is_approval_stage": false,
+          "sla_hours": 48
+        },
+        {
+          "stage_key": "closed",
+          "stage_name": "Closed",
+          "sequence_order": 5,
+          "is_approval_stage": false,
+          "sla_hours": 48
+        }
+      ],
+      "transitions": [
+        {
+          "from_stage_key": "draft",
+          "to_stage_key": "ta_review",
+          "action_name": "advance",
+          "requires_approval": true
+        },
+        {
+          "from_stage_key": "ta_review",
+          "to_stage_key": "open",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "open",
+          "to_stage_key": "on_hold",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "on_hold",
+          "to_stage_key": "closed",
+          "action_name": "advance",
+          "requires_approval": false
+        }
+      ]
+    },
+    {
+      "workflow_code": "CANDIDATE",
+      "workflow_key": "candidate",
+      "title": "Candidate Workflow",
+      "description": "Pipeline stage transitions",
+      "enabled": true,
+      "status": "Published",
+      "version": "2.0",
+      "sla_hours": 24,
+      "stages": [
+        {
+          "stage_key": "applied",
+          "stage_name": "Applied",
+          "sequence_order": 1,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "screening",
+          "stage_name": "Screening",
+          "sequence_order": 2,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "l1",
+          "stage_name": "L1",
+          "sequence_order": 3,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "l2",
+          "stage_name": "L2",
+          "sequence_order": 4,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "client",
+          "stage_name": "Client",
+          "sequence_order": 5,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "offer",
+          "stage_name": "Offer",
+          "sequence_order": 6,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "joined",
+          "stage_name": "Joined",
+          "sequence_order": 7,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        }
+      ],
+      "transitions": [
+        {
+          "from_stage_key": "applied",
+          "to_stage_key": "screening",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "screening",
+          "to_stage_key": "l1",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "l1",
+          "to_stage_key": "l2",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "l2",
+          "to_stage_key": "client",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "client",
+          "to_stage_key": "offer",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "offer",
+          "to_stage_key": "joined",
+          "action_name": "advance",
+          "requires_approval": false
+        }
+      ]
+    },
+    {
+      "workflow_code": "INTERVIEW",
+      "workflow_key": "interview",
+      "title": "Interview Workflow",
+      "description": "Schedule through feedback",
+      "enabled": true,
+      "status": "Published",
+      "version": "1.0",
+      "sla_hours": 72,
+      "stages": [
+        {
+          "stage_key": "requested",
+          "stage_name": "Requested",
+          "sequence_order": 1,
+          "is_approval_stage": false,
+          "sla_hours": 72
+        },
+        {
+          "stage_key": "scheduled",
+          "stage_name": "Scheduled",
+          "sequence_order": 2,
+          "is_approval_stage": false,
+          "sla_hours": 72
+        },
+        {
+          "stage_key": "completed",
+          "stage_name": "Completed",
+          "sequence_order": 3,
+          "is_approval_stage": false,
+          "sla_hours": 72
+        },
+        {
+          "stage_key": "feedback",
+          "stage_name": "Feedback",
+          "sequence_order": 4,
+          "is_approval_stage": false,
+          "sla_hours": 72
+        }
+      ],
+      "transitions": [
+        {
+          "from_stage_key": "requested",
+          "to_stage_key": "scheduled",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "scheduled",
+          "to_stage_key": "completed",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "completed",
+          "to_stage_key": "feedback",
+          "action_name": "advance",
+          "requires_approval": false
+        }
+      ]
+    },
+    {
+      "workflow_code": "OFFER",
+      "workflow_key": "offer",
+      "title": "Offer Workflow",
+      "description": "Offer approval and release",
+      "enabled": false,
+      "status": "Draft",
+      "version": "0.9",
+      "sla_hours": 24,
+      "stages": [
+        {
+          "stage_key": "draft",
+          "stage_name": "Draft",
+          "sequence_order": 1,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "hm_review",
+          "stage_name": "HM Review",
+          "sequence_order": 2,
+          "is_approval_stage": true,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "finance",
+          "stage_name": "Finance",
+          "sequence_order": 3,
+          "is_approval_stage": true,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "approved",
+          "stage_name": "Approved",
+          "sequence_order": 4,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        },
+        {
+          "stage_key": "released",
+          "stage_name": "Released",
+          "sequence_order": 5,
+          "is_approval_stage": false,
+          "sla_hours": 24
+        }
+      ],
+      "transitions": [
+        {
+          "from_stage_key": "draft",
+          "to_stage_key": "hm_review",
+          "action_name": "advance",
+          "requires_approval": true
+        },
+        {
+          "from_stage_key": "hm_review",
+          "to_stage_key": "finance",
+          "action_name": "advance",
+          "requires_approval": true
+        },
+        {
+          "from_stage_key": "finance",
+          "to_stage_key": "approved",
+          "action_name": "advance",
+          "requires_approval": false
+        },
+        {
+          "from_stage_key": "approved",
+          "to_stage_key": "released",
+          "action_name": "advance",
+          "requires_approval": false
+        }
+      ]
+    },
+    {
+      "workflow_code": "ENTERPRISE_HIRING_LIFECYCLE",
+      "workflow_key": "hiring_lifecycle",
+      "title": "Enterprise Hiring Lifecycle",
+      "description": "End-to-end orchestration across workforce, recruitment, and offer processes",
+      "enabled": true,
+      "status": "Published",
+      "version": "1.0",
+      "sla_hours": 48,
+      "category": "Enterprise",
+      "stages": [],
+      "transitions": []
+    }
+  ],
+  "primary_instance_id": "HCT-2026-00482"
+}

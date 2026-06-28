@@ -1,0 +1,81 @@
+{
+  "offers": [
+    {
+      "offer_id": "OFF-2026-00482",
+      "approved_position_id": "AP-2026-0076",
+      "requisition_code": "REQ-2026-1187",
+      "candidate_id": 42,
+      "mapping_id": 12,
+      "interview_id": "INT-2026-00482",
+      "recruiter_id": "Kavitha N.",
+      "hiring_manager": "Rajesh Kumar",
+      "candidate_name": "Ananya Reddy",
+      "position_title": "Senior Backend Engineer",
+      "grade": "L5",
+      "department": "Engineering",
+      "location": "Bangalore",
+      "business_unit": "Engineering",
+      "employment_type": "Full-time",
+      "approved_budget": 1800000,
+      "offered_ctc": 2100000,
+      "currency": "INR",
+      "offer_status": "Pending Approval",
+      "workflow_instance_id": "WF-OFF-2026-00482",
+      "validity_days": 7,
+      "valid_until": "2026-07-10",
+      "compensation": {
+        "base_salary": 1680000,
+        "variable_pay": 315000,
+        "bonus": 105000,
+        "benefits": 0
+      },
+      "approvals": [
+        {
+          "approval_step": "HM Review",
+          "approver_role": "Hiring Manager",
+          "approval_status": "Approved",
+          "sequence_order": 1
+        },
+        {
+          "approval_step": "Finance Approval",
+          "approver_role": "Finance Director",
+          "approver_name": "Anita Desai",
+          "approval_status": "Pending",
+          "sequence_order": 2
+        },
+        {
+          "approval_step": "Leadership Approval",
+          "approver_role": "TA Leader",
+          "approval_status": "Pending",
+          "sequence_order": 3
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "module": "Offer Management",
+      "task_type": "Finance Approval",
+      "title": "Finance Approval for offer OFF-2026-00482",
+      "status": "Pending",
+      "priority": "High",
+      "assignee": "Anita Desai",
+      "assignee_role": "Finance Director",
+      "sla_hours": 48,
+      "workflow_instance_id": "WF-OFF-2026-00482",
+      "business_object_type": "Offer",
+      "business_object_id": "OFF-2026-00482"
+    },
+    {
+      "module": "Offer Management",
+      "task_type": "Release Offer",
+      "title": "Release offer OFF-2026-00482 after approvals",
+      "status": "Pending",
+      "priority": "Normal",
+      "assignee_role": "Recruiter",
+      "sla_hours": 24,
+      "business_object_type": "Offer",
+      "business_object_id": "OFF-2026-00482"
+    }
+  ]
+}

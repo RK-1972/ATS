@@ -1,0 +1,892 @@
+{
+  "instance_id": "HCT-2026-00482",
+  "workflow_code": "ENTERPRISE_HIRING_LIFECYCLE",
+  "status": "Running",
+  "current_stage_key": "finance_approval",
+  "execution_context": {
+    "requisition": "REQ-2026-1187",
+    "candidate": "Ananya Reddy",
+    "department": "Engineering",
+    "grade": "G10",
+    "budget": {
+      "approved_budget_lpa": 18,
+      "offered_ctc_lpa": 21,
+      "variance_pct": 16.7,
+      "variance_threshold_pct": 10,
+      "status": "Exception Required",
+      "exception_workflow_triggered": true,
+      "finance_approval_required": true,
+      "leadership_approval_required": true,
+      "currency": "INR"
+    }
+  },
+  "instance_payload": {
+    "meta": {
+      "process_id": "HCT-2026-00482",
+      "position_title": "Senior Software Engineer",
+      "department": "Engineering",
+      "grade": "G10",
+      "requisition_id": "REQ-2026-1187",
+      "candidate_name": "Ananya Reddy",
+      "environment": "Production"
+    },
+    "integration_chain": [
+      {
+        "module": "Platform Configuration",
+        "config": "Recruitment · Offer · Budget modules active"
+      },
+      {
+        "module": "Business Rules Engine",
+        "config": "Offer Above Budget · Grade Approval"
+      },
+      {
+        "module": "Workflow Configuration",
+        "config": "Requisition v1.2 · Offer v0.9"
+      },
+      {
+        "module": "Budget Governance",
+        "config": "10% variance · Finance escalation"
+      },
+      {
+        "module": "Notifications",
+        "config": "Email · Teams · In-app"
+      },
+      {
+        "module": "AI Governance",
+        "config": "Advisory · 75% confidence threshold"
+      },
+      {
+        "module": "Recruitment",
+        "config": "7-stage pipeline active"
+      },
+      {
+        "module": "Offer Management",
+        "config": "3-step approval chain"
+      }
+    ],
+    "kpis": {
+      "active_hiring_processes": 24,
+      "pending_approvals": 6,
+      "clarification_requests": 2,
+      "budget_exceptions": 3,
+      "avg_approval_sla_hours": 18,
+      "avg_time_to_hire_days": 32,
+      "recruiter_workload": 8.4
+    },
+    "budget": {
+      "approved_budget_lpa": 18,
+      "offered_ctc_lpa": 21,
+      "variance_pct": 16.7,
+      "variance_threshold_pct": 10,
+      "status": "Exception Required",
+      "exception_workflow_triggered": true,
+      "finance_approval_required": true,
+      "leadership_approval_required": true,
+      "currency": "INR"
+    },
+    "stages": [
+      {
+        "key": "position_budget_approval",
+        "name": "Position & Budget Approval",
+        "status": "Completed",
+        "owner": "Rajesh Kumar",
+        "responsible_role": "Finance Director",
+        "sla_hours": 48,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": true,
+        "business_rules": [],
+        "workflow": "Workforce Planning — Budget Request",
+        "notifications": [
+          "Budget approved notification to TA Leader"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Approved by Leadership Team — Delivery Excellence sign-off"
+      },
+      {
+        "key": "approved_position",
+        "name": "Approved Position Catalogue",
+        "status": "Completed",
+        "owner": "System",
+        "responsible_role": "Workforce Planning",
+        "sla_hours": 0,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Position Catalogue Sync",
+        "notifications": [
+          "Catalogue entry created"
+        ],
+        "budget_validation": {
+          "approved_budget_lpa": 18,
+          "status": "Within Budget"
+        },
+        "ai_recommendations": [],
+        "audit_summary": "Position AP-ENG-042 added to approved catalogue"
+      },
+      {
+        "key": "requisition_raised",
+        "name": "Requisition Raised",
+        "status": "Completed",
+        "owner": "Vikram Mehta",
+        "responsible_role": "Hiring Manager",
+        "sla_hours": 24,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Location Based Hiring Approval"
+        ],
+        "workflow": "Requisition Workflow v1.2",
+        "notifications": [
+          "Requisition submitted to TA Leader"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Requisition REQ-2026-1187 raised against AP-ENG-042"
+      },
+      {
+        "key": "ta_leader_review",
+        "name": "TA Leader Review",
+        "status": "Completed",
+        "owner": "Priya Sharma",
+        "responsible_role": "TA Leader",
+        "sla_hours": 24,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": true,
+        "business_rules": [],
+        "workflow": "Requisition Workflow v1.2",
+        "notifications": [
+          "Clarification request to Hiring Manager",
+          "Approval notification on resubmit"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Requisition completeness score: 92%"
+        ],
+        "audit_summary": "1 clarification cycle completed — approved after resubmit"
+      },
+      {
+        "key": "approved_requisition",
+        "name": "Approved Requisition",
+        "status": "Completed",
+        "owner": "Priya Sharma",
+        "responsible_role": "TA Leader",
+        "sla_hours": 0,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Requisition Workflow v1.2",
+        "notifications": [
+          "Requisition approved — ready for recruiter assignment"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Requisition opened for recruitment"
+      },
+      {
+        "key": "recruiter_assigned",
+        "name": "Recruiter Assigned",
+        "status": "Completed",
+        "owner": "Priya Sharma",
+        "responsible_role": "TA Leader",
+        "sla_hours": 8,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Recruitment Assignment",
+        "notifications": [
+          "Recruiter assignment pending notification"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Suggested recruiter: Kavitha N. — 78% role match"
+        ],
+        "audit_summary": "Recruiter Kavitha N. assigned by TA Leader"
+      },
+      {
+        "key": "recruiter_notified",
+        "name": "Recruiter Notified",
+        "status": "Completed",
+        "owner": "System",
+        "responsible_role": "Notifications",
+        "sla_hours": 1,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Notification Orchestration",
+        "notifications": [
+          "Recruiter assignment — Email, Teams, In-app"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Multi-channel notification delivered to recruiter"
+      },
+      {
+        "key": "applied",
+        "name": "Applied",
+        "status": "Completed",
+        "owner": "Kavitha N.",
+        "responsible_role": "Recruiter",
+        "sla_hours": 0,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Duplicate Candidate Detection"
+        ],
+        "workflow": "Candidate Workflow v2.0",
+        "notifications": [],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Resume match score: 84%"
+        ],
+        "audit_summary": "Candidate Ananya Reddy applied — no duplicate detected"
+      },
+      {
+        "key": "screening",
+        "name": "Screening",
+        "status": "Completed",
+        "owner": "Kavitha N.",
+        "responsible_role": "Recruiter",
+        "sla_hours": 48,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Candidate Workflow v2.0",
+        "notifications": [
+          "Screening complete notification to HM"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Screening recommendation: Proceed to L1"
+        ],
+        "audit_summary": "Screening passed — advanced to L1"
+      },
+      {
+        "key": "l1",
+        "name": "L1 Interview",
+        "status": "Completed",
+        "owner": "Vikram Mehta",
+        "responsible_role": "Hiring Manager",
+        "sla_hours": 72,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Interview Workflow v1.0",
+        "notifications": [
+          "Interview feedback reminder sent"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "L1 feedback submitted — Strong Hire"
+      },
+      {
+        "key": "l2",
+        "name": "L2 Interview",
+        "status": "Completed",
+        "owner": "Technical Panel",
+        "responsible_role": "Interviewer",
+        "sla_hours": 72,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Mandatory L2 Interview"
+        ],
+        "workflow": "Interview Workflow v1.0",
+        "notifications": [
+          "Feedback submitted notification"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Interview question set generated"
+        ],
+        "audit_summary": "L2 completed — Hire recommendation"
+      },
+      {
+        "key": "client",
+        "name": "Client Interview",
+        "status": "Completed",
+        "owner": "Account Manager",
+        "responsible_role": "Hiring Manager",
+        "sla_hours": 96,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Candidate Workflow v2.0",
+        "notifications": [
+          "Client interview scheduled — Teams"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Client round cleared"
+      },
+      {
+        "key": "offer",
+        "name": "Offer",
+        "status": "Completed",
+        "owner": "Kavitha N.",
+        "responsible_role": "Recruiter",
+        "sla_hours": 24,
+        "sla_remaining_hours": 0,
+        "completion_pct": 100,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Offer Approval Based on Grade"
+        ],
+        "workflow": "Offer Workflow v0.9",
+        "notifications": [
+          "Offer draft created notification"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [
+          "Offer risk prediction: 72% acceptance"
+        ],
+        "audit_summary": "Offer drafted at 21 LPA for G10"
+      },
+      {
+        "key": "budget_validation",
+        "name": "Budget Validation",
+        "status": "In Progress",
+        "owner": "System",
+        "responsible_role": "Budget Governance",
+        "sla_hours": 24,
+        "sla_remaining_hours": 14,
+        "completion_pct": 45,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Offer Above Budget"
+        ],
+        "workflow": "Budget Exception Workflow",
+        "notifications": [
+          "Budget exception alert to Finance"
+        ],
+        "budget_validation": {
+          "approved_budget_lpa": 18,
+          "offered_ctc_lpa": 21,
+          "variance_pct": 16.7,
+          "status": "Exception Required"
+        },
+        "ai_recommendations": [
+          "Recommend negotiate to 19.5 LPA — within buffer"
+        ],
+        "audit_summary": "Variance 16.7% exceeds 10% threshold — exception triggered"
+      },
+      {
+        "key": "finance_approval",
+        "name": "Finance Approval",
+        "status": "In Progress",
+        "owner": "Anita Desai",
+        "responsible_role": "Finance Director",
+        "sla_hours": 48,
+        "sla_remaining_hours": 36,
+        "completion_pct": 20,
+        "is_approval_stage": true,
+        "business_rules": [
+          "Offer Above Budget"
+        ],
+        "workflow": "Budget Exception Workflow",
+        "notifications": [
+          "Finance approval request — Email, Teams"
+        ],
+        "budget_validation": {
+          "approved_budget_lpa": 18,
+          "offered_ctc_lpa": 21,
+          "variance_pct": 16.7,
+          "status": "Pending Finance"
+        },
+        "ai_recommendations": [],
+        "audit_summary": "Awaiting Finance Director approval for budget exception"
+      },
+      {
+        "key": "leadership_approval",
+        "name": "Leadership Approval",
+        "status": "Pending",
+        "owner": "Rajesh Kumar",
+        "responsible_role": "TA Leader / VP",
+        "sla_hours": 48,
+        "sla_remaining_hours": 48,
+        "completion_pct": 0,
+        "is_approval_stage": true,
+        "business_rules": [],
+        "workflow": "Budget Exception Workflow",
+        "notifications": [],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Required for offers exceeding 15% variance — G10+ grade"
+      },
+      {
+        "key": "release_offer",
+        "name": "Release Offer",
+        "status": "Pending",
+        "owner": "Kavitha N.",
+        "responsible_role": "Recruiter",
+        "sla_hours": 8,
+        "sla_remaining_hours": 8,
+        "completion_pct": 0,
+        "is_approval_stage": false,
+        "business_rules": [],
+        "workflow": "Offer Workflow v0.9",
+        "notifications": [
+          "Offer release notification template ready"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Pending all approvals before release"
+      },
+      {
+        "key": "joined",
+        "name": "Joined",
+        "status": "Pending",
+        "owner": "System",
+        "responsible_role": "Recruitment",
+        "sla_hours": 0,
+        "sla_remaining_hours": 0,
+        "completion_pct": 0,
+        "is_approval_stage": false,
+        "business_rules": [
+          "Auto Close Filled Requisition"
+        ],
+        "workflow": "Candidate Workflow v2.0",
+        "notifications": [
+          "Joining confirmation workflow ready"
+        ],
+        "budget_validation": null,
+        "ai_recommendations": [],
+        "audit_summary": "Final stage — triggers requisition auto-close"
+      }
+    ],
+    "timeline": [
+      {
+        "id": "tl-001",
+        "time": "2026-06-18T09:15:00Z",
+        "actor": "Rajesh Kumar",
+        "role": "Finance Director",
+        "action": "Approved Position & Budget",
+        "event_type": "approved",
+        "stage_key": "position_budget_approval"
+      },
+      {
+        "id": "tl-002",
+        "time": "2026-06-19T10:30:00Z",
+        "actor": "Vikram Mehta",
+        "role": "Hiring Manager",
+        "action": "Submitted Requisition",
+        "event_type": "submitted",
+        "stage_key": "requisition_raised"
+      },
+      {
+        "id": "tl-003",
+        "time": "2026-06-19T11:00:00Z",
+        "actor": "Priya Sharma",
+        "role": "TA Leader",
+        "action": "Requested Clarification",
+        "event_type": "clarification",
+        "comment": "Please confirm client billing rate and project duration.",
+        "stage_key": "ta_leader_review"
+      },
+      {
+        "id": "tl-004",
+        "time": "2026-06-19T14:30:00Z",
+        "actor": "Vikram Mehta",
+        "role": "Hiring Manager",
+        "action": "Clarification Submitted",
+        "event_type": "clarification",
+        "comment": "Billing rate confirmed at ₹2,400/hr. Project duration 18 months.",
+        "stage_key": "ta_leader_review"
+      },
+      {
+        "id": "tl-005",
+        "time": "2026-06-19T15:05:00Z",
+        "actor": "Priya Sharma",
+        "role": "TA Leader",
+        "action": "Approved Requisition",
+        "event_type": "approved",
+        "stage_key": "ta_leader_review"
+      },
+      {
+        "id": "tl-006",
+        "time": "2026-06-19T15:20:00Z",
+        "actor": "Priya Sharma",
+        "role": "TA Leader",
+        "action": "Recruiter Assigned — Kavitha N.",
+        "event_type": "assigned",
+        "stage_key": "recruiter_assigned"
+      },
+      {
+        "id": "tl-007",
+        "time": "2026-06-19T15:25:00Z",
+        "actor": "System",
+        "role": "Notifications",
+        "action": "Recruiter Notified — Email, Teams, In-app",
+        "event_type": "assigned",
+        "stage_key": "recruiter_notified"
+      },
+      {
+        "id": "tl-008",
+        "time": "2026-06-25T16:45:00Z",
+        "actor": "System",
+        "role": "Budget Governance",
+        "action": "Budget Exception Workflow Triggered — 16.7% variance",
+        "event_type": "escalated",
+        "stage_key": "budget_validation"
+      },
+      {
+        "id": "tl-009",
+        "time": "2026-06-25T16:50:00Z",
+        "actor": "System",
+        "role": "Business Rules Engine",
+        "action": "Rule triggered: Offer Above Budget",
+        "event_type": "escalated",
+        "stage_key": "budget_validation"
+      },
+      {
+        "id": "tl-010",
+        "time": "2026-06-25T17:00:00Z",
+        "actor": "Anita Desai",
+        "role": "Finance Director",
+        "action": "Finance approval pending",
+        "event_type": "submitted",
+        "stage_key": "finance_approval"
+      }
+    ],
+    "business_rule_details": {
+      "Offer Above Budget": {
+        "category": "Budget",
+        "trigger": "Offer CTC Updated",
+        "condition": "Offered CTC > Approved Budget by 10%",
+        "action": "Start Budget Exception Workflow"
+      },
+      "Offer Approval Based on Grade": {
+        "category": "Offer",
+        "trigger": "Offer Submitted for Approval",
+        "condition": "Grade >= G10",
+        "action": "Require TA Lead and Finance approval"
+      },
+      "Mandatory L2 Interview": {
+        "category": "Interview",
+        "trigger": "Stage Transition Requested",
+        "condition": "Grade >= G8 and L2 not completed",
+        "action": "Block transition and schedule L2"
+      },
+      "Duplicate Candidate Detection": {
+        "category": "Recruitment",
+        "trigger": "Candidate Created",
+        "condition": "Email or phone matches existing profile",
+        "action": "Flag duplicate and notify recruiter"
+      },
+      "Budget Threshold": {
+        "category": "Budget",
+        "trigger": "Budget Validation",
+        "condition": "Variance exceeds configured threshold",
+        "action": "Route to Finance approval chain"
+      },
+      "Leadership Approval": {
+        "category": "Budget",
+        "trigger": "Budget Exception",
+        "condition": "Variance > 15% for G10+ grades",
+        "action": "Require VP / TA Leader sign-off"
+      },
+      "Grade Approval": {
+        "category": "Offer",
+        "trigger": "Offer Submitted",
+        "condition": "Grade band G10–G12",
+        "action": "Dynamic approver matrix lookup"
+      },
+      "Internal Mobility": {
+        "category": "Recruitment",
+        "trigger": "Candidate Source Check",
+        "condition": "Source = Internal Transfer",
+        "action": "HRBP approval before offer"
+      },
+      "Auto Close Filled Requisition": {
+        "category": "Requisition",
+        "trigger": "Candidate Joined",
+        "condition": "Filled >= approved headcount",
+        "action": "Close requisition and release budget"
+      },
+      "Location Based Hiring Approval": {
+        "category": "Requisition",
+        "trigger": "Requisition Submitted",
+        "condition": "Location in restricted list",
+        "action": "Require HRBP and Compliance review"
+      }
+    },
+    "process_business_rules": [
+      "Budget Threshold",
+      "Leadership Approval",
+      "Offer Above Budget",
+      "Grade Approval",
+      "Internal Mobility"
+    ],
+    "budget_approval_path": [
+      {
+        "step": "Finance",
+        "status": "Running",
+        "owner": "Anita Desai"
+      },
+      {
+        "step": "Leadership",
+        "status": "Waiting",
+        "owner": "Rajesh Kumar"
+      },
+      {
+        "step": "Release",
+        "status": "Waiting",
+        "owner": "Kavitha N."
+      }
+    ],
+    "stage_notifications": {
+      "recruiter_notified": {
+        "title": "Recruiter Assignment",
+        "recipients": [
+          "Hiring Manager",
+          "Recruiter",
+          "TA Lead"
+        ],
+        "channels": [
+          {
+            "type": "Email",
+            "enabled": true,
+            "template": "recruiter-assignment-v2"
+          },
+          {
+            "type": "Teams",
+            "enabled": true,
+            "template": "recruiter-assignment-teams"
+          },
+          {
+            "type": "In-app",
+            "enabled": true,
+            "template": "recruiter-assignment-inapp"
+          },
+          {
+            "type": "SMS",
+            "enabled": false,
+            "template": null
+          }
+        ],
+        "deliveries": [
+          {
+            "recipient": "Vikram Mehta",
+            "role": "Hiring Manager",
+            "channel": "Email",
+            "template": "recruiter-assignment-v2",
+            "status": "Delivered",
+            "time": "2026-06-19T15:25:00Z"
+          },
+          {
+            "recipient": "Kavitha N.",
+            "role": "Recruiter",
+            "channel": "Teams",
+            "template": "recruiter-assignment-teams",
+            "status": "Delivered",
+            "time": "2026-06-19T15:25:00Z"
+          },
+          {
+            "recipient": "Kavitha N.",
+            "role": "Recruiter",
+            "channel": "In-app",
+            "template": "recruiter-assignment-inapp",
+            "status": "Read",
+            "time": "2026-06-19T15:26:00Z"
+          },
+          {
+            "recipient": "Priya Sharma",
+            "role": "TA Lead",
+            "channel": "Email",
+            "template": "recruiter-assignment-v2",
+            "status": "Delivered",
+            "time": "2026-06-19T15:25:00Z"
+          }
+        ]
+      },
+      "budget_validation": {
+        "title": "Budget Exception Alert",
+        "recipients": [
+          "Finance Director",
+          "TA Leader",
+          "Hiring Manager"
+        ],
+        "channels": [
+          {
+            "type": "Email",
+            "enabled": true,
+            "template": "budget-exception-v1"
+          },
+          {
+            "type": "Teams",
+            "enabled": true,
+            "template": "budget-exception-teams"
+          },
+          {
+            "type": "In-app",
+            "enabled": true,
+            "template": "budget-exception-inapp"
+          },
+          {
+            "type": "SMS",
+            "enabled": false,
+            "template": null
+          }
+        ],
+        "deliveries": [
+          {
+            "recipient": "Anita Desai",
+            "role": "Finance Director",
+            "channel": "Email",
+            "template": "budget-exception-v1",
+            "status": "Delivered",
+            "time": "2026-06-25T16:45:00Z"
+          },
+          {
+            "recipient": "Anita Desai",
+            "role": "Finance Director",
+            "channel": "Teams",
+            "template": "budget-exception-teams",
+            "status": "Delivered",
+            "time": "2026-06-25T16:45:00Z"
+          },
+          {
+            "recipient": "Priya Sharma",
+            "role": "TA Leader",
+            "channel": "In-app",
+            "template": "budget-exception-inapp",
+            "status": "Delivered",
+            "time": "2026-06-25T16:46:00Z"
+          },
+          {
+            "recipient": "Vikram Mehta",
+            "role": "Hiring Manager",
+            "channel": "Email",
+            "template": "budget-exception-v1",
+            "status": "Delivered",
+            "time": "2026-06-25T16:45:00Z"
+          }
+        ]
+      },
+      "finance_approval": {
+        "title": "Finance Approval Request",
+        "recipients": [
+          "Finance Director",
+          "TA Lead"
+        ],
+        "channels": [
+          {
+            "type": "Email",
+            "enabled": true,
+            "template": "finance-approval-v1"
+          },
+          {
+            "type": "Teams",
+            "enabled": true,
+            "template": "finance-approval-teams"
+          },
+          {
+            "type": "In-app",
+            "enabled": true,
+            "template": "finance-approval-inapp"
+          },
+          {
+            "type": "SMS",
+            "enabled": false,
+            "template": null
+          }
+        ],
+        "deliveries": [
+          {
+            "recipient": "Anita Desai",
+            "role": "Finance Director",
+            "channel": "Email",
+            "template": "finance-approval-v1",
+            "status": "Delivered",
+            "time": "2026-06-25T17:00:00Z"
+          },
+          {
+            "recipient": "Anita Desai",
+            "role": "Finance Director",
+            "channel": "In-app",
+            "template": "finance-approval-inapp",
+            "status": "Pending",
+            "time": "2026-06-25T17:00:00Z"
+          },
+          {
+            "recipient": "Priya Sharma",
+            "role": "TA Lead",
+            "channel": "Teams",
+            "template": "finance-approval-teams",
+            "status": "Delivered",
+            "time": "2026-06-25T17:00:00Z"
+          }
+        ]
+      },
+      "ta_leader_review": {
+        "title": "Requisition Review",
+        "recipients": [
+          "TA Leader",
+          "Hiring Manager"
+        ],
+        "channels": [
+          {
+            "type": "Email",
+            "enabled": true,
+            "template": "req-review-v1"
+          },
+          {
+            "type": "Teams",
+            "enabled": true,
+            "template": "req-review-teams"
+          },
+          {
+            "type": "In-app",
+            "enabled": true,
+            "template": "req-review-inapp"
+          },
+          {
+            "type": "SMS",
+            "enabled": false,
+            "template": null
+          }
+        ],
+        "deliveries": [
+          {
+            "recipient": "Priya Sharma",
+            "role": "TA Leader",
+            "channel": "Email",
+            "template": "req-review-v1",
+            "status": "Delivered",
+            "time": "2026-06-19T10:31:00Z"
+          },
+          {
+            "recipient": "Vikram Mehta",
+            "role": "Hiring Manager",
+            "channel": "In-app",
+            "template": "req-review-inapp",
+            "status": "Read",
+            "time": "2026-06-19T11:00:00Z"
+          },
+          {
+            "recipient": "Vikram Mehta",
+            "role": "Hiring Manager",
+            "channel": "Email",
+            "template": "req-review-v1",
+            "status": "Delivered",
+            "time": "2026-06-19T11:00:00Z"
+          }
+        ]
+      }
+    },
+    "linkedPositionId": "AP-ENG-042",
+    "linkedRequisitionId": "REQ-2026-1187"
+  }
+}

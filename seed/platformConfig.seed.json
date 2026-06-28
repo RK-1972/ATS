@@ -1,0 +1,366 @@
+{
+  "meta": {
+    "org_name": "IGS Engineering Quality",
+    "last_published": "2026-06-20T14:30:00Z",
+    "draft_changes": 0,
+    "environment": "Production"
+  },
+  "modules": [
+    {
+      "key": "recruitment",
+      "title": "Recruitment",
+      "description": "Core talent acquisition — candidates, pipeline, and recruiter workspaces.",
+      "enabled": true,
+      "required": true,
+      "config_summary": "7 pipeline stages · SLA 14d",
+      "policies": 4,
+      "settings": {
+        "default_stage": "Applied",
+        "sla_days": 14,
+        "allow_bulk_import": true
+      }
+    },
+    {
+      "key": "offer_management",
+      "title": "Offer Management",
+      "description": "Offer creation, approval chains, and release to candidates.",
+      "enabled": true,
+      "depends_on": "recruitment",
+      "config_summary": "3-step approval · Finance gate",
+      "policies": 3,
+      "settings": {
+        "require_finance_signoff": true,
+        "default_validity_days": 7
+      }
+    },
+    {
+      "key": "interview_management",
+      "title": "Interview Management",
+      "description": "Panel scheduling, Microsoft Teams meetings, and feedback collection.",
+      "enabled": true,
+      "depends_on": "recruitment",
+      "config_summary": "Teams integration · Feedback SLA 48h",
+      "policies": 2,
+      "settings": {
+        "auto_teams_link": true,
+        "feedback_reminder_hours": 24
+      }
+    },
+    {
+      "key": "vendor_portal",
+      "title": "Vendor Portal",
+      "description": "External staffing vendors submit and track candidates.",
+      "enabled": false,
+      "config_summary": "Not configured",
+      "policies": 0,
+      "settings": {
+        "max_submissions_per_req": 5,
+        "require_vendor_agreement": true
+      }
+    },
+    {
+      "key": "ai",
+      "title": "AI",
+      "description": "AI advisory features across matching, ranking, and pipeline insights.",
+      "enabled": false,
+      "config_summary": "Governance pending",
+      "policies": 1,
+      "settings": {
+        "advisory_only": true,
+        "log_all_requests": true
+      }
+    },
+    {
+      "key": "notifications",
+      "title": "Notifications",
+      "description": "Central notification orchestration across email, SMS, and in-app channels.",
+      "enabled": true,
+      "config_summary": "3 channels · Daily digest",
+      "policies": 2,
+      "settings": {
+        "digest_enabled": true,
+        "quiet_hours_enabled": true
+      }
+    },
+    {
+      "key": "employee_referral",
+      "title": "Employee Referral",
+      "description": "Internal referral tracking, rewards, and referral portal.",
+      "enabled": false,
+      "depends_on": "recruitment",
+      "config_summary": "Rewards policy draft",
+      "policies": 1,
+      "settings": {
+        "reward_payout_days": 90,
+        "max_referrals_per_employee": 10
+      }
+    },
+    {
+      "key": "campus_hiring",
+      "title": "Campus Hiring",
+      "description": "Campus-specific requisitions, bulk intake, and event workflows.",
+      "enabled": false,
+      "depends_on": "recruitment",
+      "config_summary": "Bulk intake disabled",
+      "policies": 0,
+      "settings": {
+        "bulk_upload_limit": 500,
+        "event_mode": false
+      }
+    }
+  ],
+  "workflows": [
+    {
+      "key": "requisition",
+      "title": "Requisition Workflow",
+      "description": "Req lifecycle from draft to closed",
+      "enabled": true,
+      "steps": 5,
+      "approvals": 2,
+      "status": "Published",
+      "version": "1.2",
+      "sla_hours": 48,
+      "stages": ["Draft", "TA Review", "Open", "On Hold", "Closed"],
+      "approval_stages": ["TA Review"]
+    },
+    {
+      "key": "candidate",
+      "title": "Candidate Workflow",
+      "description": "Pipeline stage transitions",
+      "enabled": true,
+      "steps": 7,
+      "approvals": 0,
+      "status": "Published",
+      "version": "2.0",
+      "sla_hours": 24,
+      "stages": ["Applied", "Screening", "L1", "L2", "Client", "Offer", "Joined"],
+      "approval_stages": []
+    },
+    {
+      "key": "interview",
+      "title": "Interview Workflow",
+      "description": "Schedule through feedback",
+      "enabled": true,
+      "steps": 4,
+      "approvals": 0,
+      "status": "Published",
+      "version": "1.0",
+      "sla_hours": 72,
+      "stages": ["Requested", "Scheduled", "Completed", "Feedback"],
+      "approval_stages": []
+    },
+    {
+      "key": "offer",
+      "title": "Offer Workflow",
+      "description": "Offer approval and release",
+      "enabled": false,
+      "steps": 5,
+      "approvals": 3,
+      "status": "Draft",
+      "version": "0.9",
+      "sla_hours": 24,
+      "stages": ["Draft", "HM Review", "Finance", "Approved", "Released"],
+      "approval_stages": ["HM Review", "Finance"]
+    }
+  ],
+  "budget": {
+    "budget_approval_required": true,
+    "allow_offer_above_budget": false,
+    "max_budget_variance_pct": 10,
+    "exception_workflow_enabled": true,
+    "approval_chain": ["Hiring Manager", "TA Lead", "Finance"],
+    "escalation_after_hours": 48,
+    "escalation_to": "TA Leader",
+    "auto_reject_above_pct": 25,
+    "default_currency": "INR",
+    "default_headcount_buffer_pct": 5,
+    "exception_approvers": ["Finance", "CFO Office"]
+  },
+  "notification_channels": [
+    {
+      "key": "email",
+      "title": "Email",
+      "description": "Microsoft Graph / SMTP",
+      "enabled": true,
+      "provider": "Microsoft Graph",
+      "template_count": 12,
+      "rate_limit_per_hour": 500
+    },
+    {
+      "key": "sms",
+      "title": "SMS",
+      "description": "Transactional SMS",
+      "enabled": false,
+      "provider": "Not configured",
+      "template_count": 0,
+      "rate_limit_per_hour": 100
+    },
+    {
+      "key": "whatsapp",
+      "title": "WhatsApp",
+      "description": "WhatsApp Business API",
+      "enabled": false,
+      "provider": "Not configured",
+      "template_count": 0,
+      "rate_limit_per_hour": 200
+    },
+    {
+      "key": "teams",
+      "title": "Microsoft Teams",
+      "description": "Teams notifications",
+      "enabled": true,
+      "provider": "Microsoft Graph",
+      "template_count": 6,
+      "rate_limit_per_hour": 300
+    },
+    {
+      "key": "in_app",
+      "title": "In-App",
+      "description": "Real-time in-product alerts",
+      "enabled": true,
+      "provider": "OPTALYNX",
+      "template_count": 8,
+      "rate_limit_per_hour": 1000
+    }
+  ],
+  "notification_settings": {
+    "digest_enabled": true,
+    "digest_frequency": "daily",
+    "digest_time": "08:00",
+    "quiet_hours_enabled": true,
+    "quiet_hours_start": "20:00",
+    "quiet_hours_end": "08:00",
+    "default_sender": "noreply@optalynx.com",
+    "retry_attempts": 3,
+    "escalation_on_failure": true
+  },
+  "ai_features": [
+    {
+      "key": "resume_matching",
+      "title": "Resume Matching",
+      "description": "Match score and gap analysis",
+      "enabled": false,
+      "confidence_min": 0.7,
+      "max_tokens": 2000
+    },
+    {
+      "key": "candidate_ranking",
+      "title": "Candidate Ranking",
+      "description": "Per-requisition ranked lists",
+      "enabled": false,
+      "confidence_min": 0.65,
+      "max_tokens": 1500
+    },
+    {
+      "key": "interview_questions",
+      "title": "Interview Questions",
+      "description": "Stage-aware question sets",
+      "enabled": false,
+      "confidence_min": 0.6,
+      "max_tokens": 1000
+    },
+    {
+      "key": "offer_risk",
+      "title": "Offer Risk Prediction",
+      "description": "Acceptance probability signals",
+      "enabled": false,
+      "confidence_min": 0.75,
+      "max_tokens": 800
+    }
+  ],
+  "ai_governance": {
+    "provider": "Azure OpenAI",
+    "model": "gpt-4.1",
+    "confidence_threshold": 0.75,
+    "monthly_token_limit": 500000,
+    "tokens_used": 128400,
+    "monthly_cost_cap_usd": 500,
+    "cost_mtd_usd": 142,
+    "audit_logging": true,
+    "pii_masking": true,
+    "require_human_confirmation": true,
+    "data_retention_days": 90
+  },
+  "role_visibility": {
+    "roles": [
+      "Admin",
+      "TA Leader",
+      "TA Lead",
+      "Recruiter",
+      "Hiring Manager",
+      "Interviewer"
+    ],
+    "modules": [
+      { "key": "recruitment", "label": "Recruitment" },
+      { "key": "offer_management", "label": "Offer Management" },
+      { "key": "interview_management", "label": "Interview Management" },
+      { "key": "vendor_portal", "label": "Vendor Portal" },
+      { "key": "ai", "label": "AI Insights" },
+      { "key": "notifications", "label": "Notifications" },
+      { "key": "employee_referral", "label": "Employee Referral" },
+      { "key": "campus_hiring", "label": "Campus Hiring" }
+    ],
+    "matrix": {
+      "Admin": {
+        "recruitment": true,
+        "offer_management": true,
+        "interview_management": true,
+        "vendor_portal": true,
+        "ai": true,
+        "notifications": true,
+        "employee_referral": true,
+        "campus_hiring": true
+      },
+      "TA Leader": {
+        "recruitment": true,
+        "offer_management": true,
+        "interview_management": true,
+        "vendor_portal": true,
+        "ai": true,
+        "notifications": true,
+        "employee_referral": true,
+        "campus_hiring": true
+      },
+      "TA Lead": {
+        "recruitment": true,
+        "offer_management": true,
+        "interview_management": true,
+        "vendor_portal": false,
+        "ai": true,
+        "notifications": true,
+        "employee_referral": true,
+        "campus_hiring": false
+      },
+      "Recruiter": {
+        "recruitment": true,
+        "offer_management": false,
+        "interview_management": true,
+        "vendor_portal": false,
+        "ai": true,
+        "notifications": true,
+        "employee_referral": true,
+        "campus_hiring": false
+      },
+      "Hiring Manager": {
+        "recruitment": true,
+        "offer_management": true,
+        "interview_management": true,
+        "vendor_portal": false,
+        "ai": false,
+        "notifications": true,
+        "employee_referral": false,
+        "campus_hiring": false
+      },
+      "Interviewer": {
+        "recruitment": false,
+        "offer_management": false,
+        "interview_management": true,
+        "vendor_portal": false,
+        "ai": false,
+        "notifications": true,
+        "employee_referral": false,
+        "campus_hiring": false
+      }
+    }
+  }
+}

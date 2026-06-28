@@ -11,3 +11,5 @@ uploads/
 .idea/
 
 *backup*
+migration/
+*.bundle

@@ -1,0 +1,46 @@
+{
+  "interviews": [
+    {
+      "interview_id": "INT-2026-00482",
+      "schedule_id": 482,
+      "map_id": 12,
+      "req_id": 1187,
+      "requisition_code": "REQ-2026-1187",
+      "candidate_id": 42,
+      "round_no": 1,
+      "round_type": "L1 Technical",
+      "interview_date": "2026-07-02",
+      "interview_time": "10:30:00",
+      "interview_status": "Scheduled",
+      "workflow_instance_id": "WF-INT-2026-00482",
+      "meeting_link": "https://teams.microsoft.com/l/meetup-join/example",
+      "feedback_submitted": false
+    }
+  ],
+  "tasks": [
+    {
+      "module": "Interview Management",
+      "task_type": "Accept Interview Assignment",
+      "title": "Accept L1 Technical interview assignment",
+      "status": "Pending",
+      "priority": "High",
+      "assignee": "Kavitha N.",
+      "assignee_role": "Interviewer",
+      "sla_hours": 8,
+      "workflow_instance_id": "WF-INT-2026-00482",
+      "business_object_type": "Interview",
+      "business_object_id": "INT-2026-00482"
+    },
+    {
+      "module": "Recruitment Management",
+      "task_type": "Review Requisition",
+      "title": "Review requisition REQ-2026-1187",
+      "status": "Pending",
+      "priority": "Normal",
+      "assignee_role": "TA Leader",
+      "sla_hours": 24,
+      "business_object_type": "Requisition",
+      "business_object_id": "REQ-2026-1187"
+    }
+  ]
+}

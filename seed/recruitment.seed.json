@@ -1,0 +1,26 @@
+{
+  "requisitions": [
+    {
+      "requisition_code": "REQ-2026-1187",
+      "approved_position_id": "AP-2026-0076",
+      "position_title": "Senior Backend Engineer",
+      "grade": "L5",
+      "department": "Engineering",
+      "business_unit": "Engineering",
+      "location": "Bangalore",
+      "budget_approved": 2200000,
+      "hiring_manager": "Rajesh Kumar",
+      "employment_type": "Full-time",
+      "headcount": 2,
+      "primary_skill": "Java",
+      "req_status": "Open",
+      "workflow_instance_id": "HCT-2026-00482"
+    }
+  ],
+  "recruiter_assignments": [
+    {
+      "requisition_code": "REQ-2026-1187",
+      "recruiter_code": "EMP-1042"
+    }
+  ]
+}

@@ -1,0 +1,388 @@
+{
+  "meta": {
+    "fiscal_year": "FY 2026–27",
+    "org_name": "IGS Engineering Quality",
+    "currency": "INR",
+    "last_updated": "2026-06-26T09:00:00Z"
+  },
+  "dashboard": {
+    "approved_headcount": 142,
+    "filled_positions": 118,
+    "vacant_positions": 24,
+    "budget_utilization_pct": 78,
+    "total_approved_budget": 48500000,
+    "budget_consumed": 37830000,
+    "upcoming_hiring": [
+      {
+        "id": "UH-001",
+        "department": "Engineering",
+        "position": "Senior DevOps Engineer",
+        "headcount": 2,
+        "target_date": "2026-07-15",
+        "budget": 2400000
+      },
+      {
+        "id": "UH-002",
+        "department": "Quality Assurance",
+        "position": "QA Lead",
+        "headcount": 1,
+        "target_date": "2026-07-30",
+        "budget": 1100000
+      },
+      {
+        "id": "UH-003",
+        "department": "Delivery",
+        "position": "Project Manager",
+        "headcount": 1,
+        "target_date": "2026-08-10",
+        "budget": 1350000
+      }
+    ],
+    "budget_exceptions_summary": [
+      {
+        "id": "EX-001",
+        "position": "Principal Architect",
+        "variance_pct": 12,
+        "status": "Pending Finance"
+      },
+      {
+        "id": "EX-002",
+        "position": "Technical Lead",
+        "variance_pct": 8,
+        "status": "Approved"
+      }
+    ]
+  },
+  "budget_requests": [
+    {
+      "id": "BR-2026-0142",
+      "department": "Engineering",
+      "position": "Senior DevOps Engineer",
+      "grade": "L5",
+      "headcount": 2,
+      "proposed_budget": 2400000,
+      "justification": "Cloud migration programme requires dedicated DevOps capacity for Q3 delivery milestones.",
+      "status": "Pending TA Lead",
+      "submitted_by": "Rajesh Kumar",
+      "submitted_on": "2026-06-22",
+      "priority": "High"
+    },
+    {
+      "id": "BR-2026-0138",
+      "department": "Quality Assurance",
+      "position": "Automation Engineer",
+      "grade": "L4",
+      "headcount": 3,
+      "proposed_budget": 2700000,
+      "justification": "Expand automation coverage for client delivery — current team at 140% utilization.",
+      "status": "Pending Finance",
+      "submitted_by": "Priya Sharma",
+      "submitted_on": "2026-06-18",
+      "priority": "Medium"
+    },
+    {
+      "id": "BR-2026-0129",
+      "department": "Delivery",
+      "position": "Project Manager",
+      "grade": "L5",
+      "headcount": 1,
+      "proposed_budget": 1350000,
+      "justification": "New Globex account onboarding — dedicated PM required for first 6 months.",
+      "status": "Approved",
+      "submitted_by": "Amit Verma",
+      "submitted_on": "2026-06-10",
+      "priority": "High"
+    },
+    {
+      "id": "BR-2026-0115",
+      "department": "Engineering",
+      "position": "Full Stack Developer",
+      "grade": "L3",
+      "headcount": 4,
+      "proposed_budget": 3200000,
+      "justification": "Backfill for attrition and bench reduction on Acme engagement.",
+      "status": "Sent Back",
+      "submitted_by": "Rajesh Kumar",
+      "submitted_on": "2026-06-05",
+      "priority": "Medium"
+    },
+    {
+      "id": "BR-2026-0098",
+      "department": "HR",
+      "position": "TA Coordinator",
+      "grade": "L2",
+      "headcount": 1,
+      "proposed_budget": 650000,
+      "justification": "Support campus hiring drive in Q3.",
+      "status": "Rejected",
+      "submitted_by": "Neha Gupta",
+      "submitted_on": "2026-05-28",
+      "priority": "Low"
+    }
+  ],
+  "approval_queue": [
+    {
+      "id": "BR-2026-0142",
+      "department": "Engineering",
+      "position": "Senior DevOps Engineer",
+      "grade": "L5",
+      "headcount": 2,
+      "proposed_budget": 2400000,
+      "justification": "Cloud migration programme requires dedicated DevOps capacity for Q3 delivery milestones.",
+      "status": "Pending TA Lead",
+      "submitted_by": "Rajesh Kumar",
+      "submitted_on": "2026-06-22",
+      "current_approver": "TA Lead",
+      "timeline": [
+        {
+          "step": "Submitted",
+          "actor": "Rajesh Kumar",
+          "date": "2026-06-22T10:30:00",
+          "comment": "Urgent for Q3 cloud migration."
+        }
+      ],
+      "history": []
+    },
+    {
+      "id": "BR-2026-0138",
+      "department": "Quality Assurance",
+      "position": "Automation Engineer",
+      "grade": "L4",
+      "headcount": 3,
+      "proposed_budget": 2700000,
+      "justification": "Expand automation coverage for client delivery.",
+      "status": "Pending Finance",
+      "submitted_by": "Priya Sharma",
+      "submitted_on": "2026-06-18",
+      "current_approver": "Finance",
+      "timeline": [
+        {
+          "step": "Submitted",
+          "actor": "Priya Sharma",
+          "date": "2026-06-18T09:00:00",
+          "comment": null
+        },
+        {
+          "step": "Approved by TA Lead",
+          "actor": "Sanjay Mehta",
+          "date": "2026-06-20T14:15:00",
+          "comment": "Aligned with QA roadmap. Proceed to Finance."
+        }
+      ],
+      "history": [
+        {
+          "action": "Approved",
+          "actor": "Sanjay Mehta (TA Lead)",
+          "date": "2026-06-20T14:15:00",
+          "comment": "Aligned with QA roadmap."
+        }
+      ]
+    },
+    {
+      "id": "BR-2026-0115",
+      "department": "Engineering",
+      "position": "Full Stack Developer",
+      "grade": "L3",
+      "headcount": 4,
+      "proposed_budget": 3200000,
+      "justification": "Backfill for attrition on Acme engagement.",
+      "status": "Sent Back",
+      "submitted_by": "Rajesh Kumar",
+      "submitted_on": "2026-06-05",
+      "current_approver": "Hiring Manager",
+      "timeline": [
+        {
+          "step": "Submitted",
+          "actor": "Rajesh Kumar",
+          "date": "2026-06-05T11:00:00",
+          "comment": null
+        },
+        {
+          "step": "Sent Back",
+          "actor": "Sanjay Mehta",
+          "date": "2026-06-08T16:30:00",
+          "comment": "Reduce headcount to 2 or provide Acme SOW reference."
+        }
+      ],
+      "history": [
+        {
+          "action": "Sent Back",
+          "actor": "Sanjay Mehta (TA Lead)",
+          "date": "2026-06-08T16:30:00",
+          "comment": "Reduce headcount to 2 or provide Acme SOW reference."
+        }
+      ]
+    }
+  ],
+  "approved_positions": [
+    {
+      "id": "AP-2026-0089",
+      "department": "Delivery",
+      "position": "Project Manager",
+      "grade": "L5",
+      "headcount": 1,
+      "budget_approved": 1350000,
+      "budget_consumed": 0,
+      "remaining_budget": 1350000,
+      "expiry_date": "2026-12-31",
+      "requisitions_created": 0,
+      "status": "Active"
+    },
+    {
+      "id": "AP-2026-0076",
+      "department": "Engineering",
+      "position": "Senior Backend Engineer",
+      "grade": "L5",
+      "headcount": 2,
+      "budget_approved": 2200000,
+      "budget_consumed": 1100000,
+      "remaining_budget": 1100000,
+      "expiry_date": "2026-09-30",
+      "requisitions_created": 1,
+      "status": "Active"
+    },
+    {
+      "id": "AP-2026-0062",
+      "department": "Quality Assurance",
+      "position": "QA Lead",
+      "grade": "L5",
+      "headcount": 1,
+      "budget_approved": 1100000,
+      "budget_consumed": 1100000,
+      "remaining_budget": 0,
+      "expiry_date": "2026-08-15",
+      "requisitions_created": 1,
+      "status": "Fully Utilized"
+    },
+    {
+      "id": "AP-2026-0054",
+      "department": "Engineering",
+      "position": "Data Engineer",
+      "grade": "L4",
+      "headcount": 1,
+      "budget_approved": 950000,
+      "budget_consumed": 0,
+      "remaining_budget": 950000,
+      "expiry_date": "2026-07-01",
+      "status": "Expiring Soon"
+    }
+  ],
+  "budget_exceptions": [
+    {
+      "id": "EX-2026-003",
+      "candidate_name": "Vikram Singh",
+      "position": "Principal Architect",
+      "department": "Engineering",
+      "approved_budget": 4500000,
+      "offered_ctc": 5040000,
+      "variance_amount": 540000,
+      "variance_pct": 12,
+      "workflow_status": "Pending Finance",
+      "approver": "CFO Office",
+      "comments": "Critical hire for enterprise architecture transformation.",
+      "req_code": "REQ-1088"
+    },
+    {
+      "id": "EX-2026-002",
+      "candidate_name": "Anita Desai",
+      "position": "Technical Lead",
+      "department": "Delivery",
+      "approved_budget": 1800000,
+      "offered_ctc": 1944000,
+      "variance_amount": 144000,
+      "variance_pct": 8,
+      "workflow_status": "Approved",
+      "approver": "Sanjay Mehta",
+      "comments": "Approved within exception policy — client billable from day one.",
+      "req_code": "REQ-1042"
+    },
+    {
+      "id": "EX-2026-001",
+      "candidate_name": "Rohit Menon",
+      "position": "Senior Consultant",
+      "department": "Consulting",
+      "approved_budget": 1600000,
+      "offered_ctc": 1760000,
+      "variance_amount": 160000,
+      "variance_pct": 10,
+      "workflow_status": "Rejected",
+      "approver": "Finance",
+      "comments": "Variance exceeds 8% threshold without client pass-through agreement.",
+      "req_code": "REQ-1012"
+    }
+  ],
+  "analytics": {
+    "budget_vs_actual": {
+      "approved": 48500000,
+      "actual": 37830000,
+      "forecast": 46200000
+    },
+    "savings": 4200000,
+    "overspend": 1850000,
+    "approval_sla_days": 4.2,
+    "department_utilization": [
+      {
+        "department": "Engineering",
+        "approved": 18500000,
+        "utilized": 15200000,
+        "pct": 82
+      },
+      {
+        "department": "Quality Assurance",
+        "approved": 8200000,
+        "utilized": 6100000,
+        "pct": 74
+      },
+      {
+        "department": "Delivery",
+        "approved": 9800000,
+        "utilized": 7900000,
+        "pct": 81
+      },
+      {
+        "department": "Consulting",
+        "approved": 6500000,
+        "utilized": 4830000,
+        "pct": 74
+      },
+      {
+        "department": "HR",
+        "approved": 4500000,
+        "utilized": 3800000,
+        "pct": 84
+      }
+    ],
+    "monthly_trend": [
+      {
+        "month": "Jan",
+        "budget": 3200000,
+        "actual": 2800000
+      },
+      {
+        "month": "Feb",
+        "budget": 3100000,
+        "actual": 2950000
+      },
+      {
+        "month": "Mar",
+        "budget": 3400000,
+        "actual": 3100000
+      },
+      {
+        "month": "Apr",
+        "budget": 3600000,
+        "actual": 3500000
+      },
+      {
+        "month": "May",
+        "budget": 3800000,
+        "actual": 3650000
+      },
+      {
+        "month": "Jun",
+        "budget": 4000000,
+        "actual": 3830000
+      }
+    ]
+  }
+}
