@@ -20,7 +20,26 @@ const interviewLegacyReadHandlers = require("./handlers/interviewLegacyReadHandl
 
 const app = express();
 
-app.use(cors());
+// =====================================================
+// Runtime Environment
+// =====================================================
+
+const isProduction =
+  process.env.NODE_ENV === "production" ||
+  Boolean(process.env.RENDER);
+
+const isLocalDevelopment = !isProduction;
+
+if (process.env.FRONTEND_URL) {
+  app.use(
+    cors({
+      origin: process.env.FRONTEND_URL
+    })
+  );
+} else {
+  app.use(cors());
+}
+
 app.use(express.json());
 
 app.get(
@@ -511,15 +530,21 @@ async function sendInterviewEmail(
 // PostgreSQL Connection
 // =====================================================
 
-const pool = new Pool({
-
+const poolConfig = {
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
+  database: process.env.DB_NAME
+};
 
-});
+if (isProduction) {
+  poolConfig.ssl = {
+    rejectUnauthorized: false
+  };
+}
+
+const pool = new Pool(poolConfig);
 
 pool.connect()
   .then(() => {
@@ -582,9 +607,10 @@ async function initializeBucket() {
 
   catch (error) {
 
-    console.log("❌ MinIO Error");
-
-    console.log(error);
+    console.warn(
+      "⚠️ MinIO unavailable at startup — continuing without object storage"
+    );
+    console.warn(error?.message || error);
 
   }
 
@@ -8317,30 +8343,34 @@ app.get(
 
 
 // =====================================================
-// Serve React Frontend
+// Serve React Frontend (local development only)
 // =====================================================
 
-app.use(
-  express.static(
-    path.join(
-      __dirname,
-      "../ATS-Frontend/dist"
+if (isLocalDevelopment) {
+
+  app.use(
+    express.static(
+      path.join(
+        __dirname,
+        "../ATS-Frontend/dist"
+      )
     )
-  )
-);
-
-app.get(/^\/(?!api).*/, (req, res) => {
-
-  res.sendFile(
-
-    path.join(
-      __dirname,
-      "../ATS-Frontend/dist/index.html"
-    )
-
   );
 
-});
+  app.get(/^\/(?!api).*/, (req, res) => {
+
+    res.sendFile(
+
+      path.join(
+        __dirname,
+        "../ATS-Frontend/dist/index.html"
+      )
+
+    );
+
+  });
+
+}
 // =====================================================
 // Start Server
 // =====================================================
