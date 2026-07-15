@@ -283,8 +283,93 @@ function mapDashboardTaskRow(row) {
   };
 }
 
+function toDateOnly(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value.slice(0, 10);
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
+function resolveDashboardDateRange(req) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const toDefault = today.toISOString().slice(0, 10);
+  const fromDefaultDate = new Date(today);
+  fromDefaultDate.setDate(fromDefaultDate.getDate() - 29);
+
+  const fromDate = toDateOnly(req.query?.fromDate) || fromDefaultDate.toISOString().slice(0, 10);
+  const toDate = toDateOnly(req.query?.toDate) || toDefault;
+
+  if (fromDate > toDate) {
+    return { fromDate: toDate, toDate: fromDate };
+  }
+
+  return { fromDate, toDate };
+}
+
+function emptyPipelineStageCounts() {
+  return {
+    Applied: 0,
+    Screening: 0,
+    "L1 Interview": 0,
+    "L2 Interview": 0,
+    "Client Interview": 0,
+    Offer: 0,
+    Joined: 0
+  };
+}
+
+function normalizeStageSql(column) {
+  return `CASE
+    WHEN LOWER(COALESCE(${column}, '')) LIKE '%applied%' THEN 'Applied'
+    WHEN LOWER(COALESCE(${column}, '')) LIKE '%screen%' THEN 'Screening'
+    WHEN LOWER(COALESCE(${column}, '')) ~ '(l1|level 1|technical)' THEN 'L1 Interview'
+    WHEN LOWER(COALESCE(${column}, '')) ~ '(l2|level 2)' THEN 'L2 Interview'
+    WHEN LOWER(COALESCE(${column}, '')) LIKE '%client%' THEN 'Client Interview'
+    WHEN LOWER(COALESCE(${column}, '')) LIKE '%offer%' THEN 'Offer'
+    WHEN LOWER(COALESCE(${column}, '')) LIKE '%join%' THEN 'Joined'
+    ELSE 'Applied'
+  END`;
+}
+
+function mergeStageCountRows(rows) {
+  const counts = emptyPipelineStageCounts();
+  rows.forEach((row) => {
+    const stage = row.stage;
+    if (counts[stage] !== undefined) {
+      counts[stage] = Number(row.count) || 0;
+    }
+  });
+  return counts;
+}
+
+function mergeReqPeriodMetrics(rows) {
+  const byReq = {};
+  rows.forEach((row) => {
+    const code = row.requisition_code;
+    if (!byReq[code]) {
+      byReq[code] = { stageCounts: emptyPipelineStageCounts(), candidatesEntered: 0 };
+    }
+    if (row.metric_type === "applied") {
+      const count = Number(row.count) || 0;
+      byReq[code].stageCounts.Applied = count;
+      byReq[code].candidatesEntered = count;
+      return;
+    }
+    const stage = row.stage;
+    if (stage && byReq[code].stageCounts[stage] !== undefined) {
+      byReq[code].stageCounts[stage] = Number(row.count) || 0;
+    }
+  });
+  return byReq;
+}
+
 async function getMyRecruiterDashboard(pool, req) {
   const employeeCode = recruiterEmployeeCode(req);
+  const { fromDate, toDate } = resolveDashboardDateRange(req);
+  const stageSql = normalizeStageSql("h.to_stage");
 
   const assignments = await pool.query(
     `SELECT *
@@ -307,7 +392,7 @@ async function getMyRecruiterDashboard(pool, req) {
     [employeeCode]
   );
 
-  const pipeline = await pool.query(
+  const pipelineEntered = await pool.query(
     `SELECT m.*,
       c.candidate_code,
       CONCAT(c.first_name, ' ', c.last_name) AS candidate_name
@@ -318,8 +403,62 @@ async function getMyRecruiterDashboard(pool, req) {
      WHERE a.recruiter_code = $1
        AND a.is_active = true
        AND m.is_active = true
+       AND DATE(m.applied_on) >= $2::date
+       AND DATE(m.applied_on) <= $3::date
      ORDER BY m.applied_on DESC`,
-    [employeeCode]
+    [employeeCode, fromDate, toDate]
+  );
+
+  const activePipeline = await pool.query(
+    `WITH active_mapping_ids AS (
+       SELECT DISTINCT m.mapping_id
+       FROM rm_candidate_mappings m
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = m.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND m.is_active = true
+         AND DATE(m.applied_on) >= $2::date
+         AND DATE(m.applied_on) <= $3::date
+
+       UNION
+
+       SELECT DISTINCT h.mapping_id
+       FROM rm_pipeline_history h
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = h.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND h.mapping_id IS NOT NULL
+         AND DATE(h.created_on) >= $2::date
+         AND DATE(h.created_on) <= $3::date
+
+       UNION
+
+       SELECT DISTINCT m.mapping_id
+       FROM im_interviews i
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = i.requisition_code
+       INNER JOIN rm_candidate_mappings m
+         ON m.requisition_code = i.requisition_code
+        AND m.is_active = true
+        AND (
+          (i.map_id IS NOT NULL AND m.map_id = i.map_id)
+          OR (i.candidate_id IS NOT NULL AND m.candidate_id = i.candidate_id)
+        )
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND i.interview_date >= $2::date
+         AND i.interview_date <= $3::date
+     )
+     SELECT m.*,
+       c.candidate_code,
+       CONCAT(c.first_name, ' ', c.last_name) AS candidate_name
+     FROM rm_candidate_mappings m
+     INNER JOIN active_mapping_ids am ON am.mapping_id = m.mapping_id
+     LEFT JOIN cand_mstr c ON c.candidate_id = m.candidate_id
+     ORDER BY m.modified_on DESC`,
+    [employeeCode, fromDate, toDate]
   );
 
   const interviews = await pool.query(
@@ -330,9 +469,12 @@ async function getMyRecruiterDashboard(pool, req) {
      INNER JOIN rm_recruiter_assignments a
        ON a.requisition_code = i.requisition_code
      LEFT JOIN cand_mstr c ON c.candidate_id = i.candidate_id
-     WHERE a.recruiter_code = $1 AND a.is_active = true
+     WHERE a.recruiter_code = $1
+       AND a.is_active = true
+       AND i.interview_date >= $2::date
+       AND i.interview_date <= $3::date
      ORDER BY i.interview_date DESC NULLS LAST, i.interview_time DESC NULLS LAST`,
-    [employeeCode]
+    [employeeCode, fromDate, toDate]
   );
 
   const tasks = await pool.query(
@@ -351,32 +493,181 @@ async function getMyRecruiterDashboard(pool, req) {
              AND i.interview_id = t.business_object_id
          )
        )
+       AND (
+         (t.due_at IS NOT NULL AND DATE(t.due_at) >= $2::date AND DATE(t.due_at) <= $3::date)
+         OR (t.created_on IS NOT NULL AND DATE(t.created_on) >= $2::date AND DATE(t.created_on) <= $3::date)
+       )
      ORDER BY t.due_at ASC NULLS LAST, t.created_on DESC`,
+    [employeeCode, fromDate, toDate]
+  );
+
+  const globalStageCounts = await pool.query(
+    `SELECT stage, SUM(count)::int AS count
+     FROM (
+       SELECT 'Applied' AS stage, COUNT(*)::int AS count
+       FROM rm_candidate_mappings m
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = m.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND m.is_active = true
+         AND DATE(m.applied_on) >= $2::date
+         AND DATE(m.applied_on) <= $3::date
+
+       UNION ALL
+
+       SELECT ${stageSql} AS stage, COUNT(DISTINCT h.mapping_id)::int AS count
+       FROM rm_pipeline_history h
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = h.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND h.mapping_id IS NOT NULL
+         AND DATE(h.created_on) >= $2::date
+         AND DATE(h.created_on) <= $3::date
+         AND NOT (LOWER(COALESCE(h.to_stage, '')) LIKE '%applied%')
+       GROUP BY ${stageSql}
+     ) stage_rows
+     GROUP BY stage`,
+    [employeeCode, fromDate, toDate]
+  );
+
+  const reqPeriodMetrics = await pool.query(
+    `SELECT requisition_code, metric_type, stage, count
+     FROM (
+       SELECT m.requisition_code,
+         'applied' AS metric_type,
+         NULL::text AS stage,
+         COUNT(*)::int AS count
+       FROM rm_candidate_mappings m
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = m.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND m.is_active = true
+         AND DATE(m.applied_on) >= $2::date
+         AND DATE(m.applied_on) <= $3::date
+       GROUP BY m.requisition_code
+
+       UNION ALL
+
+       SELECT h.requisition_code,
+         'history' AS metric_type,
+         ${stageSql} AS stage,
+         COUNT(DISTINCT h.mapping_id)::int AS count
+       FROM rm_pipeline_history h
+       INNER JOIN rm_recruiter_assignments a
+         ON a.requisition_code = h.requisition_code
+       WHERE a.recruiter_code = $1
+         AND a.is_active = true
+         AND h.mapping_id IS NOT NULL
+         AND DATE(h.created_on) >= $2::date
+         AND DATE(h.created_on) <= $3::date
+         AND NOT (LOWER(COALESCE(h.to_stage, '')) LIKE '%applied%')
+       GROUP BY h.requisition_code, ${stageSql}
+     ) req_metrics`,
+    [employeeCode, fromDate, toDate]
+  );
+
+  const offersInRange = await pool.query(
+    `SELECT COUNT(DISTINCT h.mapping_id)::int AS count
+     FROM rm_pipeline_history h
+     INNER JOIN rm_recruiter_assignments a
+       ON a.requisition_code = h.requisition_code
+     WHERE a.recruiter_code = $1
+       AND a.is_active = true
+       AND h.mapping_id IS NOT NULL
+       AND DATE(h.created_on) >= $2::date
+       AND DATE(h.created_on) <= $3::date
+       AND LOWER(COALESCE(h.to_stage, '')) LIKE '%offer%'`,
+    [employeeCode, fromDate, toDate]
+  );
+
+  const offerCandidates = await pool.query(
+    `SELECT DISTINCT ON (m.mapping_id)
+       m.*,
+       c.candidate_code,
+       CONCAT(c.first_name, ' ', c.last_name) AS candidate_name,
+       h.created_on AS offer_entered_on
+     FROM rm_pipeline_history h
+     INNER JOIN rm_recruiter_assignments a
+       ON a.requisition_code = h.requisition_code
+     INNER JOIN rm_candidate_mappings m
+       ON m.mapping_id = h.mapping_id
+     LEFT JOIN cand_mstr c ON c.candidate_id = m.candidate_id
+     WHERE a.recruiter_code = $1
+       AND a.is_active = true
+       AND h.mapping_id IS NOT NULL
+       AND DATE(h.created_on) >= $2::date
+       AND DATE(h.created_on) <= $3::date
+       AND LOWER(COALESCE(h.to_stage, '')) LIKE '%offer%'
+     ORDER BY m.mapping_id, h.created_on DESC`,
+    [employeeCode, fromDate, toDate]
+  );
+
+  const joinedAllTime = await pool.query(
+    `SELECT m.requisition_code, COUNT(*)::int AS joined_count
+     FROM rm_candidate_mappings m
+     INNER JOIN rm_recruiter_assignments a
+       ON a.requisition_code = m.requisition_code
+     WHERE a.recruiter_code = $1
+       AND a.is_active = true
+       AND m.is_active = true
+       AND LOWER(COALESCE(m.stage_name, '')) LIKE '%join%'
+     GROUP BY m.requisition_code`,
     [employeeCode]
   );
 
   const taskRows = tasks.rows.map(mapDashboardTaskRow);
   const interviewRows = interviews.rows.map(mapDashboardInterviewRow);
-  const requisitionRows = requisitions.rows;
-  const pipelineRows = pipeline.rows;
+  const pipelineRows = pipelineEntered.rows;
+  const activePipelineRows = activePipeline.rows;
   const assignmentRows = assignments.rows;
+  const pipelineStageCounts = mergeStageCountRows(globalStageCounts.rows);
+  const periodMetricsByReq = mergeReqPeriodMetrics(reqPeriodMetrics.rows);
+  const joinedAllTimeByReq = Object.fromEntries(
+    joinedAllTime.rows.map((row) => [row.requisition_code, Number(row.joined_count) || 0])
+  );
+
+  const requisitionRows = requisitions.rows.map((row) => ({
+    ...row,
+    periodMetrics: periodMetricsByReq[row.requisition_code] || {
+      stageCounts: emptyPipelineStageCounts(),
+      candidatesEntered: 0
+    },
+    joinedAllTime: joinedAllTimeByReq[row.requisition_code] || 0
+  }));
 
   const today = new Date().toISOString().slice(0, 10);
+  const todayInRange = today >= fromDate && today <= toDate;
+
+  const openRequisitions = requisitionRows.filter((row) =>
+    /open|pending|approved/i.test(row.req_status)
+  ).length;
+
+  const pendingFeedbackInRange = interviewRows.filter((row) => !row.feedbackSubmitted).length;
 
   return {
     employee_code: employeeCode,
     requisitions: requisitionRows,
     recruiterAssignments: assignmentRows,
     pipeline: pipelineRows,
+    activePipeline: activePipelineRows,
+    offerCandidates: offerCandidates.rows,
     interviews: interviewRows,
     tasks: taskRows,
+    filter: { fromDate, toDate },
     summary: {
-      openRequisitions: requisitionRows.filter((row) =>
-        /open|pending|approved/i.test(row.req_status)
-      ).length,
+      openRequisitions,
       activeCandidates: pipelineRows.length,
       pendingTasks: taskRows.length,
-      interviewsToday: interviewRows.filter((row) => row.interview_date === today).length
+      interviewsInRange: interviewRows.length,
+      interviewsToday: todayInRange
+        ? interviewRows.filter((row) => row.interview_date === today).length
+        : 0,
+      pendingFeedbackInRange,
+      offersInRange: Number(offersInRange.rows[0]?.count) || 0,
+      pipelineStageCounts
     },
     taskSummary: {
       pending: taskRows.length,
@@ -386,7 +677,7 @@ async function getMyRecruiterDashboard(pool, req) {
     interviewSummary: {
       scheduled: interviewRows.filter((row) => row.interviewStatus === "Scheduled").length,
       completed: interviewRows.filter((row) => row.interviewStatus === "Completed").length,
-      pendingFeedback: interviewRows.filter((row) => !row.feedbackSubmitted).length
+      pendingFeedback: pendingFeedbackInRange
     }
   };
 }
@@ -773,6 +1064,41 @@ async function mapCandidate(pool, payload, req) {
     throw httpError("Duplicate candidate detected by Business Rules Engine.", 400);
   }
 
+  if (candidateId && (await tableExists(pool, "candidate_req_map"))) {
+    const activeMapping = await pool.query(
+      `SELECT map_id
+       FROM candidate_req_map
+       WHERE candidate_id = $1
+         AND is_active = true
+       LIMIT 1`,
+      [candidateId]
+    );
+
+    if (activeMapping.rows.length > 0) {
+      throw httpError(
+        "Candidate is already assigned to an active requisition. Release the existing mapping before assigning a new requisition.",
+        409
+      );
+    }
+  }
+
+  const existingEnterprise = await pool.query(
+  `SELECT mapping_id
+   FROM rm_candidate_mappings
+   WHERE candidate_id = $1
+     AND requisition_code = $2`,
+  [
+    candidateId,
+    requisition.requisition_code
+  ]
+);
+
+if (existingEnterprise.rows.length > 0) {
+  throw httpError(
+    "Candidate is already assigned to this requisition.",
+    400
+  );
+}
   let legacyMap = null;
   let allocatedMapId = null;
 

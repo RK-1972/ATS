@@ -593,7 +593,14 @@ async function startWorkflow(pool, workflowCode, executionContext, req) {
       recruiter_workload: 0
     }
   };
+const existing = await pool.query(
+  "SELECT * FROM wf_instances WHERE instance_id = $1",
+  [instanceId]
+);
 
+if (existing.rows.length > 0) {
+  return getInstanceById(pool, instanceId);
+}
   await pool.query(
     `INSERT INTO wf_instances (
       instance_id, workflow_code, status, current_stage_key, execution_context,

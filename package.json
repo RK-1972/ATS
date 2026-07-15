@@ -24,6 +24,9 @@
     "migrate:operational": "node scripts/migrateOperationalData.js",
     "validate:operational": "node scripts/validateOperationalMigration.js",
     "rollback:operational": "node scripts/rollbackOperationalMigration.js",
+    "migrate:candidate": "node scripts/applyCandidateEnterpriseMigration.js",
+    "rollback:candidate": "node scripts/rollbackCandidateEnterpriseSchema.js",
+    "verify:candidate": "node scripts/verifyCandidateEnterpriseSchema.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -41,6 +44,7 @@
     "minio": "^8.0.7",
     "multer": "^2.1.1",
     "nodemailer": "^8.0.10",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.20.0"
   }
 }

@@ -30,6 +30,7 @@ const MASTER_DATA_DOMAINS = [
       { key: "skills", label: "Skills" },
       { key: "skill_categories", label: "Skill Categories" },
       { key: "interview_types", label: "Interview Types" },
+      { key: "interview_stages", label: "Interview Stages" },
       { key: "interview_modes", label: "Interview Modes" },
       { key: "candidate_sources", label: "Candidate Sources" },
       { key: "vendor_partners", label: "Vendor Partners" },

@@ -7,6 +7,7 @@ const {
   kebabToSnake,
   isValidEntityType
 } = require("../masterData/entityTypes");
+const skillsMasterDataService = require("./skillsMasterDataService");
 
 function buildRecordId(entityType, code) {
   const slug = code.toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -25,8 +26,8 @@ function userContext(req) {
   };
 }
 
-function rowToRecord(row, history = []) {
-  return {
+function rowToRecord(row, history = [], skillCategoryMap = null) {
+  const record = {
     id: row.id,
     entityType: row.entity_type,
     code: row.code,
@@ -47,6 +48,16 @@ function rowToRecord(row, history = []) {
       reason: item.reason || ""
     }))
   };
+
+  if (row.entity_type === skillsMasterDataService.SKILLS_ENTITY) {
+    record.skillCategoryCode = row.skill_category_code || null;
+    record.skillCategory = row.skill_category_name
+      || skillCategoryMap?.get(row.skill_category_code)
+      || row.skill_category_code
+      || "";
+  }
+
+  return record;
 }
 
 async function fetchHistory(pool, recordId) {
@@ -170,7 +181,15 @@ function validateStatusTransition(currentStatus, nextStatus) {
 
 async function buildMasterDataBundle(pool) {
   const recordsResult = await pool.query(
-    `SELECT * FROM md_records WHERE is_deleted = FALSE ORDER BY entity_type, name`
+    `SELECT r.*, cat.name AS skill_category_name
+     FROM md_records r
+     LEFT JOIN md_records cat
+       ON r.entity_type = 'skills'
+       AND cat.entity_type = 'skill_categories'
+       AND cat.code = r.skill_category_code
+       AND cat.is_deleted = FALSE
+     WHERE r.is_deleted = FALSE
+     ORDER BY r.entity_type, r.name`
   );
 
   const records = {};
@@ -179,12 +198,19 @@ async function buildMasterDataBundle(pool) {
     records[key] = [];
   });
 
+  const skillCategoryMap = await skillsMasterDataService.getCategoryMap(pool);
+
   for (const row of recordsResult.rows) {
     const history = await fetchHistory(pool, row.id);
     if (!records[row.entity_type]) {
       records[row.entity_type] = [];
     }
-    records[row.entity_type].push(rowToRecord(row, history));
+    records[row.entity_type].push(
+      skillsMasterDataService.enrichSkillRecord(
+        rowToRecord(row, history, skillCategoryMap),
+        skillCategoryMap
+      )
+    );
   }
 
   const totalRecords = recordsResult.rows.length;

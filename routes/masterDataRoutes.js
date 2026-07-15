@@ -1,4 +1,9 @@
 const masterDataService = require("../services/masterDataService");
+const skillsMasterDataService = require("../services/skillsMasterDataService");
+
+function isSkillsEntity(entityType) {
+  return entityType === skillsMasterDataService.SKILLS_ENTITY;
+}
 
 function handleError(res, error) {
   console.error("Master Data API Error:", error.message);
@@ -10,10 +15,37 @@ function handleError(res, error) {
 function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   const guard = [verifyToken, verifyAdmin];
 
-  app.get("/api/v1/master", guard, async (req, res) => {
+  app.get("/api/v1/master", verifyToken, async (req, res) => {
     try {
       const data = await masterDataService.buildMasterDataBundle(pool);
-      res.json(data);
+
+      // Admin owns EMD: full lifecycle bundle. Consumers: Active + Published only.
+      if (req.user?.role_name === "Admin") {
+        return res.json(data);
+      }
+
+      const publishedRecords = {};
+      let publishedCount = 0;
+
+      Object.entries(data.records || {}).forEach(([entityType, rows]) => {
+        const filtered = (rows || []).filter(
+          (record) =>
+            record.status === "Active" &&
+            record.versionStatus === "Published"
+        );
+        publishedRecords[entityType] = filtered;
+        publishedCount += filtered.length;
+      });
+
+      res.json({
+        ...data,
+        records: publishedRecords,
+        meta: {
+          ...data.meta,
+          total_records: publishedCount,
+          published_records: publishedCount
+        }
+      });
     } catch (error) {
       handleError(res, error);
     }
@@ -22,7 +54,9 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   app.get("/api/v1/master/:entityType/export", guard, async (req, res) => {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
-      const records = await masterDataService.exportEntity(pool, entityType);
+      const records = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.exportSkills(pool)
+        : await masterDataService.exportEntity(pool, entityType);
       res.json(records);
     } catch (error) {
       handleError(res, error);
@@ -33,7 +67,9 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
       const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-      const preview = await masterDataService.previewImport(pool, entityType, rows);
+      const preview = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.previewSkillsImport(pool, rows)
+        : await masterDataService.previewImport(pool, entityType, rows);
       res.json(preview);
     } catch (error) {
       handleError(res, error);
@@ -44,13 +80,20 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
       const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-      const result = await masterDataService.commitImport(
-        pool,
-        entityType,
-        rows,
-        req,
-        req.body?.reason || ""
-      );
+      const result = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.commitSkillsImport(
+          pool,
+          rows,
+          req,
+          req.body?.reason || ""
+        )
+        : await masterDataService.commitImport(
+          pool,
+          entityType,
+          rows,
+          req,
+          req.body?.reason || ""
+        );
       const masterData = await masterDataService.buildMasterDataBundle(pool);
       res.json({ ...result, masterData });
     } catch (error) {
@@ -61,7 +104,9 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   app.get("/api/v1/master/:entityType", guard, async (req, res) => {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
-      const records = await masterDataService.listByEntityType(pool, entityType);
+      const records = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.listSkills(pool)
+        : await masterDataService.listByEntityType(pool, entityType);
       res.json(records);
     } catch (error) {
       handleError(res, error);
@@ -71,11 +116,13 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   app.get("/api/v1/master/:entityType/:id", guard, async (req, res) => {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
-      const record = await masterDataService.getRecordById(
-        pool,
-        entityType,
-        req.params.id
-      );
+      const record = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.getSkillById(pool, req.params.id)
+        : await masterDataService.getRecordById(
+          pool,
+          entityType,
+          req.params.id
+        );
 
       if (!record) {
         return res.status(404).json({ message: "Record not found" });
@@ -90,12 +137,14 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   app.post("/api/v1/master/:entityType", guard, async (req, res) => {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
-      const record = await masterDataService.createRecord(
-        pool,
-        entityType,
-        req.body,
-        req
-      );
+      const record = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.createSkill(pool, req.body, req)
+        : await masterDataService.createRecord(
+          pool,
+          entityType,
+          req.body,
+          req
+        );
       res.status(201).json(record);
     } catch (error) {
       handleError(res, error);
@@ -105,13 +154,15 @@ function registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin) {
   app.put("/api/v1/master/:entityType/:id", guard, async (req, res) => {
     try {
       const entityType = masterDataService.resolveEntityType(req.params.entityType);
-      const record = await masterDataService.updateRecord(
-        pool,
-        entityType,
-        req.params.id,
-        req.body,
-        req
-      );
+      const record = isSkillsEntity(entityType)
+        ? await skillsMasterDataService.updateSkill(pool, req.params.id, req.body, req)
+        : await masterDataService.updateRecord(
+          pool,
+          entityType,
+          req.params.id,
+          req.body,
+          req
+        );
       res.json(record);
     } catch (error) {
       handleError(res, error);

@@ -423,7 +423,7 @@ async function linkLegacySchedule(pool, interviewId, scheduleId, meetingLink, te
 
 async function getInterview(pool, interviewId) {
   const result = await pool.query(
-    "SELECT * FROM im_interviews WHERE interview_id = $1 OR schedule_id = $1",
+    "SELECT * FROM im_interviews WHERE interview_id = $1 OR schedule_id::text = $1",
     [interviewId]
   );
 

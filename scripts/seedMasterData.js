@@ -71,9 +71,9 @@ const SEED_TEMPLATES = {
     ["WC-NBILL", "Non-Billable", "Internal / overhead workforce"]
   ],
   skills: [
-    ["SK-JAVA", "Java", "Core Java development", DEFAULT_USED_BY.skills],
-    ["SK-REACT", "React", "Frontend React framework", DEFAULT_USED_BY.skills],
-    ["SK-AWS", "AWS", "Amazon Web Services cloud", DEFAULT_USED_BY.skills]
+    ["SK-JAVA", "SC-TECH", "Java", "Core Java development", DEFAULT_USED_BY.skills],
+    ["SK-REACT", "SC-TECH", "React", "Frontend React framework", DEFAULT_USED_BY.skills],
+    ["SK-AWS", "SC-TECH", "AWS", "Amazon Web Services cloud", DEFAULT_USED_BY.skills]
   ],
   skill_categories: [
     ["SC-TECH", "Technical", "Technical skill grouping"],
@@ -83,6 +83,13 @@ const SEED_TEMPLATES = {
     ["IT-L1", "L1 Technical", "First-level technical interview"],
     ["IT-L2", "L2 Technical", "Second-level technical interview"],
     ["IT-HM", "Hiring Manager", "HM culture and fit round"]
+  ],
+  interview_stages: [
+    ["L1", "L1", "Level 1 interview stage"],
+    ["L2", "L2", "Level 2 interview stage"],
+    ["L3", "L3", "Level 3 interview stage"],
+    ["L4", "L4", "Level 4 interview stage"],
+    ["FIN", "Final Round", "Final interview stage"]
   ],
   interview_modes: [
     ["IM-FTF", "Face to Face", "In-person interview"],
@@ -191,7 +198,19 @@ async function seed() {
   for (const entityType of ENTITY_TYPE_KEYS) {
     const items = SEED_TEMPLATES[entityType] || [];
 
-    for (const [code, name, description, usedBy] of items) {
+    for (const item of items) {
+      let code;
+      let name;
+      let description;
+      let usedBy;
+      let skillCategoryCode = null;
+
+      if (entityType === "skills") {
+        [code, skillCategoryCode, name, description, usedBy] = item;
+      } else {
+        [code, name, description, usedBy] = item;
+      }
+
       const id = buildRecordId(entityType, code);
       const usedByJson = JSON.stringify(usedBy || ["Platform Configuration"]);
 
@@ -206,10 +225,10 @@ async function seed() {
 
       await pool.query(
         `INSERT INTO md_records (
-          id, entity_type, code, name, description, status, version, version_status,
-          used_by, created_by, modified_by
-        ) VALUES ($1,$2,$3,$4,$5,'Active',1.0,'Published',$6,'System Admin','System Admin')`,
-        [id, entityType, code, name, description, usedByJson]
+          id, entity_type, code, name, description, skill_category_code,
+          status, version, version_status, used_by, created_by, modified_by
+        ) VALUES ($1,$2,$3,$4,$5,$6,'Active',1.0,'Published',$7,'System Admin','System Admin')`,
+        [id, entityType, code, name, description, skillCategoryCode, usedByJson]
       );
 
       await pool.query(

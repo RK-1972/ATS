@@ -606,6 +606,495 @@ const upload = multer({
 });
 
 
+async function uploadResumeToMinio(file) {
+
+  const fileName =
+    `${Date.now()}-${file.originalname}`;
+
+  await minioClient.putObject(
+
+    bucketName,
+    fileName,
+    file.buffer,
+    file.size
+
+  );
+
+  return `http://localhost:9000/${bucketName}/${fileName}`;
+
+}
+
+
+let pdfParse = null;
+
+try {
+
+  const { PDFParse } = require("pdf-parse");
+
+  pdfParse = async (buffer) => {
+
+    const parser = new PDFParse({ data: buffer });
+
+    try {
+
+      const textResult = await parser.getText();
+
+      return { text: textResult.text };
+
+    }
+
+    finally {
+
+      await parser.destroy();
+
+    }
+
+  };
+
+}
+
+catch (error) {
+
+  pdfParse = null;
+
+}
+
+
+function resolveMinioObjectKey(resumePath) {
+
+  const url = new URL(resumePath);
+  const pathParts =
+    url.pathname.split("/").filter(Boolean);
+
+  let objectKey;
+
+  if (pathParts[0] === bucketName) {
+
+    objectKey = pathParts.slice(1).join("/");
+
+  }
+
+  else {
+
+    objectKey = pathParts.join("/");
+
+  }
+
+  return decodeURIComponent(objectKey);
+
+}
+
+
+function streamToBuffer(stream) {
+
+  return new Promise((resolve, reject) => {
+
+    const chunks = [];
+
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+
+  });
+
+}
+
+
+async function downloadResumeFromMinio(resumePath) {
+
+  const objectKey =
+    resolveMinioObjectKey(resumePath);
+
+  try {
+
+    await minioClient.statObject(bucketName, objectKey);
+
+  }
+
+  catch (statError) {
+
+    const error = new Error(statError.message);
+
+    error.bucket = bucketName;
+    error.objectKey = objectKey;
+    error.isStatObjectFailure = true;
+
+    throw error;
+
+  }
+
+  const stream =
+    await minioClient.getObject(bucketName, objectKey);
+
+  return streamToBuffer(stream);
+
+}
+
+
+async function extractPdfText(buffer) {
+
+  if (!pdfParse) {
+
+    throw new Error(
+      "No PDF parser is installed. Install pdf-parse to enable resume text extraction."
+    );
+
+  }
+
+  const parsed = await pdfParse(buffer);
+
+  return (parsed.text || "").trim();
+
+}
+
+
+function parseBasicCandidateInfo(extractedText) {
+
+  const text = (extractedText || "").trim();
+  const lines =
+    text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  const emailRegex =
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i;
+
+  const mobileRegex =
+    /(?:\+91[\s-]*)?[6-9][\d\s-]{8,12}\d/;
+
+  const emailMatch = text.match(emailRegex);
+  const email = emailMatch ? emailMatch[0] : null;
+
+  const mobileMatch = text.match(mobileRegex);
+  const mobile = mobileMatch ? mobileMatch[0].trim() : null;
+
+  const isIgnoredCandidateNameLine = (line) => {
+
+    const trimmedLine = line.trim();
+
+    if (!trimmedLine) {
+
+      return true;
+
+    }
+
+    if (/^\d+$/.test(trimmedLine)) {
+
+      return true;
+
+    }
+
+    if (/^Page/i.test(trimmedLine)) {
+
+      return true;
+
+    }
+
+    if (trimmedLine.startsWith("--")) {
+
+      return true;
+
+    }
+
+    if (trimmedLine.includes("@")) {
+
+      return true;
+
+    }
+
+    if (mobileRegex.test(trimmedLine)) {
+
+      return true;
+
+    }
+
+    if (/^http/i.test(trimmedLine)) {
+
+      return true;
+
+    }
+
+    if (/^www/i.test(trimmedLine)) {
+
+      return true;
+
+    }
+
+    return false;
+
+  };
+
+  let candidate_name = null;
+
+  for (const line of lines) {
+
+    if (isIgnoredCandidateNameLine(line)) {
+
+      continue;
+
+    }
+
+    candidate_name = line.replace(/\s+/g, " ").trim();
+    break;
+
+  }
+
+  const experienceRegex =
+    /\d+(?:\.\d+)?\+?\s*years?/i;
+
+  const experienceMatch = text.match(experienceRegex);
+  const experience =
+    experienceMatch ? experienceMatch[0].trim() : null;
+
+  const educationKeywords = [
+    "Bachelor",
+    "B.E",
+    "B.Tech",
+    "M.Tech",
+    "MCA",
+    "MBA",
+    "Diploma",
+    "Degree"
+  ];
+
+  let education = null;
+
+  for (const line of lines) {
+
+    const matchedKeyword = educationKeywords.find((keyword) =>
+      line.toLowerCase().includes(keyword.toLowerCase())
+    );
+
+    if (matchedKeyword) {
+
+      education = line.trim();
+      break;
+
+    }
+
+  }
+
+  const skillKeywords = [
+    "Playwright",
+    "Selenium",
+    "Python",
+    "Java",
+    "SQL",
+    "Pytest",
+    "Jenkins",
+    "Docker",
+    "Kubernetes",
+    "Postman",
+    "REST Assured",
+    "MySQL",
+    "Jira",
+    "Git",
+    "TypeScript",
+    "JavaScript",
+    "React",
+    "Node",
+    "API Testing",
+    "Regression Testing",
+    "Smoke Testing",
+    "Functional Testing"
+  ];
+
+  const lowerText = text.toLowerCase();
+  const skills = [];
+
+  for (const skill of skillKeywords) {
+
+    if (lowerText.includes(skill.toLowerCase())) {
+
+      skills.push(skill);
+
+    }
+
+  }
+
+  return {
+    candidate_name,
+    email,
+    mobile,
+    experience,
+    education,
+    skills
+  };
+
+}
+
+
+function splitCandidateName(candidateName) {
+
+  const trimmed =
+    (candidateName || "").trim().replace(/\s+/g, " ");
+
+  if (!trimmed) {
+
+    return {
+      first_name: "Unknown",
+      last_name: ""
+    };
+
+  }
+
+  const parts = trimmed.split(" ");
+
+  return {
+    first_name: parts[0],
+    last_name: parts.slice(1).join(" ") || ""
+  };
+
+}
+
+
+async function createDraftCandidateFromParsedIntake({
+  intake,
+  parsedCandidate,
+  createdBy
+}) {
+
+  const {
+    first_name,
+    last_name
+  } = splitCandidateName(parsedCandidate.candidate_name);
+
+  const skillsList =
+    Array.isArray(parsedCandidate.skills)
+      ? parsedCandidate.skills
+      : [];
+
+  const primary_skill =
+    skillsList.length > 0
+      ? skillsList.join(", ")
+      : null;
+
+  const remarksParts = [];
+
+  if (parsedCandidate.education) {
+
+    remarksParts.push(
+      `Education: ${parsedCandidate.education}`
+    );
+
+  }
+
+  remarksParts.push(
+    `Intake ID: ${intake.intake_id}`
+  );
+
+  if (intake.original_file_name) {
+
+    remarksParts.push(
+      `Original File: ${intake.original_file_name}`
+    );
+
+  }
+
+  const today = new Date();
+
+  const day =
+    String(today.getDate()).padStart(2, "0");
+
+  const month =
+    String(today.getMonth() + 1).padStart(2, "0");
+
+  const year =
+    String(today.getFullYear()).slice(-2);
+
+  const datePrefix =
+    `${day}${month}${year}`;
+
+  const countResult = await pool.query(
+
+    `
+
+    SELECT COUNT(*) AS total
+    FROM cand_mstr
+    WHERE TO_CHAR(created_on, 'DDMMYY') = $1
+
+    `,
+
+    [datePrefix]
+
+  );
+
+  const runningNumber =
+    parseInt(countResult.rows[0].total, 10) + 1;
+
+  const candidateCode =
+    `${datePrefix}${runningNumber}`;
+
+  const result = await pool.query(
+
+    `
+
+    INSERT INTO cand_mstr (
+      candidate_code,
+      first_name,
+      last_name,
+      email_id,
+      mobile_number,
+      total_experience,
+      primary_skill,
+      resume_path,
+      source_channel,
+      candidate_status,
+      recruiter_id,
+      remarks,
+      created_by
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10,
+      $11, $12, $13
+    )
+    RETURNING candidate_id
+
+    `,
+
+    [
+      candidateCode,
+      first_name,
+      last_name,
+      parsedCandidate.email || null,
+      parsedCandidate.mobile || null,
+      parsedCandidate.experience || null,
+      primary_skill,
+      intake.resume_path || null,
+      intake.source_id || null,
+      "DRAFT",
+      createdBy || null,
+      remarksParts.join(" | "),
+      createdBy || null
+    ]
+
+  );
+
+  return result.rows[0].candidate_id;
+
+}
+
+
+async function markIntakeParsingFailed(intakeId, errorMessage) {
+
+  await pool.query(
+
+    `
+
+    UPDATE rm_candidate_intake
+    SET
+      parsing_status = 'FAILED',
+      error_message = $1
+    WHERE intake_id = $2
+
+    `,
+
+    [errorMessage, intakeId]
+
+  );
+
+}
+
+
 // =====================================================
 // JWT TOKEN VERIFICATION MIDDLEWARE
 // =====================================================
@@ -970,10 +1459,52 @@ app.get(
 
       );
 
+      const row = result.rows[0] || null;
+
+      if (!row) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const addressResult = await pool.query(
+
+        `
+
+        SELECT country_code, state_code, city_code, address_line_1
+        FROM can_address
+        WHERE candidate_id = $1
+          AND address_type = 'Current'
+          AND active_flag = TRUE
+        ORDER BY address_id DESC
+        LIMIT 1
+
+        `,
+
+        [candidateId]
+
+      );
+
+      const address = addressResult.rows[0] || null;
+
       res.status(200).json({
 
         success: true,
-        data: result.rows[0]
+        data: {
+          ...row,
+          country_code:
+            row.current_country || address?.country_code || null,
+          state_code:
+            row.current_state || address?.state_code || null,
+          city_code:
+            row.current_city || address?.city_code || null,
+          address_line: address?.address_line_1 || null
+        }
 
       });
 
@@ -1021,7 +1552,7 @@ app.put(
 
         `
 
-        SELECT resume_path
+        SELECT *
         FROM cand_mstr
         WHERE candidate_id = $1
 
@@ -1031,9 +1562,59 @@ app.put(
 
       );
 
-      let resumePath =
-        existingCandidate.rows[0]?.resume_path || null;
+      if (existingCandidate.rows.length === 0) {
 
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const existing = existingCandidate.rows[0];
+
+      const resolveField = (fieldName) => {
+
+        if (
+          Object.prototype.hasOwnProperty.call(req.body, fieldName)
+        ) {
+
+          return req.body[fieldName];
+
+        }
+
+        return existing[fieldName];
+
+      };
+
+      const resolveAliasedField = (preferredKey, dbKey) => {
+
+        if (
+          Object.prototype.hasOwnProperty.call(req.body, preferredKey)
+        ) {
+
+          return req.body[preferredKey];
+
+        }
+
+        if (
+          Object.prototype.hasOwnProperty.call(req.body, dbKey)
+        ) {
+
+          return req.body[dbKey];
+
+        }
+
+        return existing[dbKey];
+
+      };
+
+      const hasBodyField = (fieldName) =>
+        Object.prototype.hasOwnProperty.call(req.body, fieldName);
+
+      let resumePath = existing.resume_path || null;
 
       if (req.file) {
 
@@ -1054,49 +1635,238 @@ app.put(
 
       }
 
+      const countryCode = resolveAliasedField(
+        "country_code",
+        "current_country"
+      );
+      const stateCode = resolveAliasedField(
+        "state_code",
+        "current_state"
+      );
+      const cityCode = resolveAliasedField(
+        "city_code",
+        "current_city"
+      );
+      const currentLocation = resolveField("current_location");
+
       const result = await pool.query(
 
         `
 
         UPDATE cand_mstr
 
-        SET
+SET
 
-          first_name = $1,
-          last_name = $2,
-          mobile_number = $3,
-          primary_skill = $4,
-          total_experience = $5,
-          resume_path = $6,
-          candidate_status = $7,
-          updated_on = CURRENT_TIMESTAMP
+    first_name      = $1,
+    middle_name     = $2,
+    last_name       = $3,
+    preferred_name  = $4,
+    gender          = $5,
 
-        WHERE candidate_id = $8
+    mobile_number   = $6,
+    primary_skill   = $7,
+    total_experience= $8,
+    resume_path     = $9,
+    candidate_status= $10,
 
-        RETURNING *
+    current_country = $11,
+    current_state   = $12,
+    current_city    = $13,
+    current_location= $14,
 
-        `,
+    relevant_experience = $15,
+    employment_type     = $16,
+    preferred_work_mode = $17,
+    current_company     = $18,
+    current_designation = $19,
+    current_department  = $20,
+    notice_period       = $21,
+    availability        = $22,
+    currency_code       = $23,
+    current_ctc         = $24,
+    expected_ctc        = $25,
+    ctc_negotiable      = $26,
 
-        [
+    updated_on      = CURRENT_TIMESTAMP
 
-          req.body.first_name,
-          req.body.last_name,
-          req.body.mobile_number,
-          req.body.primary_skill,
-          req.body.total_experience,
-          resumePath,
-          req.body.candidate_status,
-          candidateId
+WHERE candidate_id = $27
 
-        ]
+RETURNING *
+
+`,
+[
+    resolveField("first_name"),
+    resolveField("middle_name"),
+    resolveField("last_name"),
+    resolveField("preferred_name"),
+    resolveField("gender"),
+
+    resolveField("mobile_number"),
+    resolveField("primary_skill"),
+    resolveField("total_experience"),
+    resumePath,
+    resolveField("candidate_status"),
+
+    countryCode,
+    stateCode,
+    cityCode,
+    currentLocation,
+
+    resolveField("relevant_experience"),
+    resolveField("employment_type"),
+    resolveField("preferred_work_mode"),
+    resolveField("current_company"),
+    resolveField("current_designation"),
+    resolveField("current_department"),
+    resolveField("notice_period"),
+    resolveField("availability"),
+    resolveField("currency_code"),
+    resolveField("current_ctc"),
+    resolveField("expected_ctc"),
+    (() => {
+      const value = resolveField("ctc_negotiable");
+      if (value === true || value === "true") {
+        return true;
+      }
+      if (value === false || value === "false") {
+        return false;
+      }
+      return value;
+    })(),
+
+    candidateId
+]
 
       );
+
+      let addressLine = null;
+
+      if (
+        hasBodyField("country_code") ||
+        hasBodyField("state_code") ||
+        hasBodyField("city_code") ||
+        hasBodyField("address_line") ||
+        hasBodyField("current_country") ||
+        hasBodyField("current_state") ||
+        hasBodyField("current_city")
+      ) {
+
+        const existingAddress = await pool.query(
+
+          `
+
+          SELECT address_id, address_line_1
+          FROM can_address
+          WHERE candidate_id = $1
+            AND address_type = 'Current'
+            AND active_flag = TRUE
+          ORDER BY address_id DESC
+          LIMIT 1
+
+          `,
+
+          [candidateId]
+
+        );
+
+        addressLine = hasBodyField("address_line")
+          ? req.body.address_line
+          : (existingAddress.rows[0]?.address_line_1 || null);
+
+        if (existingAddress.rows.length > 0) {
+
+          await pool.query(
+
+            `
+
+            UPDATE can_address
+            SET
+              country_code = $1,
+              state_code = $2,
+              city_code = $3,
+              address_line_1 = $4,
+              modified_on = CURRENT_TIMESTAMP
+            WHERE address_id = $5
+
+            `,
+
+            [
+              countryCode || null,
+              stateCode || null,
+              cityCode || null,
+              addressLine,
+              existingAddress.rows[0].address_id
+            ]
+
+          );
+
+        } else {
+
+          await pool.query(
+
+            `
+
+            INSERT INTO can_address (
+              candidate_id,
+              address_type,
+              address_line_1,
+              city_code,
+              state_code,
+              country_code
+            )
+            VALUES ($1, 'Current', $2, $3, $4, $5)
+
+            `,
+
+            [
+              candidateId,
+              addressLine,
+              cityCode || null,
+              stateCode || null,
+              countryCode || null
+            ]
+
+          );
+
+        }
+
+      } else {
+
+        const existingAddress = await pool.query(
+
+          `
+
+          SELECT address_line_1
+          FROM can_address
+          WHERE candidate_id = $1
+            AND address_type = 'Current'
+            AND active_flag = TRUE
+          ORDER BY address_id DESC
+          LIMIT 1
+
+          `,
+
+          [candidateId]
+
+        );
+
+        addressLine = existingAddress.rows[0]?.address_line_1 || null;
+
+      }
+
+      const updatedRow = result.rows[0];
 
       res.status(200).json({
 
         success: true,
         message: "Candidate Updated Successfully",
-        data: result.rows[0]
+        data: {
+          ...updatedRow,
+          country_code: updatedRow.current_country || countryCode || null,
+          state_code: updatedRow.current_state || stateCode || null,
+          city_code: updatedRow.current_city || cityCode || null,
+          address_line: addressLine
+        }
 
       });
 
@@ -2695,8 +3465,10 @@ app.get(
             c.resume_path,
 
             crm.map_id,
-            
+
             crm.req_id,
+
+            crm.requisition_code AS req_code,
 
             crm.stage_name,
 
@@ -2706,8 +3478,9 @@ app.get(
 
           FROM cand_mstr c
 
-          LEFT JOIN candidate_req_map crm
+          LEFT JOIN rm_candidate_mappings crm
           ON c.candidate_id = crm.candidate_id
+          AND crm.is_active = true
 
           WHERE c.candidate_id = $1
           
@@ -3149,15 +3922,53 @@ app.post(
 console.log("===== API 34 HIT =====");
 console.log("Logged In User:");
 console.log(req.user);
-      const {
+        const {
 
   candidate_id,
-  req_id,
+  requisition_code,
   stage_name,
   source_type,
   remarks
 
 } = req.body;
+const reqLookup = await pool.query(
+  `
+  SELECT req_id
+  FROM rm_requisitions
+  WHERE requisition_code = $1
+  `,
+  [requisition_code]
+);
+
+if (reqLookup.rows.length === 0) {
+  return res.status(404).json({
+    success: false,
+    message: "Requisition not found"
+  });
+}
+
+const req_id = reqLookup.rows[0].req_id;
+
+if (!req_id) {
+  return res.status(400).json({
+    success: false,
+    message: "Enterprise requisition is not linked to a legacy Req ID."
+  });
+}
+
+// ===============================================
+// DEBUG LOGS  ← ADD THEM HERE
+// ===============================================
+
+console.log("==================================");
+console.log("Candidate ID      :", candidate_id);
+console.log("Requisition Code  :", requisition_code);
+console.log("Resolved Req ID   :", req_id);
+console.log("==================================");
+
+// ===============================================
+// Existing Mapping Check
+// ===============================================
 
       const existingMap =
         await pool.query(
@@ -3458,25 +4269,25 @@ app.get(
 
           FROM cand_mstr cm
 
-          INNER JOIN candidate_req_map crm
+          LEFT JOIN candidate_req_map crm
 
             ON cm.candidate_id =
                crm.candidate_id
 
-          INNER JOIN req_mstr rm
+            AND crm.is_active = true
+
+          LEFT JOIN req_mstr rm
 
             ON crm.req_id =
                rm.req_id
 
           WHERE
 
-            crm.recruiter_id = $1
-
-            AND crm.is_active = true
+            cm.recruiter_id = $1
 
           ORDER BY
 
-            crm.applied_date DESC
+            crm.applied_date DESC NULLS LAST
 
           `,
 
@@ -5331,32 +6142,6 @@ app.get(
 );
 
 // =====================================================
-// Serve React Frontend
-// =====================================================
-
-app.use(
-  express.static(
-    path.join(
-      __dirname,
-      "../ATS-Frontend/dist"
-    )
-  )
-);
-
-app.get(/^\/(?!api).*/, (req, res) => {
-
-  res.sendFile(
-
-    path.join(
-      __dirname,
-      "../ATS-Frontend/dist/index.html"
-    )
-
-  );
-
-});
-
-// =====================================================
 // Send Password Reset Email
 // =====================================================
 
@@ -5854,8 +6639,104 @@ if (
   }
 
 );
+
 // =====================================================
-// Enterprise Master Data API (PostgreSQL-backed)
+// API 55 - Available Candidates (Talent Pool)
+// =====================================================
+
+app.get(
+
+  "/available-candidates",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const result = await pool.query(
+
+        `
+
+        SELECT
+
+          'AVAILABLE' AS candidate_type,
+
+          cm.candidate_id,
+          cm.candidate_code,
+
+          cm.first_name,
+          cm.middle_name,
+          cm.last_name,
+          cm.preferred_name,
+
+          cm.email_id,
+          cm.mobile_number,
+
+          cm.primary_skill,
+          cm.total_experience,
+
+          cm.current_company,
+          cm.current_location,
+
+          cm.candidate_status,
+
+          cm.created_on
+
+        FROM cand_mstr cm
+
+        WHERE NOT EXISTS (
+
+            SELECT 1
+
+            FROM candidate_req_map crm
+
+            WHERE crm.candidate_id = cm.candidate_id
+              AND crm.is_active = true
+
+        )
+
+        ORDER BY
+
+          cm.created_on DESC
+
+        `
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        count: result.rows.length,
+
+        data: result.rows
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Available Candidates Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error Fetching Available Candidates"
+
+      });
+
+    }
+
+  }
+
+);
+// =====================================================
+// API 56-Enterprise Master Data API (PostgreSQL-backed)
 // =====================================================
 
 const { registerMasterDataRoutes } = require("./routes/masterDataRoutes");
@@ -5878,6 +6759,1588 @@ registerTaskRoutes(app, pool, verifyToken);
 registerInterviewRoutes(app, pool, verifyToken);
 registerOfferRoutes(app, pool, verifyToken);
 
+app.get("/health-test", (req, res) => {
+  res.json({
+    success: true,
+    message: "THIS IS INDEX.JS",
+    time: new Date()
+  });
+});
+
+// =====================================================
+// API 57 - Request Candidate Ownership
+// =====================================================
+
+app.post(
+  "/request-candidate-ownership",
+  verifyToken,
+  async (req, res) => {
+
+    try {
+
+      const { candidate_id, reason } = req.body;
+
+      const to_recruiter_id = req.user.employee_code;
+
+      // -------------------------------------------------
+      // Get Current Candidate Owner
+      // -------------------------------------------------
+
+      const ownerResult = await pool.query(
+        `
+        SELECT recruiter_id
+        FROM cand_mstr
+        WHERE candidate_id = $1
+        `,
+        [candidate_id]
+      );
+
+      if (ownerResult.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const from_recruiter_id =
+        ownerResult.rows[0].recruiter_id;
+
+      // -------------------------------------------------
+      // Prevent requesting own candidate
+      // -------------------------------------------------
+
+      if (from_recruiter_id === to_recruiter_id) {
+
+        return res.status(400).json({
+
+          success: false,
+          message:
+            "You already own this candidate."
+
+        });
+
+      }
+
+      // -------------------------------------------------
+      // Prevent Duplicate Pending Request
+      // -------------------------------------------------
+
+      const pendingRequest =
+  await pool.query(
+
+    `
+    SELECT
+      request_id,
+      to_recruiter_id
+
+    FROM rm_candidate_transfer_requests
+
+    WHERE
+      candidate_id = $1
+      AND status = 'Pending'
+    `,
+
+    [
+
+      candidate_id
+
+    ]
+
+  );
+
+if (pendingRequest.rows.length > 0) {
+
+  return res.status(400).json({
+
+    success: false,
+
+    message:
+      "An ownership request for this candidate is already pending."
+
+  });
+
+}
+      // -------------------------------------------------
+      // Create Request
+      // -------------------------------------------------
+
+      await pool.query(
+
+        `
+        INSERT INTO
+        rm_candidate_transfer_requests
+        (
+
+          candidate_id,
+
+          from_recruiter_id,
+
+          to_recruiter_id,
+
+          reason,
+
+          status,
+
+          requested_on
+
+        )
+
+        VALUES
+
+        (
+
+          $1,
+
+          $2,
+
+          $3,
+
+          $4,
+
+          'Pending',
+
+          NOW()
+
+        )
+        `,
+
+        [
+
+          candidate_id,
+
+          from_recruiter_id,
+
+          to_recruiter_id,
+
+          reason
+
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+          "Ownership request submitted successfully."
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log(
+        "❌ Request Candidate Ownership Error"
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Error requesting candidate ownership."
+
+      });
+
+    }
+
+  }
+
+);
+
+// =====================================================
+// API 58 - Get My Pending Ownership Requests
+// =====================================================
+
+app.get(
+
+  "/my-ownership-requests",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const recruiterId = req.user.employee_code;
+
+      const result = await pool.query(
+
+        `
+
+    SELECT
+
+    r.request_id,
+
+    r.candidate_id,
+
+    c.candidate_code,
+
+    c.first_name,
+
+    c.last_name,
+
+    c.primary_skill,
+
+    c.total_experience,
+
+    c.current_location,
+
+    r.from_recruiter_id,
+
+    owner.full_name AS owner_name,
+
+    CONCAT(
+        owner.full_name,
+        ' (',
+        owner.employee_code,
+        ')'
+    ) AS owner_display_name,
+
+    r.to_recruiter_id,
+
+    requester.full_name AS requester_name,
+
+    CONCAT(
+        requester.full_name,
+        ' (',
+        requester.employee_code,
+        ')'
+    ) AS requester_display_name,
+
+    r.reason,
+
+    r.status,
+
+    r.requested_on
+
+        FROM rm_candidate_transfer_requests r
+
+        INNER JOIN cand_mstr c
+        ON c.candidate_id = r.candidate_id
+
+        LEFT JOIN user_mstr owner
+        ON owner.employee_code = r.from_recruiter_id
+
+        LEFT JOIN user_mstr requester
+        ON requester.employee_code = r.to_recruiter_id
+
+        WHERE
+
+      r.from_recruiter_id = $1
+
+          AND r.status = 'Pending'
+
+        ORDER BY
+
+          r.requested_on DESC
+
+        `,
+
+        [
+
+          recruiterId
+
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        data: result.rows
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log(
+
+        "❌ Ownership Request Inbox Error"
+
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+
+          "Error fetching ownership requests."
+
+      });
+
+    }
+
+  }
+
+);
+
+// =====================================================
+// API 59 - Approve Candidate Ownership Transfer
+// =====================================================
+
+app.put(
+
+  "/approve-candidate-ownership/:requestId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    const client = await pool.connect();
+
+    try {
+
+      await client.query("BEGIN");
+
+      const { requestId } = req.params;
+
+      const approverId = req.user.employee_code;
+
+      // -------------------------------------------------
+      // Get Request
+      // -------------------------------------------------
+
+      const requestResult = await client.query(
+
+        `
+        SELECT *
+
+        FROM rm_candidate_transfer_requests
+
+        WHERE request_id = $1
+        `,
+
+        [
+
+          requestId
+
+        ]
+
+      );
+
+      if (requestResult.rows.length === 0) {
+
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "Ownership request not found."
+
+        });
+
+      }
+
+      const request = requestResult.rows[0];
+
+      // -------------------------------------------------
+      // Validate Current Owner
+      // -------------------------------------------------
+
+      if (request.from_recruiter_id !== approverId) {
+
+        await client.query("ROLLBACK");
+
+        return res.status(403).json({
+
+          success: false,
+
+          message:
+            "Only the current owner can approve this request."
+
+        });
+
+      }
+
+      if (request.status !== "Pending") {
+
+        await client.query("ROLLBACK");
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "This request has already been processed."
+
+        });
+
+      }
+
+      // -------------------------------------------------
+      // Transfer Ownership
+      // -------------------------------------------------
+
+      await client.query(
+
+  `
+  UPDATE cand_mstr
+
+  SET
+
+    recruiter_id = $1
+
+  WHERE candidate_id = $2
+  `,
+
+  [
+
+    request.to_recruiter_id,
+
+    request.candidate_id
+
+  ]
+
+);
+      // -------------------------------------------------
+      // Mark Request Approved
+      // -------------------------------------------------
+
+      await client.query(
+
+        `
+        UPDATE rm_candidate_transfer_requests
+
+        SET
+
+          status = 'Approved',
+
+          actioned_on = NOW(),
+
+          actioned_by = $1
+
+        WHERE request_id = $2
+        `,
+
+        [
+
+          approverId,
+
+          requestId
+
+        ]
+
+      );
+
+      // -------------------------------------------------
+      // Cancel Other Pending Requests
+      // -------------------------------------------------
+
+await client.query(
+
+  `
+
+  UPDATE rm_candidate_transfer_requests
+
+  SET
+
+    status = 'Cancelled',
+
+    actioned_on = NOW(),
+
+    actioned_by = $1
+
+  WHERE
+
+    candidate_id = $2
+
+    AND status = 'Pending'
+
+    AND request_id <> $3
+
+  `,
+
+  [
+
+    approverId,
+
+    request.candidate_id,
+
+    requestId
+
+  ]
+
+);
+
+      await client.query("COMMIT");
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+          "Candidate ownership transferred successfully."
+
+      });
+
+    }
+
+    catch (error) {
+
+      await client.query("ROLLBACK");
+
+      console.log(
+        "❌ Approve Candidate Ownership Error"
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Error approving ownership request."
+
+      });
+
+    }
+
+    finally {
+
+      client.release();
+
+    }
+
+  }
+
+);
+// =====================================================
+// API 60 - Reject Candidate Ownership Request
+// =====================================================
+
+app.put(
+
+  "/reject-candidate-ownership/:requestId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const { requestId } = req.params;
+
+      const approverId = req.user.employee_code;
+
+      const requestResult = await pool.query(
+
+        `
+
+        SELECT *
+
+        FROM rm_candidate_transfer_requests
+
+        WHERE request_id = $1
+
+        `,
+
+        [
+
+          requestId
+
+        ]
+
+      );
+
+      if (requestResult.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "Ownership request not found."
+
+        });
+
+      }
+
+      const request = requestResult.rows[0];
+
+      // ---------------------------------------------
+      // Validate Current Owner
+      // ---------------------------------------------
+
+      if (request.from_recruiter_id !== approverId) {
+
+        return res.status(403).json({
+
+          success: false,
+
+          message:
+            "Only the current owner can reject this request."
+
+        });
+
+      }
+
+      if (request.status !== "Pending") {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "This request has already been processed."
+
+        });
+
+      }
+
+      // ---------------------------------------------
+      // Reject Request
+      // ---------------------------------------------
+
+      await pool.query(
+
+        `
+
+        UPDATE rm_candidate_transfer_requests
+
+        SET
+
+          status = 'Rejected',
+
+          actioned_on = NOW(),
+
+          actioned_by = $1
+
+        WHERE request_id = $2
+
+        `,
+
+        [
+
+          approverId,
+
+          requestId
+
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+          "Ownership request rejected successfully."
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log(
+        "❌ Reject Candidate Ownership Error"
+      );
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Error rejecting ownership request."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+// =====================================================
+// API 61 - Get Candidate Ownership
+// =====================================================
+
+app.get(
+
+  "/candidate-ownership/:candidateId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const { candidateId } = req.params;
+      const recruiterId = req.user.employee_code;
+
+      const result = await pool.query(
+
+        `
+
+        SELECT
+
+          c.candidate_id,
+
+          c.recruiter_id AS owner_employee_code,
+
+          u.full_name,
+
+          CONCAT(
+
+            u.full_name,
+
+            ' (',
+
+            u.employee_code,
+
+            ')'
+
+          ) AS owner_display_name,
+
+          (c.recruiter_id = $2) AS is_owner,
+
+          EXISTS (
+
+            SELECT 1
+
+            FROM rm_candidate_transfer_requests r
+
+            WHERE
+              r.candidate_id = c.candidate_id
+              AND r.status = 'Pending'
+              AND r.to_recruiter_id = $2
+
+          ) AS pending_request
+
+        FROM cand_mstr c
+
+        LEFT JOIN user_mstr u
+
+          ON u.employee_code = c.recruiter_id
+
+        WHERE c.candidate_id = $1
+
+        `,
+
+        [candidateId, recruiterId]
+
+      );
+
+      if (result.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      res.status(200).json({
+
+        success: true,
+
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Candidate Ownership Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error fetching candidate ownership."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 62 - Release Candidate Mapping
+// =====================================================
+
+app.put(
+
+  "/release-candidate-mapping/:candidateId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const { candidateId } = req.params;
+
+      const activeMapping = await pool.query(
+
+        `
+
+        SELECT
+          mapping_id,
+          candidate_id,
+          requisition_code
+
+        FROM rm_candidate_mappings
+
+        WHERE candidate_id = $1
+
+          AND is_active = true
+
+        LIMIT 1
+
+        `,
+
+        [candidateId]
+
+      );
+
+      if (activeMapping.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "No active requisition mapping found."
+
+        });
+
+      }
+
+      const mappingRow = activeMapping.rows[0];
+
+      await pool.query(
+
+        `
+
+        UPDATE rm_candidate_mappings
+
+        SET is_active = false
+
+        WHERE candidate_id = $1
+
+          AND is_active = true
+
+        `,
+
+        [candidateId]
+
+      );
+
+      await pool.query(
+
+        `
+
+        INSERT INTO rm_pipeline_history (
+          requisition_code,
+          mapping_id,
+          candidate_id,
+          event_type,
+          actor,
+          actor_code,
+          actor_role,
+          comments
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+
+        `,
+
+        [
+          mappingRow.requisition_code,
+          mappingRow.mapping_id,
+          mappingRow.candidate_id,
+          "CandidateReleased",
+          req.user.full_name,
+          req.user.employee_code,
+          req.user.role_name,
+          "Candidate released from requisition"
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        message: "Candidate released from active requisition."
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Release Candidate Mapping Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error releasing candidate mapping."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 63 - Get Active Candidate Sources
+// =====================================================
+
+app.get(
+
+  "/candidate-sources",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const result = await pool.query(
+
+        `
+
+        SELECT
+          id AS source_id,
+          code AS source_code,
+          name AS source_name,
+          NULL AS ownership_strategy
+
+        FROM md_candidate_sources
+
+        WHERE status = 'Active'
+
+        ORDER BY name ASC
+
+        `
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        count: result.rows.length,
+
+        data: result.rows
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Get Candidate Sources Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error fetching candidate sources."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 64 - Create Candidate Intake Record
+// =====================================================
+
+app.post(
+
+  "/candidate-intake",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const {
+        source_id,
+        source_reference,
+        original_file_name,
+        resume_path
+      } = req.body;
+
+      if (!source_id) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message: "source_id is required."
+
+        });
+
+      }
+
+      const result = await pool.query(
+
+        `
+
+        INSERT INTO rm_candidate_intake (
+          source_id,
+          source_reference,
+          original_file_name,
+          resume_path
+        ) VALUES ($1, $2, $3, $4)
+
+        RETURNING *
+
+        `,
+
+        [
+          source_id,
+          source_reference,
+          original_file_name,
+          resume_path
+        ]
+
+      );
+
+      res.status(201).json({
+
+        success: true,
+
+        message: "Candidate intake record created successfully.",
+
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Create Candidate Intake Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error creating candidate intake record."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 65 - Process Candidate Intake Resume Upload
+// =====================================================
+
+app.post(
+
+  "/candidate-intake/:intakeId/process",
+
+  verifyToken,
+
+  upload.single("resume"),
+
+  async (req, res) => {
+
+    try {
+
+      const intakeId = req.params.intakeId;
+
+      if (!req.file) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message: "Resume file is required."
+
+        });
+
+      }
+
+      const existingIntake = await pool.query(
+
+        `
+
+        SELECT intake_id
+        FROM rm_candidate_intake
+        WHERE intake_id = $1
+
+        `,
+
+        [intakeId]
+
+      );
+
+      if (existingIntake.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "Candidate intake record not found."
+
+        });
+
+      }
+
+      const resumePath =
+        await uploadResumeToMinio(req.file);
+
+      const originalFileName =
+        req.file.originalname;
+
+      const intakeStatus = "RESUME_UPLOADED";
+
+      const result = await pool.query(
+
+        `
+
+        UPDATE rm_candidate_intake
+        SET
+          resume_path = $1,
+          original_file_name = $2,
+          intake_status = $3
+        WHERE intake_id = $4
+
+        RETURNING intake_id, intake_status
+
+        `,
+
+        [
+          resumePath,
+          originalFileName,
+          intakeStatus,
+          intakeId
+        ]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        intake_id: result.rows[0].intake_id,
+
+        intake_status: result.rows[0].intake_status
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Process Candidate Intake Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error processing candidate intake resume."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 66 - Parse Candidate Intake Resume
+// =====================================================
+
+app.post(
+
+  "/candidate-intake/:intakeId/parse",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    const intakeId = req.params.intakeId;
+
+    try {
+
+      const existingIntake = await pool.query(
+
+        `
+
+        SELECT
+          intake_id,
+          source_id,
+          resume_path,
+          original_file_name,
+          parsing_status,
+          created_draft_id
+        FROM rm_candidate_intake
+        WHERE intake_id = $1
+
+        `,
+
+        [intakeId]
+
+      );
+
+      if (existingIntake.rows.length === 0) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message: "Candidate intake record not found."
+
+        });
+
+      }
+
+      const intake = existingIntake.rows[0];
+
+      if (!intake.resume_path) {
+
+        const errorMessage =
+          "Resume path is not set for this intake record.";
+
+        await markIntakeParsingFailed(intakeId, errorMessage);
+
+        return res.status(400).json({
+
+          success: false,
+
+          message: errorMessage
+
+        });
+
+      }
+
+      let resumeBuffer;
+
+      try {
+
+        resumeBuffer =
+          await downloadResumeFromMinio(intake.resume_path);
+
+      }
+
+      catch (downloadError) {
+
+        if (downloadError.isStatObjectFailure) {
+
+          return res.status(500).json({
+
+            bucket: downloadError.bucket,
+
+            objectKey: downloadError.objectKey
+
+          });
+
+        }
+
+        const errorMessage =
+          `Failed to download resume from storage: ${downloadError.message}`;
+
+        await markIntakeParsingFailed(intakeId, errorMessage);
+
+        return res.status(500).json({
+
+          success: false,
+
+          message: errorMessage
+
+        });
+
+      }
+
+      const originalFileName =
+        (intake.original_file_name || "").toLowerCase();
+
+      if (
+        originalFileName &&
+        !originalFileName.endsWith(".pdf")
+      ) {
+
+        const errorMessage =
+          "Only PDF resume parsing is currently supported.";
+
+        await markIntakeParsingFailed(intakeId, errorMessage);
+
+        return res.status(400).json({
+
+          success: false,
+
+          message: errorMessage
+
+        });
+
+      }
+
+      let extractedText;
+
+      try {
+
+        extractedText =
+          await extractPdfText(resumeBuffer);
+
+      }
+
+      catch (parseError) {
+
+        const errorMessage =
+          parseError.message ||
+          "Failed to extract text from resume PDF.";
+
+        await markIntakeParsingFailed(intakeId, errorMessage);
+
+        return res.status(500).json({
+
+          success: false,
+
+          message: errorMessage
+
+        });
+
+      }
+
+      const parsed_candidate =
+        parseBasicCandidateInfo(extractedText);
+
+      const draft_candidate_id =
+        await createDraftCandidateFromParsedIntake({
+          intake,
+          parsedCandidate: parsed_candidate,
+          createdBy: req.user?.employee_code
+        });
+
+      const result = await pool.query(
+
+        `
+
+        UPDATE rm_candidate_intake
+        SET
+          parsing_status = 'COMPLETED',
+          error_message = NULL,
+          created_draft_id = $1
+        WHERE intake_id = $2
+
+        RETURNING intake_id, parsing_status
+
+        `,
+
+        [draft_candidate_id, intakeId]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        intake_id: result.rows[0].intake_id,
+
+        parsing_status: result.rows[0].parsing_status,
+
+        parsed_candidate,
+
+        draft_candidate_id
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Parse Candidate Intake Error");
+
+      console.error(error.stack || error);
+
+      const errorMessage =
+        error.message ||
+        "Error parsing candidate intake resume.";
+
+      try {
+
+        await markIntakeParsingFailed(intakeId, errorMessage);
+
+      }
+
+      catch (updateError) {
+
+        console.log("❌ Failed to update intake parsing status");
+
+        console.log(updateError);
+
+      }
+
+      res.status(500).json({
+
+        success: false,
+
+        message: errorMessage
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 67 - Candidate Intake Dashboard Summary
+// =====================================================
+
+app.get(
+
+  "/candidate-intake/dashboard",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const result = await pool.query(
+
+        `
+
+        SELECT
+          COUNT(*)::int AS total_intakes,
+          COUNT(*) FILTER (
+            WHERE intake_status = 'RESUME_UPLOADED'
+          )::int AS uploaded,
+          COUNT(*) FILTER (
+            WHERE parsing_status = 'COMPLETED'
+          )::int AS parsed,
+          COUNT(*) FILTER (
+            WHERE review_status = 'PENDING'
+          )::int AS pending_review,
+          COUNT(*) FILTER (
+            WHERE created_draft_id IS NOT NULL
+          )::int AS candidate_created
+        FROM rm_candidate_intake
+
+        `
+
+      );
+
+      const dashboard = result.rows[0];
+
+      res.status(200).json({
+
+        success: true,
+
+        dashboard: {
+          total_intakes: dashboard.total_intakes,
+          uploaded: dashboard.uploaded,
+          parsed: dashboard.parsed,
+          pending_review: dashboard.pending_review,
+          candidate_created: dashboard.candidate_created
+        }
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Candidate Intake Dashboard Error");
+
+      console.log(error);
+
+      res.status(500).json({
+
+        success: false,
+
+        message: "Error fetching candidate intake dashboard."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// Serve React Frontend
+// =====================================================
+
+app.use(
+  express.static(
+    path.join(
+      __dirname,
+      "../ATS-Frontend/dist"
+    )
+  )
+);
+
+app.get(/^\/(?!api).*/, (req, res) => {
+
+  res.sendFile(
+
+    path.join(
+      __dirname,
+      "../ATS-Frontend/dist/index.html"
+    )
+
+  );
+
+});
 // =====================================================
 // Start Server
 // =====================================================

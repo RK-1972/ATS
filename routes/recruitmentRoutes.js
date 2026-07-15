@@ -180,7 +180,7 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/recruitment/candidate-mappings", guard, async (req, res) => {
+  app.post("/api/v1/recruitment/candidate-mappings", operatorGuard, async (req, res) => {
     try {
       const result = await recruitmentService.mapCandidate(pool, req.body, req);
       res.status(201).json({ success: true, ...result });
