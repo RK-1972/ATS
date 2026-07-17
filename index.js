@@ -546,11 +546,15 @@ if (isProduction) {
 
 const pool = new Pool(poolConfig);
 
+// Prevent process exit when PostgreSQL drops idle pool connections (e.g. 57P01).
+pool.on("error", (err) => {
+  console.error("⚠️ PostgreSQL pool idle client error:", err.message);
+});
+
 pool.connect()
-  .then(() => {
-
+  .then((client) => {
+    client.release();
     console.log("✅ PostgreSQL Connected");
-
   })
   .catch((err) => {
 
@@ -3009,8 +3013,28 @@ app.post("/login", async (req, res) => {
       email_id,
       password
 
-    } = req.body;
+    } = req.body || {};
 
+    console.log("[login] Incoming request", {
+      email_id: email_id || null,
+      has_password: typeof password === "string" && password.length > 0
+    });
+
+    if (
+      !email_id ||
+      typeof password !== "string"
+    ) {
+
+      return res.status(400).json({
+
+        success: false,
+        message: "Email and password are required"
+
+      });
+
+    }
+
+    console.log("[login] Executing user lookup query");
 
     const userResult = await pool.query(
 
@@ -3026,6 +3050,10 @@ app.post("/login", async (req, res) => {
 
     );
 
+    console.log("[login] Query result", {
+      row_count: userResult.rows.length
+    });
+
     if (userResult.rows.length === 0) {
 
       return res.status(401).json({
@@ -3039,14 +3067,57 @@ app.post("/login", async (req, res) => {
 
     const user = userResult.rows[0];
 
+    if (!user.password_hash) {
 
-    const validPassword =
-      await bcrypt.compare(
+      console.error("[login] User record missing password_hash", {
+        user_id: user.user_id,
+        email_id: user.email_id
+      });
 
-        password,
-        user.password_hash
+      return res.status(401).json({
 
-      );
+        success: false,
+        message: "Invalid Password"
+
+      });
+
+    }
+
+    let validPassword = false;
+
+    try {
+
+      validPassword =
+        await bcrypt.compare(
+
+          password,
+          user.password_hash
+
+        );
+
+    }
+
+    catch (compareError) {
+
+      console.error("[login] Password comparison failed", {
+        user_id: user.user_id,
+        email_id: user.email_id,
+        message: compareError.message
+      });
+
+      return res.status(401).json({
+
+        success: false,
+        message: "Invalid Password"
+
+      });
+
+    }
+
+    console.log("[login] Password comparison result", {
+      user_id: user.user_id,
+      valid: validPassword
+    });
 
     if (!validPassword) {
 
@@ -3059,6 +3130,20 @@ app.post("/login", async (req, res) => {
 
     }
 
+    if (!process.env.JWT_SECRET) {
+
+      console.error("[login] JWT_SECRET is not configured");
+
+      return res.status(500).json({
+
+        success: false,
+        message: "Login Error"
+
+      });
+
+    }
+
+    console.log("[login] Generating JWT");
 
     const token = jwt.sign(
 
@@ -3081,6 +3166,10 @@ app.post("/login", async (req, res) => {
       }
 
     );
+
+    console.log("[login] JWT generated", {
+      user_id: user.user_id
+    });
 
 
     res.status(200).json({
@@ -3110,7 +3199,10 @@ app.post("/login", async (req, res) => {
 
     console.log("❌ Login Error");
 
-    console.log(error);
+    console.error("[login] Exception", {
+      message: error.message,
+      stack: error.stack
+    });
 
     res.status(500).json({
 
