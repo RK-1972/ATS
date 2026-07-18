@@ -8,7 +8,13 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const { Pool } = require("pg");
-const Minio = require("minio");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  HeadBucketCommand
+} = require("@aws-sdk/client-s3");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const path = require("path");
@@ -566,61 +572,39 @@ pool.connect()
 
 
 // =====================================================
-// MinIO Configuration
+// Cloudflare R2 Configuration
 // =====================================================
 
-const minioClient = new Minio.Client({
-
-  endPoint: process.env.MINIO_ENDPOINT,
-  port: parseInt(process.env.MINIO_PORT),
-  useSSL: false,
-  accessKey: process.env.MINIO_ACCESS_KEY,
-  secretKey: process.env.MINIO_SECRET_KEY,
-
+const r2Client = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
 });
 
-const bucketName = process.env.MINIO_BUCKET;
+const bucketName = process.env.R2_BUCKET;
 
-
-// =====================================================
-// Ensure Bucket Exists
-// =====================================================
-
-async function initializeBucket() {
-
+async function initializeR2() {
   try {
-
-    const exists =
-      await minioClient.bucketExists(bucketName);
-
-    if (!exists) {
-
-      await minioClient.makeBucket(bucketName);
-
-      console.log("✅ MinIO Bucket Created");
-
-    }
-
-    else {
-
-      console.log("✅ MinIO Bucket Exists");
-
-    }
-
-  }
-
-  catch (error) {
-
-    console.warn(
-      "⚠️ MinIO unavailable at startup — continuing without object storage"
+    await r2Client.send(
+      new HeadBucketCommand({
+        Bucket: bucketName,
+      })
     );
-    console.warn(error?.message || error);
+
+    console.log("✅ Cloudflare R2 Bucket Connected");
+
+  } catch (err) {
+
+    console.warn("⚠️ Cloudflare R2 unavailable at startup");
+    console.warn(err.message);
 
   }
-
 }
 
-initializeBucket();
+initializeR2();
 
 
 // =====================================================
@@ -636,21 +620,21 @@ const upload = multer({
 });
 
 
-async function uploadResumeToMinio(file) {
+async function uploadResumeToStorage(file) {
 
   const fileName =
     `${Date.now()}-${file.originalname}`;
 
-  await minioClient.putObject(
-
-    bucketName,
-    fileName,
-    file.buffer,
-    file.size
-
+  await r2Client.send(
+    new PutObjectCommand({
+      Bucket: bucketName,
+      Key: fileName,
+      Body: file.buffer,
+      ContentType: file.mimetype
+    })
   );
 
-  return `http://localhost:9000/${bucketName}/${fileName}`;
+  return fileName;
 
 }
 
@@ -690,27 +674,9 @@ catch (error) {
 }
 
 
-function resolveMinioObjectKey(resumePath) {
+function resolveStorageObjectKey(resumePath) {
 
-  const url = new URL(resumePath);
-  const pathParts =
-    url.pathname.split("/").filter(Boolean);
-
-  let objectKey;
-
-  if (pathParts[0] === bucketName) {
-
-    objectKey = pathParts.slice(1).join("/");
-
-  }
-
-  else {
-
-    objectKey = pathParts.join("/");
-
-  }
-
-  return decodeURIComponent(objectKey);
+  return resumePath;
 
 }
 
@@ -730,14 +696,21 @@ function streamToBuffer(stream) {
 }
 
 
-async function downloadResumeFromMinio(resumePath) {
+async function downloadResumeFromStorage(resumePath) {
 
   const objectKey =
-    resolveMinioObjectKey(resumePath);
+    resolveStorageObjectKey(resumePath);
+
+  let response;
 
   try {
 
-    await minioClient.statObject(bucketName, objectKey);
+    response = await r2Client.send(
+      new GetObjectCommand({
+        Bucket: bucketName,
+        Key: objectKey
+      })
+    );
 
   }
 
@@ -753,10 +726,7 @@ async function downloadResumeFromMinio(resumePath) {
 
   }
 
-  const stream =
-    await minioClient.getObject(bucketName, objectKey);
-
-  return streamToBuffer(stream);
+  return streamToBuffer(response.Body);
 
 }
 
@@ -1246,20 +1216,8 @@ app.post(
 
       if (req.file) {
 
-        const fileName =
-          `${Date.now()}-${req.file.originalname}`;
-
-        await minioClient.putObject(
-
-          bucketName,
-          fileName,
-          req.file.buffer,
-          req.file.size
-
-        );
-
         resumePath =
-          `http://localhost:9000/${bucketName}/${fileName}`;
+          await uploadResumeToStorage(req.file);
 
       }
 
@@ -1648,20 +1606,8 @@ app.put(
 
       if (req.file) {
 
-        const fileName =
-          `${Date.now()}-${req.file.originalname}`;
-
-        await minioClient.putObject(
-
-          bucketName,
-          fileName,
-          req.file.buffer,
-          req.file.size
-
-        );
-
         resumePath =
-          `http://localhost:9000/${bucketName}/${fileName}`;
+          await uploadResumeToStorage(req.file);
 
       }
 
@@ -8051,7 +7997,7 @@ app.post(
       }
 
       const resumePath =
-        await uploadResumeToMinio(req.file);
+        await uploadResumeToStorage(req.file);
 
       const originalFileName =
         req.file.originalname;
@@ -8188,7 +8134,7 @@ app.post(
       try {
 
         resumeBuffer =
-          await downloadResumeFromMinio(intake.resume_path);
+          await downloadResumeFromStorage(intake.resume_path);
 
       }
 
@@ -8463,6 +8409,7 @@ if (isLocalDevelopment) {
   });
 
 }
+
 // =====================================================
 // Start Server
 // =====================================================
