@@ -92,12 +92,20 @@ CREATE TABLE IF NOT EXISTS can_education (
   year_of_passing INT,
   percentage NUMERIC(5, 2),
   cgpa NUMERIC(4, 2),
+  from_date DATE,
+  to_date DATE,
+  score_type VARCHAR(30),
   active_flag BOOLEAN NOT NULL DEFAULT TRUE,
   created_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   modified_on TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_can_education_candidate ON can_education(candidate_id);
+
+-- Additive columns for existing can_education installs (CREATE IF NOT EXISTS is a no-op)
+ALTER TABLE can_education ADD COLUMN IF NOT EXISTS from_date DATE;
+ALTER TABLE can_education ADD COLUMN IF NOT EXISTS to_date DATE;
+ALTER TABLE can_education ADD COLUMN IF NOT EXISTS score_type VARCHAR(30);
 
 -- ---------------------------------------------------------------------------
 -- can_experience

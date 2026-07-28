@@ -1,0 +1,422 @@
+{
+  "locations_count": {
+    "c": 0
+  },
+  "work_locations": [
+    {
+      "code": "CLS",
+      "name": "Client Site"
+    },
+    {
+      "code": "HYB",
+      "name": "Hybrid"
+    },
+    {
+      "code": "OFF",
+      "name": "Office"
+    },
+    {
+      "code": "REM",
+      "name": "Remote"
+    }
+  ],
+  "cities": [
+    {
+      "code": "AMD",
+      "name": "Ahmedabad"
+    },
+    {
+      "code": "AMR",
+      "name": "Amritsar"
+    },
+    {
+      "code": "AUR",
+      "name": "Aurangabad"
+    },
+    {
+      "code": "BLR",
+      "name": "Bengaluru"
+    },
+    {
+      "code": "BPL",
+      "name": "Bhopal"
+    },
+    {
+      "code": "BBS",
+      "name": "Bhubaneswar"
+    },
+    {
+      "code": "CHD",
+      "name": "Chandigarh"
+    },
+    {
+      "code": "CHE",
+      "name": "Chennai"
+    },
+    {
+      "code": "CBE",
+      "name": "Coimbatore"
+    },
+    {
+      "code": "CTC",
+      "name": "Cuttack"
+    },
+    {
+      "code": "FBD",
+      "name": "Faridabad"
+    },
+    {
+      "code": "GTR",
+      "name": "Guntur"
+    },
+    {
+      "code": "GGN",
+      "name": "Gurugram"
+    },
+    {
+      "code": "GUW",
+      "name": "Guwahati"
+    },
+    {
+      "code": "HBL",
+      "name": "Hubballi"
+    },
+    {
+      "code": "HYD",
+      "name": "Hyderabad"
+    },
+    {
+      "code": "IDR",
+      "name": "Indore"
+    },
+    {
+      "code": "JPR",
+      "name": "Jaipur"
+    },
+    {
+      "code": "JMU",
+      "name": "Jammu"
+    },
+    {
+      "code": "KNP",
+      "name": "Kanpur"
+    },
+    {
+      "code": "KOC",
+      "name": "Kochi"
+    },
+    {
+      "code": "KOL",
+      "name": "Kolkata"
+    },
+    {
+      "code": "CLT",
+      "name": "Kozhikode"
+    },
+    {
+      "code": "LKO",
+      "name": "Lucknow"
+    },
+    {
+      "code": "LDH",
+      "name": "Ludhiana"
+    },
+    {
+      "code": "MDU",
+      "name": "Madurai"
+    },
+    {
+      "code": "MNG",
+      "name": "Mangaluru"
+    },
+    {
+      "code": "MOH",
+      "name": "Mohali"
+    },
+    {
+      "code": "MUM",
+      "name": "Mumbai"
+    },
+    {
+      "code": "MYS",
+      "name": "Mysuru"
+    },
+    {
+      "code": "NGP",
+      "name": "Nagpur"
+    },
+    {
+      "code": "NSK",
+      "name": "Nashik"
+    },
+    {
+      "code": "DEL",
+      "name": "New Delhi"
+    },
+    {
+      "code": "NOD",
+      "name": "Noida"
+    },
+    {
+      "code": "GOA",
+      "name": "Panaji"
+    },
+    {
+      "code": "PAT",
+      "name": "Patna"
+    },
+    {
+      "code": "PUN",
+      "name": "Pune"
+    },
+    {
+      "code": "RPR",
+      "name": "Raipur"
+    },
+    {
+      "code": "RJK",
+      "name": "Rajkot"
+    },
+    {
+      "code": "RNC",
+      "name": "Ranchi"
+    },
+    {
+      "code": "SML",
+      "name": "Shimla"
+    },
+    {
+      "code": "SLG",
+      "name": "Siliguri"
+    },
+    {
+      "code": "SXR",
+      "name": "Srinagar"
+    },
+    {
+      "code": "SRT",
+      "name": "Surat"
+    },
+    {
+      "code": "TVM",
+      "name": "Thiruvananthapuram"
+    },
+    {
+      "code": "TRC",
+      "name": "Tiruchirappalli"
+    },
+    {
+      "code": "UDA",
+      "name": "Udaipur"
+    },
+    {
+      "code": "VDR",
+      "name": "Vadodara"
+    },
+    {
+      "code": "VJA",
+      "name": "Vijayawada"
+    },
+    {
+      "code": "VSK",
+      "name": "Visakhapatnam"
+    },
+    {
+      "code": "WRG",
+      "name": "Warangal"
+    }
+  ],
+  "delivery_units": [
+    {
+      "code": "DU006",
+      "name": "AI & Automation"
+    },
+    {
+      "code": "DU003",
+      "name": "Cloud Services"
+    },
+    {
+      "code": "DU009",
+      "name": "Cyber Security"
+    },
+    {
+      "code": "DU005",
+      "name": "Data Engineering"
+    },
+    {
+      "code": "DU004",
+      "name": "DevOps & Platform"
+    },
+    {
+      "code": "DU002",
+      "name": "Digital Engineering"
+    },
+    {
+      "code": "DU007",
+      "name": "ERP Services"
+    },
+    {
+      "code": "DU010",
+      "name": "Infrastructure Services"
+    },
+    {
+      "code": "DU008",
+      "name": "Managed Services"
+    },
+    {
+      "code": "DU001",
+      "name": "Quality Engineering"
+    }
+  ],
+  "departments": [
+    {
+      "code": "SAL",
+      "name": "Business Development"
+    },
+    {
+      "code": "FIN",
+      "name": "Finance"
+    },
+    {
+      "code": "GEN",
+      "name": "General Administration"
+    },
+    {
+      "code": "HRO",
+      "name": "Human Resources Operations"
+    },
+    {
+      "code": "ITF",
+      "name": "IT Infrastructure"
+    },
+    {
+      "code": "MAR",
+      "name": "Marketing"
+    },
+    {
+      "code": "PMO",
+      "name": "Project Management Office"
+    },
+    {
+      "code": "TAS",
+      "name": "Talent Strategy"
+    },
+    {
+      "code": "TES",
+      "name": "Testing"
+    }
+  ],
+  "grades": [
+    {
+      "code": "G1",
+      "name": "Executive"
+    },
+    {
+      "code": "G10",
+      "name": "Vice President"
+    },
+    {
+      "code": "G11",
+      "name": "Senior Vice President"
+    },
+    {
+      "code": "G12",
+      "name": "Chief Executive"
+    },
+    {
+      "code": "G2",
+      "name": "Associate"
+    },
+    {
+      "code": "G3",
+      "name": "Senior Associate"
+    },
+    {
+      "code": "G4",
+      "name": "Lead"
+    },
+    {
+      "code": "G5",
+      "name": "Manager"
+    },
+    {
+      "code": "G6",
+      "name": "Senior Manager"
+    },
+    {
+      "code": "G7",
+      "name": "Associate Director"
+    },
+    {
+      "code": "G8",
+      "name": "Director"
+    },
+    {
+      "code": "G9",
+      "name": "Senior Director"
+    }
+  ],
+  "employment_types": [
+    {
+      "code": "APP",
+      "name": "Apprentice"
+    },
+    {
+      "code": "CON",
+      "name": "Contract"
+    },
+    {
+      "code": "FTC",
+      "name": "Fixed Term"
+    },
+    {
+      "code": "FUL",
+      "name": "Full Time"
+    },
+    {
+      "code": "INT",
+      "name": "Intern"
+    },
+    {
+      "code": "PRT",
+      "name": "Part Time"
+    },
+    {
+      "code": "TRN",
+      "name": "Trainee"
+    }
+  ],
+  "approved_positions": [
+    {
+      "position_id": "AP-2026-0054",
+      "department": "Engineering",
+      "grade": "L4",
+      "position_title": "Data Engineer",
+      "status": "Expiring Soon"
+    },
+    {
+      "position_id": "AP-2026-0062",
+      "department": "Quality Assurance",
+      "grade": "L5",
+      "position_title": "QA Lead",
+      "status": "Fully Utilized"
+    },
+    {
+      "position_id": "AP-2026-0076",
+      "department": "Engineering",
+      "grade": "L5",
+      "position_title": "Senior Backend Engineer",
+      "status": "Active"
+    },
+    {
+      "position_id": "AP-2026-0089",
+      "department": "Delivery",
+      "grade": "L5",
+      "position_title": "Project Manager",
+      "status": "Active"
+    }
+  ],
+  "approval_route_exists": {
+    "reg": "approval_route_mstr"
+  }
+}

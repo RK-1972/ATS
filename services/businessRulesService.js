@@ -148,11 +148,16 @@ async function loadPlatformConfig(pool) {
   return result.rows[0].published_payload;
 }
 
-async function syncNormalizedTables(pool, payload, userName, version, versionStatus) {
-  const client = await pool.connect();
+async function syncNormalizedTables(queryable, payload, userName, version, versionStatus) {
+  // Pool has no release(); PoolClient does. Join outer TX when already a client.
+  const isClient = typeof queryable.release === "function";
+  const client = isClient ? queryable : await queryable.connect();
+  const manageTx = !isClient;
 
   try {
-    await client.query("BEGIN");
+    if (manageTx) {
+      await client.query("BEGIN");
+    }
     const effectiveFrom = new Date();
     const meta = payload.meta || {};
 
@@ -305,12 +310,18 @@ async function syncNormalizedTables(pool, payload, userName, version, versionSta
       );
     }
 
-    await client.query("COMMIT");
+    if (manageTx) {
+      await client.query("COMMIT");
+    }
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (manageTx) {
+      await client.query("ROLLBACK");
+    }
     throw error;
   } finally {
-    client.release();
+    if (manageTx) {
+      client.release();
+    }
   }
 }
 

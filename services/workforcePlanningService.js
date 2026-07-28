@@ -1,14 +1,178 @@
 const businessRulesService = require("./businessRulesService");
 const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
+const approvalRouteResolverService = require("./approvalRouteResolverService");
+const approvalRouteRepository = require("../repositories/approvalRouteRepository");
+const userPermissionRepository = require("../repositories/userPermissionRepository");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "workforcePlanning.seed.json");
+const RAISE_BUDGET_REQUEST_CODE = "RAISE_BUDGET_REQUEST";
+const BUDGET_PENDING_LEVEL_1_STATUS = "Pending Level-1 Approval";
+const BUDGET_PENDING_LEVEL_2_STATUS = "Pending Level-2 Approval";
+
+function isBudgetPendingLevel1(status) {
+  const value = String(status || "").trim();
+  return (
+    value === BUDGET_PENDING_LEVEL_1_STATUS
+    || value === "Pending TA Lead"
+  );
+}
+
+function isBudgetPendingLevel2(status) {
+  const value = String(status || "").trim();
+  return (
+    value === BUDGET_PENDING_LEVEL_2_STATUS
+    || value === "Pending Finance"
+  );
+}
+
+function resumeBudgetStatusAfterClarification(request) {
+  const approver = String(request?.current_approver || "");
+  if (
+    isBudgetPendingLevel2(request?.status)
+    || /level-2|finance/i.test(approver)
+  ) {
+    return BUDGET_PENDING_LEVEL_2_STATUS;
+  }
+  return BUDGET_PENDING_LEVEL_1_STATUS;
+}
 
 function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+/**
+ * Admins may always raise Budget Requests.
+ * Other users require RAISE_BUDGET_REQUEST via Enterprise User Permissions.
+ */
+async function assertCanRaiseBudgetRequest(pool, req) {
+  const roleName = String(req?.user?.role_name || "").trim();
+
+  if (roleName === "Admin") {
+    return;
+  }
+
+  const employeeCode = String(req?.user?.employee_code || "").trim();
+
+  if (!employeeCode) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to raise Budget Requests.",
+      403
+    );
+  }
+
+  const allowed = await userPermissionRepository.hasPermission(
+    pool,
+    employeeCode,
+    RAISE_BUDGET_REQUEST_CODE
+  );
+
+  if (!allowed) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to raise Budget Requests.",
+      403
+    );
+  }
+}
+
+async function buildApprovalRouteSnapshot(pool, approvalRouteId) {
+  const route = await approvalRouteRepository.getApprovalRoute(pool, approvalRouteId);
+
+  if (!route) {
+    throw httpError(`Approval route not found: ${approvalRouteId}`, 404);
+  }
+
+  const steps = await approvalRouteRepository.getApprovalRouteSteps(
+    pool,
+    approvalRouteId
+  );
+
+  return {
+    route_id: route.route_id,
+    route_name: route.route_name,
+    applies_to: route.applies_to,
+    status: route.status,
+    effective_from: route.effective_from,
+    max_approval_days: route.max_approval_days,
+    frozen_on: new Date().toISOString(),
+    steps: (steps || []).map((step) => ({
+      step_id: step.step_id,
+      step_no: step.step_no,
+      sequence_no: step.sequence_no,
+      approver_employee_code: step.approver_employee_code,
+      approval_type: step.approval_type,
+      comments_required: step.comments_required,
+      allow_reject: step.allow_reject,
+      allow_return: step.allow_return,
+      stop_if_rejected: step.stop_if_rejected
+    }))
+  };
+}
+
+/**
+ * Audit-only capture of the matching Approval Policy at submit time.
+ * Does not change route resolution behaviour.
+ */
+async function buildApprovalPolicySnapshot(pool, documentType, criteria) {
+  const matches = await approvalRouteRepository.findMatchingActivePolicies(
+    pool,
+    documentType,
+    criteria
+  );
+
+  if (!matches.length) {
+    return null;
+  }
+
+  // Prefer the single exact match; if multiple policies map to one route,
+  // still capture the first for audit without changing routing.
+  const policy = matches[0];
+
+  return {
+    policy_id: policy.policy_id,
+    route_id: policy.route_id,
+    route_name: policy.route_name,
+    route_applies_to: policy.route_applies_to,
+    department: policy.department,
+    designation: policy.designation,
+    grade: policy.grade,
+    min_amount:
+      policy.min_amount !== null && policy.min_amount !== undefined
+        ? Number(policy.min_amount)
+        : null,
+    max_amount:
+      policy.max_amount !== null && policy.max_amount !== undefined
+        ? Number(policy.max_amount)
+        : null,
+    is_active: Boolean(policy.is_active),
+    effective_from: policy.effective_from,
+    effective_to: policy.effective_to,
+    frozen_on: new Date().toISOString()
+  };
+}
+
+/**
+ * Lock the shared Workforce Planning config row for exclusive submit
+ * (same FOR UPDATE pattern as Talent Demand draft submit).
+ */
+async function lockWorkforceConfigState(client) {
+  await ensureConfigState(client);
+
+  const locked = await client.query(
+    `SELECT *
+     FROM wp_config_state
+     WHERE id = 1
+     FOR UPDATE`
+  );
+
+  if (!locked.rows[0]) {
+    throw httpError("Workforce Planning configuration state not found.", 500);
+  }
+
+  return locked.rows[0];
 }
 
 function clonePayload(payload) {
@@ -88,10 +252,12 @@ async function validateMasterDataReferences(pool, request) {
   const errors = [];
   const departments = await masterDataService.listByEntityType(pool, "departments");
   const grades = await masterDataService.listByEntityType(pool, "grades");
+  const designations = await masterDataService.listByEntityType(pool, "designations");
 
   const departmentNames = new Set(departments.map((row) => row.name.toLowerCase()));
   const gradeCodes = new Set(grades.map((row) => row.code.toLowerCase()));
   const gradeNames = new Set(grades.map((row) => row.name.toLowerCase()));
+  const designationNames = new Set(designations.map((row) => row.name.toLowerCase()));
 
   if (request.department && !departmentNames.has(request.department.toLowerCase())) {
     const partial = departments.find((row) =>
@@ -100,6 +266,16 @@ async function validateMasterDataReferences(pool, request) {
     );
     if (!partial) {
       errors.push(`Department "${request.department}" not found in Master Data.`);
+    }
+  }
+
+  if (request.position && !designationNames.has(request.position.toLowerCase())) {
+    const partial = designations.find((row) =>
+      row.name.toLowerCase().includes(request.position.toLowerCase())
+      || request.position.toLowerCase().includes(row.name.toLowerCase())
+    );
+    if (!partial) {
+      errors.push(`Position "${request.position}" not found in Master Data.`);
     }
   }
 
@@ -149,7 +325,11 @@ async function evaluateBudgetRules(pool, request, platformConfig) {
     budgetThreshold,
     requiresFinance,
     requiresLeadership,
-    nextApprover: requiresFinance ? "Finance" : requiresLeadership ? "TA Leader" : null
+    nextApprover: requiresFinance
+      ? "Level-2 Approver"
+      : requiresLeadership
+        ? "Level-1 Approver"
+        : null
   };
 }
 
@@ -371,7 +551,14 @@ async function syncNormalizedTables(pool, payload, userName, version, versionSta
   }
 }
 
-async function ensureWorkflowInstance(pool, request, req) {
+async function ensureWorkflowInstance(
+  pool,
+  request,
+  req,
+  approvalRouteId = null,
+  routeSnapshot = null,
+  policySnapshot = null
+) {
   if (request.workflow_instance_id) {
     return request.workflow_instance_id;
   }
@@ -383,12 +570,24 @@ async function ensureWorkflowInstance(pool, request, req) {
       instance_id: `WF-BR-${request.id}`,
       meta: {
         process_id: `WF-BR-${request.id}`,
+        document_type: "BUDGET",
+        budget_request_id: request.id,
         department: request.department,
         position_title: request.position,
-        requisition_id: request.id
+        grade: request.grade,
+        priority: request.priority || "Medium",
+        requisition_id: request.id,
+        approval_route_id: approvalRouteId,
+        approval_route_snapshot: routeSnapshot || null,
+        approval_policy_id: policySnapshot?.policy_id || null,
+        approval_policy_snapshot: policySnapshot || null
       },
       department: request.department,
-      grade: request.grade
+      grade: request.grade,
+      approval_route_id: approvalRouteId,
+      approval_route_snapshot: routeSnapshot || null,
+      approval_policy_id: policySnapshot?.policy_id || null,
+      approval_policy_snapshot: policySnapshot || null
     },
     req
   );
@@ -396,14 +595,51 @@ async function ensureWorkflowInstance(pool, request, req) {
   return instance.instanceId;
 }
 
-async function approveBudgetRequest(pool, requestId, comment, req) {
+function nextBudgetRequestId(draft) {
+  const year = new Date().getFullYear();
+  const pattern = new RegExp(`^BR-${year}-(\\d+)$`);
+  let max = 1000;
+
+  const collect = (items) => {
+    (items || []).forEach((item) => {
+      const match = String(item.id || "").match(pattern);
+      if (match) {
+        max = Math.max(max, Number(match[1]));
+      }
+    });
+  };
+
+  collect(draft.budget_requests);
+  collect(draft.approval_queue);
+
+  return `BR-${year}-${String(max + 1).padStart(4, "0")}`;
+}
+
+/**
+ * Save a Budget Request draft into the existing WP draft model
+ * (wp_config_state.draft_payload.budget_requests) only. No approval_queue
+ * entry, no workflow, no normalized wp_* writes — those happen on Submit
+ * (later step) and final approval respectively.
+ */
+async function createBudgetRequest(pool, payload, req) {
+  await assertCanRaiseBudgetRequest(pool, req);
+
   const user = userContext(req);
   const row = await ensureConfigState(pool);
   const draft = clonePayload(row.draft_payload);
-  const request = findQueueRequest(draft, requestId);
 
-  if (!request) {
-    throw httpError(`Budget request not found: ${requestId}`, 404);
+  const request = {
+    department: String(payload.department || "").trim(),
+    position: String(payload.position || "").trim(),
+    grade: String(payload.grade || "").trim(),
+    headcount: Number(payload.headcount) || 1,
+    proposed_budget: Number(payload.proposed_budget) || 0,
+    justification: String(payload.justification || "").trim(),
+    priority: payload.priority || "Medium"
+  };
+
+  if (!request.department || !request.position) {
+    throw httpError("Department and Position Title are required.", 400);
   }
 
   const mdValidation = await validateMasterDataReferences(pool, request);
@@ -411,316 +647,546 @@ async function approveBudgetRequest(pool, requestId, comment, req) {
     throw httpError(mdValidation.errors.join(" "), 400);
   }
 
-  const platformConfig = await loadPlatformConfig(pool);
-  const workforceModule = platformConfig?.modules?.find((item) => item.key === "recruitment");
-  if (platformConfig && workforceModule && !workforceModule.enabled) {
-    throw httpError("Recruitment module is disabled in Platform Configuration.", 400);
-  }
+  const requestedId = String(payload.id || "").trim();
+  let savedRequest;
 
-  const ruleEval = await evaluateBudgetRules(pool, request, platformConfig);
-  const instanceId = await ensureWorkflowInstance(pool, request, req);
-
-  let nextStatus = "Approved";
-  let nextApprover = null;
-  let approvedPosition = null;
-
-  if (request.status === "Pending TA Lead" && ruleEval.requiresFinance) {
-    nextStatus = "Pending Finance";
-    nextApprover = "Finance";
-  } else if (request.status === "Pending Finance" || !ruleEval.requiresFinance) {
-    nextStatus = "Approved";
-    approvedPosition = {
-      id: `AP-2026-${String(draft.approved_positions.length + 90).padStart(4, "0")}`,
-      department: request.department,
-      position: request.position,
-      grade: request.grade,
-      headcount: request.headcount,
-      budget_approved: request.proposed_budget,
-      budget_consumed: 0,
-      remaining_budget: request.proposed_budget,
-      expiry_date: "2026-12-31",
-      requisitions_created: 0,
-      status: "Active",
-      source_request_id: request.id
-    };
-    draft.approved_positions = [approvedPosition, ...draft.approved_positions];
-    draft.dashboard.approved_headcount += request.headcount;
-    draft.dashboard.vacant_positions += request.headcount;
-  }
-
-  const updatedRequest = appendTimelineEntry(
-    {
-      ...request,
-      status: nextStatus,
-      current_approver: nextApprover,
-      workflow_instance_id: instanceId
-    },
-    nextStatus === "Approved" ? "Approved" : "Approved by TA Lead",
-    user.name,
-    comment
-  );
-
-  draft.approval_queue = draft.approval_queue.map((item) =>
-    item.id === requestId ? updatedRequest : item
-  );
-  draft.budget_requests = draft.budget_requests.map((item) =>
-    item.id === requestId ? { ...item, status: nextStatus } : item
-  );
-
-  if (nextStatus === "Approved") {
-    await workflowService.advanceWorkflow(
-      pool,
-      instanceId,
-      "approve",
-      { stageKey: "position_budget_approval", actor: user.name, comment },
-      req
+  if (requestedId) {
+    const existing = (draft.budget_requests || []).find(
+      (item) => item.id === requestedId
     );
+
+    if (!existing) {
+      throw httpError(`Budget request not found: ${requestedId}`, 404);
+    }
+    const editableStatuses = new Set(["Draft", "Clarification Requested"]);
+    if (!editableStatuses.has(existing.status)) {
+      throw httpError(
+        `Budget request ${requestedId} is ${existing.status} and can no longer be edited.`,
+        400
+      );
+    }
+
+    const nextStatus =
+      existing.status === "Clarification Requested"
+        ? "Clarification Requested"
+        : "Draft";
+
+    savedRequest = { ...existing, ...request, status: nextStatus };
+    draft.budget_requests = draft.budget_requests.map((item) =>
+      item.id === requestedId ? savedRequest : item
+    );
+
+    if (nextStatus === "Clarification Requested") {
+      draft.approval_queue = (draft.approval_queue || []).map((item) =>
+        item.id === requestedId
+          ? { ...item, ...request, status: nextStatus }
+          : item
+      );
+    }
+  } else {
+    savedRequest = {
+      id: nextBudgetRequestId(draft),
+      ...request,
+      status: "Draft",
+      submitted_by: null,
+      submitted_on: null
+    };
+    draft.budget_requests = [savedRequest, ...(draft.budget_requests || [])];
   }
 
   draft.meta.last_updated = nowIso();
   await persistDraft(pool, draft, user.name);
 
   await writeEnterpriseAudit(pool, {
-    eventType: nextStatus === "Approved" ? "BudgetApproved" : "BudgetRouted",
+    eventType: "BudgetDraftSaved",
     module: "Workforce Planning",
     entity: "Budget Request",
-    entityId: requestId,
-    action: nextStatus === "Approved"
-      ? `Budget approved for ${request.position}`
-      : `Budget routed to ${nextApprover}`,
-    previousValue: request.status,
-    newValue: nextStatus,
+    entityId: savedRequest.id,
+    action: `Budget request draft saved for ${savedRequest.position}`,
+    previousValue: requestedId ? "Draft" : null,
+    newValue: "Draft",
     userName: user.name,
-    userRole: user.role,
-    metadata: { comment, ruleEvaluation: ruleEval.simulation }
+    userRole: user.role
   });
-
-  if (approvedPosition) {
-    await pool.query(
-      `INSERT INTO wp_position_lifecycle (position_id, event_type, from_status, to_status, actor, comments)
-       VALUES ($1,'Approved','Draft','Active',$2,$3)`,
-      [approvedPosition.id, user.name, comment || null]
-    );
-
-    await writeEnterpriseAudit(pool, {
-      eventType: "PositionApproved",
-      module: "Workforce Planning",
-      entity: "Approved Position",
-      entityId: approvedPosition.id,
-      action: `Position ${request.position} added to catalogue`,
-      userName: user.name,
-      userRole: user.role
-    });
-  }
 
   return {
     workforce: draft,
-    approvedPosition,
-    request: updatedRequest,
-    ruleEvaluation: ruleEval,
-    hiringProcessUpdate: approvedPosition
-      ? { linkedPositionId: approvedPosition.id }
-      : undefined,
-    toastMessage: nextStatus === "Approved"
-      ? "Budget request approved."
-      : `Routed to ${nextApprover} for approval.`
+    request: savedRequest,
+    toastMessage: `Budget request ${savedRequest.id} saved as draft.`
   };
 }
 
-async function rejectBudgetRequest(pool, requestId, comment, req) {
+/**
+ * Submit a Draft Budget Request into the approval queue.
+ * Status → Pending Level-1 Approval; starts workflow instance;
+ * resolves and freezes the matching Approval Route; expands Level-1 task;
+ * later route steps remain Waiting until Level-1 completes.
+ */
+async function submitBudgetRequest(pool, requestId, req) {
+  await assertCanRaiseBudgetRequest(pool, req);
+
   const user = userContext(req);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Serialize concurrent submits of any Budget against the shared WP state
+    // (reuse Talent Demand FOR UPDATE submit pattern).
+    const row = await lockWorkforceConfigState(client);
+    const draft = clonePayload(row.draft_payload);
+
+    const existing = (draft.budget_requests || []).find(
+      (item) => item.id === requestId
+    );
+
+    if (!existing) {
+      throw httpError(`Budget request not found: ${requestId}`, 404);
+    }
+
+    if (existing.status !== "Draft") {
+      throw httpError(
+        `Budget request ${requestId} has already been submitted. Current status: ${existing.status}.`,
+        409
+      );
+    }
+
+    if (existing.workflow_instance_id) {
+      throw httpError(
+        `Budget request ${requestId} already has a workflow instance and cannot be submitted again.`,
+        409
+      );
+    }
+
+    if (
+      !existing.department
+      || !existing.position
+      || !existing.grade
+      || !Number(existing.proposed_budget)
+      || !String(existing.justification || "").trim()
+      || !Number(existing.headcount)
+    ) {
+      throw httpError(
+        "Budget request is incomplete. Save a complete Draft before submitting.",
+        400
+      );
+    }
+
+    const mdValidation = await validateMasterDataReferences(client, existing);
+    if (!mdValidation.valid) {
+      throw httpError(mdValidation.errors.join(" "), 400);
+    }
+
+    const resolveCriteria = {
+      department: existing.department,
+      designation: existing.position,
+      grade: existing.grade,
+      amount: existing.proposed_budget
+    };
+
+    const approvalRouteId =
+      await approvalRouteResolverService.resolveApprovalRoute(
+        client,
+        "BUDGET",
+        resolveCriteria
+      );
+
+    const approvalRouteSnapshot = await buildApprovalRouteSnapshot(
+      client,
+      approvalRouteId
+    );
+
+    const approvalPolicySnapshot = await buildApprovalPolicySnapshot(
+      client,
+      "BUDGET",
+      resolveCriteria
+    );
+
+    const submittedOn = new Date().toISOString().slice(0, 10);
+    const instanceId = await ensureWorkflowInstance(
+      client,
+      existing,
+      req,
+      approvalRouteId,
+      approvalRouteSnapshot,
+      approvalPolicySnapshot
+    );
+
+    const approvalTasks = await workflowService.createApprovalRouteWorkflowTasks(
+      client,
+      instanceId,
+      approvalRouteId,
+      {
+        stageKey: "approval",
+        assignedBy: req.user?.employee_code || user.name,
+        requisitionCode: requestId
+      }
+    );
+
+    const level1Step = (approvalRouteSnapshot.steps || [])[0] || null;
+    const currentApprover =
+      level1Step?.approver_employee_code || "Level-1 Approver";
+    const requestorEmployeeCode =
+      req.user?.employee_code || existing.submitted_by_employee_code || null;
+
+    let queueItem = {
+      id: existing.id,
+      department: existing.department,
+      position: existing.position,
+      grade: existing.grade,
+      headcount: existing.headcount || 1,
+      proposed_budget: existing.proposed_budget || 0,
+      justification: existing.justification || null,
+      priority: existing.priority || "Medium",
+      status: BUDGET_PENDING_LEVEL_1_STATUS,
+      submitted_by: user.name,
+      submitted_by_employee_code: requestorEmployeeCode,
+      submitted_on: submittedOn,
+      current_approver: currentApprover,
+      approval_route_id: approvalRouteId,
+      approval_route_snapshot: approvalRouteSnapshot,
+      approval_policy_id: approvalPolicySnapshot?.policy_id || null,
+      approval_policy_snapshot: approvalPolicySnapshot,
+      workflow_instance_id: instanceId,
+      timeline: Array.isArray(existing.timeline) ? existing.timeline : [],
+      history: Array.isArray(existing.history) ? existing.history : []
+    };
+
+    queueItem = appendTimelineEntry(queueItem, "Submitted", user.name, null);
+
+    draft.budget_requests = (draft.budget_requests || []).map((item) =>
+      item.id === requestId
+        ? {
+            ...item,
+            status: BUDGET_PENDING_LEVEL_1_STATUS,
+            submitted_by: user.name,
+            submitted_by_employee_code: requestorEmployeeCode,
+            submitted_on: submittedOn,
+            current_approver: currentApprover,
+            approval_route_id: approvalRouteId,
+            approval_route_snapshot: approvalRouteSnapshot,
+            approval_policy_id: approvalPolicySnapshot?.policy_id || null,
+            approval_policy_snapshot: approvalPolicySnapshot,
+            workflow_instance_id: instanceId
+          }
+        : item
+    );
+
+    const queue = draft.approval_queue || [];
+    const queueIndex = queue.findIndex((item) => item.id === requestId);
+    if (queueIndex >= 0) {
+      draft.approval_queue = queue.map((item, index) =>
+        index === queueIndex ? queueItem : item
+      );
+    } else {
+      draft.approval_queue = [queueItem, ...queue];
+    }
+
+    draft.meta.last_updated = nowIso();
+    await persistDraft(client, draft, user.name);
+
+    await writeEnterpriseAudit(client, {
+      eventType: "BudgetSubmitted",
+      module: "Workforce Planning",
+      entity: "Budget Request",
+      entityId: requestId,
+      action: `Budget request submitted for Level-1 approval`,
+      previousValue: "Draft",
+      newValue: BUDGET_PENDING_LEVEL_1_STATUS,
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        workflow_instance_id: instanceId,
+        approval_route_id: approvalRouteId,
+        approval_route_snapshot: approvalRouteSnapshot,
+        approval_policy_id: approvalPolicySnapshot?.policy_id || null,
+        approval_policy_snapshot: approvalPolicySnapshot,
+        approval_task_count: approvalTasks.length
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      workforce: draft,
+      request: queueItem,
+      toastMessage: `Budget request ${requestId} submitted for Level-1 approval.`
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function resolveBudgetWorkflowInstanceId(request, requestId) {
+  return request?.workflow_instance_id || `WF-BR-${requestId}`;
+}
+
+async function findActiveBudgetApprovalTask(pool, requestId, instanceId) {
+  const candidateIds = Array.from(
+    new Set(
+      [instanceId, `WF-BR-${requestId}`, requestId]
+        .filter(Boolean)
+        .map((value) => String(value))
+    )
+  );
+
+  const result = await pool.query(
+    `SELECT
+       t.task_id,
+       t.instance_id,
+       t.title,
+       t.status AS task_status,
+       t.assignee,
+       a.assignment_id,
+       a.assignee AS assignment_assignee,
+       a.active
+     FROM wf_tasks t
+     INNER JOIN wf_assignments a
+       ON a.task_id = t.task_id
+      AND a.active IS TRUE
+     WHERE t.instance_id = ANY($1::text[])
+       AND LOWER(TRIM(t.status)) = 'pending'
+       AND LOWER(TRIM(COALESCE(t.task_type, 'approval'))) IN ('approval', 'approve')
+     ORDER BY t.task_id ASC
+     LIMIT 1`,
+    [candidateIds]
+  );
+
+  if (!result.rows[0]) {
+    throw httpError(
+      `No active approval task found for Budget request ${requestId}.`,
+      409
+    );
+  }
+
+  return result.rows[0];
+}
+
+async function loadBudgetQueueRequest(pool, requestId) {
   const row = await ensureConfigState(pool);
   const draft = clonePayload(row.draft_payload);
-  const request = findQueueRequest(draft, requestId);
+  const request =
+    findQueueRequest(draft, requestId)
+    || (draft.budget_requests || []).find((item) => item.id === requestId);
 
   if (!request) {
     throw httpError(`Budget request not found: ${requestId}`, 404);
   }
 
-  const updatedRequest = appendTimelineEntry(
-    { ...request, status: "Rejected" },
-    "Rejected",
-    user.name,
-    comment
-  );
+  return { row, draft, request };
+}
 
-  draft.approval_queue = draft.approval_queue.map((item) =>
-    item.id === requestId ? updatedRequest : item
-  );
-  draft.budget_requests = draft.budget_requests.map((item) =>
-    item.id === requestId ? { ...item, status: "Rejected" } : item
-  );
-  draft.meta.last_updated = nowIso();
+/**
+ * Approve via Workflow Engine completeTask (activates L2 or final-completes).
+ * Domain hook updates Budget status / Approved Position inside the same TX.
+ */
+async function approveBudgetRequest(pool, requestId, comment, req) {
+  const { request } = await loadBudgetQueueRequest(pool, requestId);
+  const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
+  const task = await findActiveBudgetApprovalTask(pool, requestId, instanceId);
 
-  if (request.workflow_instance_id) {
-    await workflowService.advanceWorkflow(
-      pool,
-      request.workflow_instance_id,
-      "reject",
-      { stageKey: "position_budget_approval", actor: user.name, comment },
-      req
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const assignee = String(task.assignment_assignee || task.assignee || "").trim();
+  if (!employeeCode || employeeCode !== assignee) {
+    throw httpError(
+      "Only the assigned approver may approve this Budget request.",
+      403
     );
   }
 
-  await persistDraft(pool, draft, user.name);
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "BudgetRejected",
-    module: "Workforce Planning",
-    entity: "Budget Request",
-    entityId: requestId,
-    action: `Budget rejected for ${request.position}`,
-    previousValue: request.status,
-    newValue: "Rejected",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comment }
+  const result = await workflowService.completeTask(pool, task.task_id, req, {
+    requireActiveAssignee: true,
+    comments: comment || null
   });
 
+  const bundle = await getWorkforceBundle(pool);
+  const updated =
+    bundle.config.approval_queue.find((item) => item.id === requestId)
+    || bundle.config.budget_requests.find((item) => item.id === requestId);
+
   return {
-    workforce: draft,
-    request: updatedRequest,
+    workforce: bundle.config,
+    request: updated || request,
+    workflowResult: result,
+    approvedPosition: result?.businessAction?.approved_position_id
+      ? { id: result.businessAction.approved_position_id }
+      : null,
+    toastMessage: result.workflowCompleted
+      ? "Budget request approved."
+      : "Budget approved at this level. Next approver activated."
+  };
+}
+
+async function rejectBudgetRequest(pool, requestId, comment, req) {
+  const clarificationComments = String(comment || "").trim();
+  if (!clarificationComments) {
+    throw httpError("Rejection comments are required.", 400);
+  }
+
+  const { request } = await loadBudgetQueueRequest(pool, requestId);
+  const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
+  const task = await findActiveBudgetApprovalTask(pool, requestId, instanceId);
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const assignee = String(task.assignment_assignee || task.assignee || "").trim();
+  if (!employeeCode || employeeCode !== assignee) {
+    throw httpError(
+      "Only the assigned approver may reject this Budget request.",
+      403
+    );
+  }
+
+  const result = await workflowService.rejectMyActiveApproval(
+    pool,
+    task.task_id,
+    clarificationComments,
+    req
+  );
+
+  const bundle = await getWorkforceBundle(pool);
+  const updated =
+    bundle.config.approval_queue.find((item) => item.id === requestId)
+    || bundle.config.budget_requests.find((item) => item.id === requestId);
+
+  return {
+    workforce: bundle.config,
+    request: updated || request,
+    workflowResult: result,
     toastMessage: "Budget request rejected."
   };
 }
 
 async function sendBackBudgetRequest(pool, requestId, comment, req) {
-  const user = userContext(req);
-  const row = await ensureConfigState(pool);
-  const draft = clonePayload(row.draft_payload);
-  const request = findQueueRequest(draft, requestId);
-
-  if (!request) {
-    throw httpError(`Budget request not found: ${requestId}`, 404);
-  }
-
-  const updatedRequest = appendTimelineEntry(
-    {
-      ...request,
-      status: "Sent Back",
-      current_approver: "Hiring Manager"
-    },
-    "Sent Back",
-    user.name,
-    comment
-  );
-
-  draft.approval_queue = draft.approval_queue.map((item) =>
-    item.id === requestId ? updatedRequest : item
-  );
-  draft.budget_requests = draft.budget_requests.map((item) =>
-    item.id === requestId ? { ...item, status: "Sent Back" } : item
-  );
-  draft.meta.last_updated = nowIso();
-  await persistDraft(pool, draft, user.name);
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "BudgetSentBack",
-    module: "Workforce Planning",
-    entity: "Budget Request",
-    entityId: requestId,
-    action: `Budget sent back for ${request.position}`,
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comment }
-  });
-
-  return {
-    workforce: draft,
-    request: updatedRequest,
-    toastMessage: "Budget request sent back to hiring manager."
-  };
+  return requestBudgetClarification(pool, requestId, comment, req);
 }
 
 async function requestBudgetClarification(pool, requestId, comments, req) {
-  const user = userContext(req);
-  const row = await ensureConfigState(pool);
-  const draft = clonePayload(row.draft_payload);
-  const request = findQueueRequest(draft, requestId);
-
-  if (!request) {
-    throw httpError(`Budget request not found: ${requestId}`, 404);
+  const clarificationComments = String(comments || "").trim();
+  if (!clarificationComments) {
+    throw httpError("Clarification comments are required.", 400);
   }
 
-  const instanceId = await ensureWorkflowInstance(pool, request, req);
+  const { request } = await loadBudgetQueueRequest(pool, requestId);
+  const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
+  const task = await findActiveBudgetApprovalTask(pool, requestId, instanceId);
 
-  await workflowService.requestClarification(pool, instanceId, comments, req);
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const assignee = String(task.assignment_assignee || task.assignee || "").trim();
+  if (!employeeCode || employeeCode !== assignee) {
+    throw httpError(
+      "Only the assigned approver may request clarification.",
+      403
+    );
+  }
 
-  const updatedRequest = appendTimelineEntry(
-    { ...request, status: "Clarification Requested", workflow_instance_id: instanceId },
-    "Clarification Requested",
-    user.name,
-    comments
+  const result = await workflowService.requestClarificationMyActiveApproval(
+    pool,
+    task.task_id,
+    clarificationComments,
+    req
   );
 
-  draft.approval_queue = draft.approval_queue.map((item) =>
-    item.id === requestId ? updatedRequest : item
-  );
-  draft.budget_requests = draft.budget_requests.map((item) =>
-    item.id === requestId ? { ...item, status: "Clarification Requested" } : item
-  );
-  await persistDraft(pool, draft, user.name);
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "ClarificationRequested",
-    module: "Workforce Planning",
-    entity: "Budget Request",
-    entityId: requestId,
-    action: "Clarification requested on budget request",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comments }
-  });
-
+  const bundle = await getWorkforceBundle(pool);
   return {
-    workforce: draft,
-    toastMessage: "Clarification request sent via Workflow Engine."
+    workforce: bundle.config,
+    workflowResult: result,
+    toastMessage:
+      result.toastMessage || "Clarification request sent. Workflow paused."
   };
 }
 
 async function submitBudgetClarification(pool, requestId, comments, req) {
-  const user = userContext(req);
-  const row = await ensureConfigState(pool);
-  const draft = clonePayload(row.draft_payload);
-  const request = findQueueRequest(draft, requestId);
+  const { request } = await loadBudgetQueueRequest(pool, requestId);
 
-  if (!request?.workflow_instance_id) {
+  if (request.status !== "Clarification Requested") {
+    throw httpError(
+      `Budget request ${requestId} is not awaiting clarification.`,
+      409
+    );
+  }
+
+  const requestorCode = String(request.submitted_by_employee_code || "").trim();
+  const actorCode = String(req.user?.employee_code || "").trim();
+  const isAdmin = String(req.user?.role_name || "").toLowerCase() === "admin";
+  if (requestorCode && actorCode && requestorCode !== actorCode && !isAdmin) {
+    throw httpError(
+      "Only the original requestor may resubmit clarification.",
+      403
+    );
+  }
+
+  if (!request.workflow_instance_id) {
     throw httpError("No workflow instance linked to this request.", 400);
   }
 
-  await workflowService.submitClarification(
+  const result = await workflowService.submitClarification(
     pool,
     request.workflow_instance_id,
-    comments,
+    comments || "",
     req
   );
 
-  const updatedRequest = appendTimelineEntry(
-    { ...request, status: request.current_approver ? `Pending ${request.current_approver}` : "Pending TA Lead" },
-    "Clarification Submitted",
-    user.name,
-    comments
-  );
-
-  draft.approval_queue = draft.approval_queue.map((item) =>
-    item.id === requestId ? updatedRequest : item
-  );
-  await persistDraft(pool, draft, user.name);
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "ClarificationSubmitted",
-    module: "Workforce Planning",
-    entity: "Budget Request",
-    entityId: requestId,
-    action: "Clarification submitted on budget request",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comments }
-  });
+  const bundle = await getWorkforceBundle(pool);
+  const updated =
+    bundle.config.approval_queue.find((item) => item.id === requestId)
+    || bundle.config.budget_requests.find((item) => item.id === requestId);
 
   return {
-    workforce: draft,
-    toastMessage: "Clarification submitted. Workflow resumed."
+    workforce: bundle.config,
+    request: updated || request,
+    workflowResult: result,
+    toastMessage:
+      result.toastMessage || "Clarification submitted. Workflow resumed."
+  };
+}
+
+async function getBudgetApprovalActionContext(pool, requestId, req) {
+  const { request } = await loadBudgetQueueRequest(pool, requestId);
+  const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
+  const employeeCode = String(req.user?.employee_code || "").trim();
+
+  let activeTask = null;
+  try {
+    activeTask = await findActiveBudgetApprovalTask(pool, requestId, instanceId);
+  } catch (_error) {
+    activeTask = null;
+  }
+
+  const assignee = String(
+    activeTask?.assignment_assignee || activeTask?.assignee || ""
+  ).trim();
+  const canAct =
+    Boolean(activeTask)
+    && Boolean(employeeCode)
+    && employeeCode === assignee
+    && ["Pending Level-1 Approval", "Pending Level-2 Approval"].includes(
+      request.status
+    );
+
+  const canResubmit =
+    request.status === "Clarification Requested"
+    && (
+      !request.submitted_by_employee_code
+      || String(request.submitted_by_employee_code) === employeeCode
+      || String(req.user?.role_name || "").toLowerCase() === "admin"
+    );
+
+  return {
+    request_id: requestId,
+    status: request.status,
+    workflow_instance_id: instanceId,
+    task_id: activeTask?.task_id || null,
+    assignee: assignee || request.current_approver || null,
+    can_act: canAct,
+    can_resubmit: canResubmit,
+    is_read_only: !["Draft", "Clarification Requested"].includes(request.status)
   };
 }
 
@@ -903,11 +1369,14 @@ async function seedConfiguration(pool, payload, user = { name: "System Seed", ro
 module.exports = {
   getDefaultSeedPayload,
   getWorkforceBundle,
+  createBudgetRequest,
+  submitBudgetRequest,
   approveBudgetRequest,
   rejectBudgetRequest,
   sendBackBudgetRequest,
   requestBudgetClarification,
   submitBudgetClarification,
+  getBudgetApprovalActionContext,
   createRequisition,
   publishBundle,
   discardDraft,

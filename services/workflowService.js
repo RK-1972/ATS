@@ -1,7 +1,29 @@
 const businessRulesService = require("./businessRulesService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
+const approvalRouteRepository = require("../repositories/approvalRouteRepository");
+const workflowDomainHooks = require("./workflowDomainHooks");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "workflows.seed.json");
+
+/** Canonical wf_tasks.status values (Workflow Engine convention). */
+const TASK_STATUS = {
+  PENDING: "Pending",
+  WAITING: "Waiting",
+  COMPLETED: "Completed",
+  CANCELLED: "Cancelled",
+  /** Reuses existing stage clarification status string — no new invented label. */
+  CLARIFICATION: "Waiting for Clarification"
+};
+
+/** Canonical wf_instances.status values already used by the engine. */
+const INSTANCE_STATUS = {
+  RUNNING: "Running",
+  COMPLETED: "Completed",
+  /** Same rejected terminal already used on approval stages via advanceWorkflow. */
+  REJECTED: "Rejected",
+  /** Pause state implied by existing clarification toast ("Workflow paused."). */
+  PAUSED: "Paused"
+};
 
 function httpError(message, status = 400) {
   const error = new Error(message);
@@ -231,11 +253,16 @@ function validateDefinitions(payload) {
   return { valid: errors.length === 0, errors, warnings };
 }
 
-async function syncNormalizedTables(pool, payload, userName, version, versionStatus) {
-  const client = await pool.connect();
+async function syncNormalizedTables(queryable, payload, userName, version, versionStatus) {
+  // Pool has no release(); PoolClient does. Join outer TX when already a client.
+  const isClient = typeof queryable.release === "function";
+  const client = isClient ? queryable : await queryable.connect();
+  const manageTx = !isClient;
 
   try {
-    await client.query("BEGIN");
+    if (manageTx) {
+      await client.query("BEGIN");
+    }
     const effectiveFrom = new Date();
 
     await client.query("DELETE FROM wf_transition_conditions");
@@ -356,12 +383,18 @@ async function syncNormalizedTables(pool, payload, userName, version, versionSta
       );
     }
 
-    await client.query("COMMIT");
+    if (manageTx) {
+      await client.query("COMMIT");
+    }
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (manageTx) {
+      await client.query("ROLLBACK");
+    }
     throw error;
   } finally {
-    client.release();
+    if (manageTx) {
+      client.release();
+    }
   }
 }
 
@@ -472,8 +505,11 @@ async function persistInstance(pool, instanceRow, userName) {
   );
 }
 
-async function getInstanceById(pool, instanceId) {
-  const result = await pool.query(
+/**
+ * @param {object} queryable - pg Pool or Client (shared TX handle)
+ */
+async function getInstanceById(queryable, instanceId) {
+  const result = await queryable.query(
     "SELECT * FROM wf_instances WHERE instance_id = $1",
     [instanceId]
   );
@@ -516,6 +552,822 @@ async function getCurrentTasks(pool, instanceId) {
   }));
 }
 
+function computeAgeDays(fromDate) {
+  if (!fromDate) {
+    return null;
+  }
+
+  const parsed = fromDate instanceof Date ? fromDate : new Date(fromDate);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return Math.max(0, Math.floor((Date.now() - parsed.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+function resolveAssigneeIdentity(req, options = {}) {
+  const requireEmployeeCode = options.requireEmployeeCode !== false;
+  const employeeCode = req.user?.employee_code
+    ? String(req.user.employee_code).trim()
+    : "";
+  const fullName = req.user?.full_name
+    ? String(req.user.full_name).trim()
+    : "";
+
+  if (requireEmployeeCode) {
+    if (!employeeCode) {
+      throw httpError(
+        "Authenticated employee_code is required for workflow task actions.",
+        401
+      );
+    }
+    return { employeeCode, fullName };
+  }
+
+  if (!employeeCode && !fullName) {
+    throw httpError("Unable to resolve current user for approvals.", 401);
+  }
+
+  return { employeeCode, fullName };
+}
+
+/**
+ * Assert the caller is the active assignee of a Pending task.
+ * Employee code is authoritative (no full_name ownership match).
+ * Call only after the task row is locked (FOR UPDATE).
+ */
+async function assertActiveAssignee(queryable, taskId, req, options = {}) {
+  const { employeeCode } = resolveAssigneeIdentity(req, {
+    requireEmployeeCode: true
+  });
+
+  if (options.forUpdate) {
+    await queryable.query(
+      `SELECT assignment_id
+       FROM wf_assignments
+       WHERE task_id = $1
+       FOR UPDATE`,
+      [taskId]
+    );
+  }
+
+  const result = await queryable.query(
+    `SELECT
+       a.assignment_id,
+       a.assignee,
+       a.active,
+       t.task_id,
+       t.instance_id,
+       t.stage_key,
+       t.status AS task_status
+     FROM wf_assignments a
+     INNER JOIN wf_tasks t ON t.task_id = a.task_id
+     WHERE a.task_id = $1
+       AND a.active = TRUE
+       AND LOWER(t.status) = 'pending'
+       AND a.assignee = $2
+     LIMIT 1`,
+    [taskId, employeeCode]
+  );
+
+  if (!result.rows.length) {
+    throw httpError(
+      "No active approval assignment found for this task and user.",
+      403
+    );
+  }
+
+  return result.rows[0];
+}
+
+function assertTaskStatusPending(task) {
+  const status = String(task?.status || "");
+  if (status.toLowerCase() !== "pending") {
+    throw httpError(
+      `Only Pending tasks may be actioned. Current status: ${status || "(empty)"}`,
+      400
+    );
+  }
+}
+
+function assertInstanceRunning(instance) {
+  const status = String(instance?.status || "");
+  if (status !== INSTANCE_STATUS.RUNNING) {
+    throw httpError(
+      `Workflow instance must be Running. Current status: ${status || "(empty)"}`,
+      400
+    );
+  }
+}
+
+/**
+ * Ensure exactly one active assignment for a task (and none elsewhere on the instance).
+ */
+async function activateSingleAssignment(client, instanceId, taskId) {
+  await client.query(
+    `UPDATE wf_assignments a
+     SET active = FALSE
+     FROM wf_tasks t
+     WHERE a.task_id = t.task_id
+       AND t.instance_id = $1
+       AND a.active = TRUE`,
+    [instanceId]
+  );
+
+  const assignmentResult = await client.query(
+    `SELECT assignment_id
+     FROM wf_assignments
+     WHERE task_id = $1
+     ORDER BY assigned_on ASC, assignment_id ASC
+     LIMIT 1
+     FOR UPDATE`,
+    [taskId]
+  );
+
+  if (!assignmentResult.rows.length) {
+    return null;
+  }
+
+  const assignmentId = assignmentResult.rows[0].assignment_id;
+
+  await client.query(
+    `UPDATE wf_assignments
+     SET active = TRUE
+     WHERE assignment_id = $1`,
+    [assignmentId]
+  );
+
+  return assignmentId;
+}
+
+/**
+ * Active approval assignments for the logged-in user (wf_assignments.active = true).
+ * Read-only; does not duplicate task rows — joins existing workflow tables.
+ */
+async function getMyActiveApprovals(pool, req) {
+  const { employeeCode } = resolveAssigneeIdentity(req, {
+    requireEmployeeCode: true
+  });
+
+  const result = await pool.query(
+    `SELECT
+       a.assignment_id,
+       a.assignee,
+       a.assignee_role,
+       a.assigned_on,
+       a.active,
+       t.task_id,
+       t.title AS task_title,
+       t.status AS task_status,
+       t.stage_key,
+       t.task_type,
+       t.created_on AS task_created_on,
+       i.instance_id,
+       i.workflow_code,
+       i.status AS instance_status,
+       i.current_stage_key,
+       i.started_on,
+       i.started_by,
+       i.execution_context,
+       r.requisition_code,
+       r.position_title,
+       r.hiring_manager,
+       r.req_status,
+       r.created_by AS document_requestor,
+       r.created_on AS document_submitted_on,
+       d.priority_level,
+       d.draft_id,
+       d.draft_code
+     FROM wf_assignments a
+     INNER JOIN wf_tasks t ON t.task_id = a.task_id
+     INNER JOIN wf_instances i ON i.instance_id = t.instance_id
+     LEFT JOIN rm_requisitions r ON r.workflow_instance_id = i.instance_id
+     LEFT JOIN td_draft_mstr d
+       ON d.result_requisition_code = r.requisition_code
+      AND d.is_deleted = FALSE
+     WHERE a.active = TRUE
+       AND LOWER(t.status) = 'pending'
+       AND (
+         i.status = $2
+         OR (
+           i.status = $3
+           AND LOWER(COALESCE(t.task_type, '')) = 'clarification'
+         )
+       )
+       AND a.assignee = $1
+     ORDER BY COALESCE(a.assigned_on, t.created_on, i.started_on) ASC,
+              t.task_id ASC`,
+    [employeeCode, INSTANCE_STATUS.RUNNING, INSTANCE_STATUS.PAUSED]
+  );
+
+  return result.rows.map((row) => {
+    const submittedOn =
+      row.document_submitted_on || row.started_on || row.assigned_on || null;
+    const ageAnchor = row.assigned_on || row.task_created_on || row.started_on;
+    const rawContext = row.execution_context;
+    const context =
+      rawContext && typeof rawContext === "object"
+        ? rawContext
+        : typeof rawContext === "string"
+          ? (() => {
+              try {
+                return JSON.parse(rawContext);
+              } catch {
+                return {};
+              }
+            })()
+          : {};
+    const meta =
+      context.meta && typeof context.meta === "object" ? context.meta : {};
+    const priority =
+      row.priority_level ||
+      context.priority_level ||
+      context.priority ||
+      meta.priority ||
+      null;
+
+    const instanceId = String(row.instance_id || "");
+    const metaDocumentType = String(meta.document_type || "")
+      .trim()
+      .toUpperCase();
+
+    // Budget request id must NOT fall back to meta.requisition_id for Requisition
+    // workflows (those also set requisition_id = REQ-…).
+    const isBudgetDocument =
+      metaDocumentType === "BUDGET" || instanceId.startsWith("WF-BR-");
+
+    const budgetRequestId = isBudgetDocument
+      ? meta.budget_request_id ||
+        meta.requisition_id ||
+        (instanceId.startsWith("WF-BR-")
+          ? instanceId.replace(/^WF-BR-/, "")
+          : null)
+      : null;
+
+    const isRequisitionDocument =
+      metaDocumentType === "REQUISITION" ||
+      instanceId.startsWith("WF-RM-") ||
+      Boolean(row.requisition_code);
+
+    const documentType = isBudgetDocument
+      ? "BUDGET"
+      : isRequisitionDocument
+        ? "REQUISITION"
+        : metaDocumentType || null;
+
+    return {
+      assignment_id: row.assignment_id,
+      task_id: row.task_id,
+      instance_id: row.instance_id,
+      workflow_type: row.workflow_code,
+      document_number:
+        row.requisition_code ||
+        (isBudgetDocument ? budgetRequestId : null) ||
+        row.instance_id,
+      document_title:
+        row.position_title ||
+        meta.position_title ||
+        row.task_title ||
+        row.requisition_code ||
+        "—",
+      requestor: row.document_requestor || row.started_by || "—",
+      current_approval_step: row.task_title || row.stage_key || "—",
+      stage_key: row.stage_key,
+      submitted_date: submittedOn?.toISOString?.() || submittedOn || null,
+      priority: priority || "Normal",
+      status: row.task_status || "Pending",
+      age_days: computeAgeDays(ageAnchor),
+      assignee: row.assignee,
+      assignee_role: row.assignee_role,
+      assigned_on: row.assigned_on?.toISOString?.() || null,
+      instance_status: row.instance_status,
+      requisition_code: row.requisition_code || null,
+      draft_id: row.draft_id || null,
+      draft_code: row.draft_code || null,
+      hiring_manager: row.hiring_manager || null,
+      req_status: row.req_status || null,
+      document_type: documentType,
+      task_type: row.task_type || null
+    };
+  });
+}
+
+/**
+ * Approve via existing completeTask chain (activates next Waiting step or completes).
+ * Assignee revalidation and Pending checks run inside completeTask's transaction.
+ */
+async function approveMyActiveApproval(pool, taskId, req) {
+  return completeTask(pool, taskId, req, { requireActiveAssignee: true });
+}
+
+/**
+ * Reject lifecycle — single ACID transaction.
+ * Terminates the instance, completes the current task (outcome Rejected),
+ * cancels remaining Waiting tasks, deactivates all assignments, and notifies
+ * domain hooks. Does not activate the next approver.
+ */
+async function rejectMyActiveApproval(pool, taskId, comments, req) {
+  const user = userContext(req);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 1. Lock current task
+    const taskResult = await client.query(
+      "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+      [taskId]
+    );
+
+    if (!taskResult.rows.length) {
+      throw httpError(`Task not found: ${taskId}`, 404);
+    }
+
+    const task = taskResult.rows[0];
+
+    assertTaskStatusPending(task);
+
+    // 1b. Lock workflow instance
+    const instanceResult = await client.query(
+      "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
+      [task.instance_id]
+    );
+
+    if (!instanceResult.rows.length) {
+      throw httpError(`Workflow instance not found: ${task.instance_id}`, 404);
+    }
+
+    const instance = instanceResult.rows[0];
+    const instanceStatus = String(instance.status || "");
+
+    assertInstanceRunning(instance);
+
+    // Re-validate active assignee under the same locks (employee_code authoritative)
+    await assertActiveAssignee(client, taskId, req, { forUpdate: true });
+
+    // 2. Mark current task Completed (outcome = Rejected in history/audit)
+    await client.query(
+      `UPDATE wf_tasks
+       SET status = $2, completed_on = NOW()
+       WHERE task_id = $1`,
+      [taskId, TASK_STATUS.COMPLETED]
+    );
+
+    // 3. Deactivate current assignment(s)
+    await client.query(
+      `UPDATE wf_assignments
+       SET active = FALSE
+       WHERE task_id = $1
+         AND active = TRUE`,
+      [taskId]
+    );
+
+    // 4. Cancel every remaining Waiting task
+    const waitingResult = await client.query(
+      `SELECT task_id, stage_key, status
+       FROM wf_tasks
+       WHERE instance_id = $1
+         AND task_id <> $2
+         AND LOWER(status) = 'waiting'
+       ORDER BY created_on ASC, task_id ASC
+       FOR UPDATE`,
+      [task.instance_id, taskId]
+    );
+
+    const cancelledTaskIds = waitingResult.rows.map((row) => row.task_id);
+
+    if (cancelledTaskIds.length > 0) {
+      await client.query(
+        `UPDATE wf_tasks
+         SET status = $2, completed_on = NOW()
+         WHERE task_id = ANY($1::int[])`,
+        [cancelledTaskIds, TASK_STATUS.CANCELLED]
+      );
+    }
+
+    // 5. Deactivate every remaining assignment for this instance
+    await client.query(
+      `UPDATE wf_assignments a
+       SET active = FALSE
+       FROM wf_tasks t
+       WHERE a.task_id = t.task_id
+         AND t.instance_id = $1
+         AND a.active = TRUE`,
+      [task.instance_id]
+    );
+
+    // 6. Terminate instance (canonical Rejected — same string as approval stage reject)
+    const payload = clonePayload(instance.instance_payload || {});
+    const stage =
+      (payload.stages || []).find((item) => item.key === task.stage_key) ||
+      (payload.stages || []).find(
+        (item) => item.key === instance.current_stage_key
+      );
+
+    if (stage) {
+      stage.status = "Rejected";
+      stage.completion_pct = 0;
+    }
+
+    if (!Array.isArray(payload.timeline)) {
+      payload.timeline = [];
+    }
+
+    payload.timeline.push({
+      id: `tl-${Date.now()}`,
+      time: new Date().toISOString(),
+      actor: user.name,
+      role: user.role,
+      action: "Approval Rejected",
+      event_type: "rejected",
+      stage_key: task.stage_key,
+      comment: comments || null,
+      outcome: "Rejected"
+    });
+
+    await client.query(
+      `UPDATE wf_instances
+       SET status = $2,
+           instance_payload = $3,
+           completed_on = NOW(),
+           modified_by = $4,
+           modified_on = NOW()
+       WHERE instance_id = $1`,
+      [
+        task.instance_id,
+        INSTANCE_STATUS.REJECTED,
+        JSON.stringify(payload),
+        user.name
+      ]
+    );
+
+    // 9. Workflow history (single TaskRejected + optional cancel summary + WorkflowRejected)
+    await appendHistory(client, task.instance_id, {
+      eventType: "TaskRejected",
+      stageKey: task.stage_key,
+      actor: user.name,
+      actorRole: user.role,
+      action: "Approval rejected",
+      comments: comments || "",
+      metadata: {
+        taskId,
+        outcome: "Rejected",
+        previousStatus: task.status
+      }
+    });
+
+    if (cancelledTaskIds.length > 0) {
+      await appendHistory(client, task.instance_id, {
+        eventType: "TasksCancelled",
+        stageKey: task.stage_key,
+        actor: user.name,
+        actorRole: user.role,
+        action: "Remaining waiting approval tasks cancelled",
+        comments: comments || "",
+        metadata: {
+          cancelledTaskIds,
+          outcome: "Cancelled",
+          rejectedTaskId: taskId
+        }
+      });
+    }
+
+    await appendHistory(client, task.instance_id, {
+      eventType: "WorkflowRejected",
+      stageKey: task.stage_key,
+      actor: user.name,
+      actorRole: user.role,
+      action: "Workflow terminated after rejection",
+      comments: comments || "",
+      metadata: {
+        rejectedTaskId: taskId,
+        cancelledTaskIds,
+        outcome: "Rejected",
+        instanceStatus: INSTANCE_STATUS.REJECTED
+      }
+    });
+
+    // 7. Notify existing workflow domain hook (reject path)
+    const businessAction = await workflowDomainHooks.notifyWorkflowRejected(
+      client,
+      {
+        instanceId: task.instance_id,
+        workflowCode: instance.workflow_code,
+        rejectedByTaskId: taskId,
+        cancelledTaskIds,
+        comments: comments || "",
+        executionContext: instance.execution_context || {},
+        instancePayload: payload
+      },
+      req
+    );
+
+    // 10. Enterprise audit
+    await writeEnterpriseAudit(client, {
+      eventType: "WorkflowRejected",
+      module: "Workflow Engine",
+      entity: "Workflow Instance",
+      entityId: String(task.instance_id),
+      action: "Workflow rejected and terminated",
+      userName: user.name,
+      userRole: user.role,
+      previousValue: instanceStatus,
+      newValue: INSTANCE_STATUS.REJECTED,
+      metadata: {
+        taskId,
+        outcome: "Rejected",
+        cancelledTaskIds,
+        comments: comments || "",
+        businessActionCompleted: Boolean(
+          businessAction?.businessActionCompleted
+        )
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      taskId,
+      status: TASK_STATUS.COMPLETED,
+      outcome: "Rejected",
+      instanceId: task.instance_id,
+      instanceStatus: INSTANCE_STATUS.REJECTED,
+      cancelledTaskIds,
+      workflowRejected: true,
+      businessActionCompleted: Boolean(
+        businessAction?.businessActionCompleted
+      ),
+      businessAction: businessAction || null
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // Preserve original error
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Clarification request lifecycle — single ACID transaction.
+ * Pauses the instance, holds the same Pending task, deactivates assignment.
+ * Approver cannot approve while paused (assignment inactive + non-Pending task).
+ */
+async function requestClarificationMyActiveApproval(pool, taskId, comments, req) {
+  const user = userContext(req);
+  const clarificationComments = String(comments || "").trim();
+
+  if (!clarificationComments) {
+    throw httpError("Clarification comments are required.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 1. Lock workflow task
+    const taskResult = await client.query(
+      "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+      [taskId]
+    );
+
+    if (!taskResult.rows.length) {
+      throw httpError(`Task not found: ${taskId}`, 404);
+    }
+
+    const task = taskResult.rows[0];
+
+    assertTaskStatusPending(task);
+
+    // Lock instance before assignee revalidation
+    const instanceResult = await client.query(
+      "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
+      [task.instance_id]
+    );
+
+    if (!instanceResult.rows.length) {
+      throw httpError(`Workflow instance not found: ${task.instance_id}`, 404);
+    }
+
+    const instance = instanceResult.rows[0];
+    const instanceStatus = String(instance.status || "");
+
+    assertInstanceRunning(instance);
+
+    // Revalidate active assignee after locks (employee_code authoritative)
+    const assignment = await assertActiveAssignee(client, taskId, req, {
+      forUpdate: true
+    });
+
+    // 4. Update task status to existing clarification status
+    await client.query(
+      `UPDATE wf_tasks
+       SET status = $2, completed_on = NULL
+       WHERE task_id = $1`,
+      [taskId, TASK_STATUS.CLARIFICATION]
+    );
+
+    // 5. Deactivate the current assignment (same row — do not create another)
+    await client.query(
+      `UPDATE wf_assignments
+       SET active = FALSE
+       WHERE assignment_id = $1
+         AND active = TRUE`,
+      [assignment.assignment_id]
+    );
+
+    await client.query(
+      `UPDATE wf_assignments
+       SET active = FALSE
+       WHERE task_id = $1
+         AND active = TRUE`,
+      [taskId]
+    );
+
+    // 6. Pause workflow instance + store clarification hold (comments + ids)
+    const payload = clonePayload(instance.instance_payload || {});
+    const stageKey = task.stage_key || instance.current_stage_key;
+    const stage = (payload.stages || []).find((item) => item.key === stageKey);
+
+    if (stage) {
+      stage.status = "Waiting for Clarification";
+    }
+
+    if (!Array.isArray(payload.timeline)) {
+      payload.timeline = [];
+    }
+
+    payload.timeline.push({
+      id: `tl-${Date.now()}`,
+      time: new Date().toISOString(),
+      actor: user.name,
+      role: user.role,
+      action: "Requested Clarification",
+      event_type: "clarification",
+      comment: clarificationComments,
+      stage_key: stageKey,
+      task_id: taskId
+    });
+
+    const priorContext =
+      instance.execution_context && typeof instance.execution_context === "object"
+        ? instance.execution_context
+        : typeof instance.execution_context === "string"
+          ? (() => {
+              try {
+                return JSON.parse(instance.execution_context);
+              } catch {
+                return {};
+              }
+            })()
+          : {};
+
+    const nextContext = {
+      ...priorContext,
+      clarification: {
+        status: "requested",
+        task_id: taskId,
+        assignment_id: assignment.assignment_id,
+        stage_key: stageKey,
+        comments: clarificationComments,
+        requested_by: user.name,
+        requested_by_role: user.role,
+        requested_on: new Date().toISOString()
+      }
+    };
+
+    await client.query(
+      `UPDATE wf_instances
+       SET status = $2,
+           execution_context = $3,
+           instance_payload = $4,
+           modified_by = $5,
+           modified_on = NOW()
+       WHERE instance_id = $1`,
+      [
+        task.instance_id,
+        INSTANCE_STATUS.PAUSED,
+        JSON.stringify(nextContext),
+        JSON.stringify(payload),
+        user.name
+      ]
+    );
+
+    // 7–9. History + audit (comments stored)
+    await appendHistory(client, task.instance_id, {
+      eventType: "ClarificationRequested",
+      stageKey,
+      actor: user.name,
+      actorRole: user.role,
+      action: "Clarification requested — workflow paused",
+      comments: clarificationComments,
+      metadata: {
+        taskId,
+        assignmentId: assignment.assignment_id,
+        taskStatus: TASK_STATUS.CLARIFICATION,
+        instanceStatus: INSTANCE_STATUS.PAUSED
+      }
+    });
+
+    await writeEnterpriseAudit(client, {
+      eventType: "ClarificationRequested",
+      module: "Workflow Engine",
+      entity: "Workflow Instance",
+      entityId: String(task.instance_id),
+      action: "Clarification requested — workflow paused",
+      userName: user.name,
+      userRole: user.role,
+      previousValue: instanceStatus,
+      newValue: INSTANCE_STATUS.PAUSED,
+      metadata: {
+        taskId,
+        assignmentId: assignment.assignment_id,
+        comments: clarificationComments,
+        stageKey
+      }
+    });
+
+    let requestorTaskId = null;
+    const domainClarification = await workflowDomainHooks.notifyClarificationRequested(
+      client,
+      {
+        instanceId: task.instance_id,
+        workflowCode: instance.workflow_code,
+        taskId,
+        assignmentId: assignment.assignment_id,
+        comments: clarificationComments,
+        executionContext: nextContext,
+        instancePayload: payload
+      },
+      req
+    );
+
+    // Budget: create clarification task for original requestor (My Approvals inbox).
+    if (
+      domainClarification?.businessActionCompleted
+      && domainClarification.requestor_employee_code
+    ) {
+      requestorTaskId = await createTask(client, task.instance_id, {
+        stageKey: stageKey || "clarification",
+        taskType: "clarification",
+        title: `Clarify Budget — ${domainClarification.budget_request_id || task.instance_id}`,
+        status: TASK_STATUS.PENDING,
+        assignee: domainClarification.requestor_employee_code,
+        assigneeRole: "Requestor",
+        assignedBy: req.user?.employee_code || user.name,
+        assignmentActive: true
+      });
+
+      nextContext.clarification = {
+        ...nextContext.clarification,
+        requestor_task_id: requestorTaskId,
+        requestor_employee_code: domainClarification.requestor_employee_code,
+        resume_status: domainClarification.resume_status || null
+      };
+
+      await client.query(
+        `UPDATE wf_instances
+         SET execution_context = $2,
+             modified_by = $3,
+             modified_on = NOW()
+         WHERE instance_id = $1`,
+        [task.instance_id, JSON.stringify(nextContext), user.name]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      taskId,
+      assignmentId: assignment.assignment_id,
+      instanceId: task.instance_id,
+      taskStatus: TASK_STATUS.CLARIFICATION,
+      instanceStatus: INSTANCE_STATUS.PAUSED,
+      comments: clarificationComments,
+      workflowPaused: true,
+      requestorTaskId,
+      businessActionCompleted: Boolean(
+        domainClarification?.businessActionCompleted
+      ),
+      toastMessage: "Clarification request sent. Workflow paused."
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // Preserve original error
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function createTask(pool, instanceId, task) {
   const result = await pool.query(
     `INSERT INTO wf_tasks (
@@ -526,7 +1378,7 @@ async function createTask(pool, instanceId, task) {
       task.stageKey,
       task.taskType || "approval",
       task.title,
-      task.status || "Pending",
+      task.status || TASK_STATUS.PENDING,
       task.assignee || null,
       task.assigneeRole || null,
       task.dueAt ? new Date(task.dueAt) : null
@@ -534,19 +1386,161 @@ async function createTask(pool, instanceId, task) {
   );
 
   if (task.assignee) {
+    // Map enterprise ACTIVE/WAITING assignment states onto existing active boolean
+    // (no schema change): ACTIVE => true, WAITING => false.
+    const assignmentActive =
+      task.assignmentActive === undefined
+        ? true
+        : Boolean(task.assignmentActive);
+
     await pool.query(
-      `INSERT INTO wf_assignments (task_id, assignee, assignee_role, assigned_by)
-       VALUES ($1,$2,$3,$4)`,
-      [result.rows[0].task_id, task.assignee, task.assigneeRole || null, task.assignedBy || "System"]
+      `INSERT INTO wf_assignments (
+         task_id, assignee, assignee_role, assigned_by, active
+       ) VALUES ($1,$2,$3,$4,$5)`,
+      [
+        result.rows[0].task_id,
+        task.assignee,
+        task.assigneeRole || null,
+        task.assignedBy || "System",
+        assignmentActive
+      ]
     );
   }
 
   return result.rows[0].task_id;
 }
 
-async function startWorkflow(pool, workflowCode, executionContext, req) {
+/**
+ * Expand approval_route_step rows into workflow tasks/assignments.
+ * Step 1 => task Pending + assignment ACTIVE (active=true)
+ * Later steps => task Waiting + assignment WAITING (active=false)
+ * No notifications. Must run on the same queryable/client as Submit TX.
+ *
+ * @param {object} queryable - pg Pool or Client
+ * @param {string} instanceId
+ * @param {string|number} approvalRouteId
+ * @param {object} [options]
+ * @returns {Promise<object[]>}
+ */
+async function createApprovalRouteWorkflowTasks(
+  queryable,
+  instanceId,
+  approvalRouteId,
+  options = {}
+) {
+  if (!instanceId) {
+    throw httpError(
+      "workflow instanceId is required for approval route expansion.",
+      400
+    );
+  }
+
+  if (
+    approvalRouteId === null ||
+    approvalRouteId === undefined ||
+    String(approvalRouteId).trim() === ""
+  ) {
+    throw httpError(
+      "approval_route_id is required for approval route expansion.",
+      400
+    );
+  }
+
+  // Idempotent expansion (Talent Demand / Budget concurrent submit safety):
+  // if route-step tasks already exist for this instance, return them.
+  const existingRouteTasks = await queryable.query(
+    `SELECT
+       t.task_id,
+       t.status AS task_status,
+       t.title,
+       t.assignee,
+       t.assignee_role,
+       COALESCE(a.active, FALSE) AS assignment_active
+     FROM wf_tasks t
+     LEFT JOIN wf_assignments a ON a.task_id = t.task_id
+     WHERE t.instance_id = $1
+       AND t.task_type = 'approval'
+       AND t.title LIKE 'Approval Step %'
+     ORDER BY t.task_id ASC`,
+    [instanceId]
+  );
+
+  if (existingRouteTasks.rows.length > 0) {
+    return existingRouteTasks.rows.map((row, index) => ({
+      task_id: row.task_id,
+      step_id: null,
+      sequence_no: index + 1,
+      task_status: row.task_status,
+      assignment_status: row.assignment_active ? "ACTIVE" : "WAITING",
+      assignee: row.assignee,
+      reused: true
+    }));
+  }
+
+  const steps = await approvalRouteRepository.getApprovalRouteSteps(
+    queryable,
+    approvalRouteId
+  );
+
+  if (!steps.length) {
+    throw httpError("Approval route has no steps to expand.", 400);
+  }
+
+  const stageKey = options.stageKey || options.currentStageKey || "approval";
+  const assignedBy = options.assignedBy || "System";
+  const requisitionCode = options.requisitionCode || null;
+  const created = [];
+
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    const isFirst = index === 0;
+    const sequence = step.sequence_no ?? step.step_no ?? index + 1;
+    const assignee = step.approver_employee_code
+      ? String(step.approver_employee_code).trim()
+      : "";
+
+    if (!assignee) {
+      throw httpError(
+        `Approval route step ${sequence} has no approver_employee_code.`,
+        400
+      );
+    }
+
+    const taskStatus = isFirst ? TASK_STATUS.PENDING : TASK_STATUS.WAITING;
+    const assignmentActive = isFirst;
+
+    const taskId = await createTask(queryable, instanceId, {
+      stageKey,
+      taskType: "approval",
+      title: requisitionCode
+        ? `Approval Step ${sequence} — ${requisitionCode}`
+        : `Approval Step ${sequence}`,
+      status: taskStatus,
+      assignee,
+      assigneeRole: step.approval_type || "Approver",
+      assignedBy,
+      assignmentActive
+    });
+
+    created.push({
+      task_id: taskId,
+      step_id: step.step_id,
+      sequence_no: sequence,
+      task_status: taskStatus,
+      assignment_status: isFirst ? "ACTIVE" : "WAITING",
+      assignee
+    });
+  }
+
+  return created;
+}
+
+/**
+ * @param {object} queryable - pg Pool or Client (shared TX handle)
+ */
+async function startWorkflow(queryable, workflowCode, executionContext, req) {
   const user = userContext(req);
-  const bundle = await getWorkflowsBundle(pool);
+  const bundle = await getWorkflowsBundle(queryable);
   const definition = (bundle.baseline.definitions || []).find(
     (item) => item.workflow_code === workflowCode || item.workflow_key === workflowCode
   );
@@ -593,15 +1587,15 @@ async function startWorkflow(pool, workflowCode, executionContext, req) {
       recruiter_workload: 0
     }
   };
-const existing = await pool.query(
+const existing = await queryable.query(
   "SELECT * FROM wf_instances WHERE instance_id = $1",
   [instanceId]
 );
 
 if (existing.rows.length > 0) {
-  return getInstanceById(pool, instanceId);
+  return getInstanceById(queryable, instanceId);
 }
-  await pool.query(
+  await queryable.query(
     `INSERT INTO wf_instances (
       instance_id, workflow_code, status, current_stage_key, execution_context,
       instance_payload, started_by, modified_by
@@ -617,7 +1611,7 @@ if (existing.rows.length > 0) {
   );
 
   if (firstStage?.is_approval_stage) {
-    await createTask(pool, instanceId, {
+    await createTask(queryable, instanceId, {
       stageKey: firstStage.stage_key,
       taskType: "approval",
       title: `${firstStage.stage_name} approval`,
@@ -626,7 +1620,7 @@ if (existing.rows.length > 0) {
     });
   }
 
-  await appendHistory(pool, instanceId, {
+  await appendHistory(queryable, instanceId, {
     eventType: "WorkflowStarted",
     stageKey: firstStage?.stage_key,
     actor: user.name,
@@ -634,7 +1628,7 @@ if (existing.rows.length > 0) {
     action: `Workflow ${definition.title} started`
   });
 
-  await writeEnterpriseAudit(pool, {
+  await writeEnterpriseAudit(queryable, {
     eventType: "WorkflowStarted",
     module: "Workflow Engine",
     entity: "Workflow Instance",
@@ -645,7 +1639,7 @@ if (existing.rows.length > 0) {
     metadata: { workflowCode: definition.workflow_code }
   });
 
-  return getInstanceById(pool, instanceId);
+  return getInstanceById(queryable, instanceId);
 }
 
 async function advanceWorkflow(pool, instanceId, action, executionContext, req) {
@@ -848,129 +1842,836 @@ async function requestClarification(pool, instanceId, comments, req) {
 
 async function submitClarification(pool, instanceId, comments, req) {
   const user = userContext(req);
-  const row = await pool.query("SELECT * FROM wf_instances WHERE instance_id = $1", [instanceId]);
+  const clarificationComments = String(comments || "").trim();
+  const client = await pool.connect();
 
-  if (!row.rows.length) {
-    throw httpError(`Workflow instance not found: ${instanceId}`, 404);
+  try {
+    await client.query("BEGIN");
+
+    // Peek without FOR UPDATE to choose lock order: task → instance (matches approve/reject).
+    const peekResult = await client.query(
+      `SELECT status, execution_context
+       FROM wf_instances
+       WHERE instance_id = $1`,
+      [instanceId]
+    );
+
+    if (!peekResult.rows.length) {
+      throw httpError(`Workflow instance not found: ${instanceId}`, 404);
+    }
+
+    const peekRow = peekResult.rows[0];
+    const peekContext =
+      peekRow.execution_context && typeof peekRow.execution_context === "object"
+        ? peekRow.execution_context
+        : typeof peekRow.execution_context === "string"
+          ? (() => {
+              try {
+                return JSON.parse(peekRow.execution_context);
+              } catch {
+                return {};
+              }
+            })()
+          : {};
+    const peekHold = peekContext.clarification || null;
+    const peekHasTaskHold =
+      String(peekRow.status || "") === INSTANCE_STATUS.PAUSED &&
+      peekHold &&
+      peekHold.task_id;
+
+    if (peekHasTaskHold) {
+      const peekTaskId = Number(peekHold.task_id);
+      await client.query(
+        "SELECT task_id FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+        [peekTaskId]
+      );
+    }
+
+    // 1. Lock workflow instance
+    const instanceResult = await client.query(
+      "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
+      [instanceId]
+    );
+
+    if (!instanceResult.rows.length) {
+      throw httpError(`Workflow instance not found: ${instanceId}`, 404);
+    }
+
+    const instance = instanceResult.rows[0];
+    const instanceStatus = String(instance.status || "");
+    const priorContext =
+      instance.execution_context && typeof instance.execution_context === "object"
+        ? instance.execution_context
+        : typeof instance.execution_context === "string"
+          ? (() => {
+              try {
+                return JSON.parse(instance.execution_context);
+              } catch {
+                return {};
+              }
+            })()
+          : {};
+
+    const clarificationHold = priorContext.clarification || null;
+
+    if (
+      instanceStatus === INSTANCE_STATUS.PAUSED &&
+      !(clarificationHold && clarificationHold.task_id)
+    ) {
+      throw httpError(
+        `Workflow instance ${instanceId} is paused but has no clarification hold to resume.`,
+        400
+      );
+    }
+
+    const hasTaskHold =
+      clarificationHold &&
+      clarificationHold.task_id &&
+      instanceStatus === INSTANCE_STATUS.PAUSED;
+
+    // Legacy instance-only clarification (offers / workforce without task hold)
+    if (!hasTaskHold) {
+      const stageKey = instance.current_stage_key;
+      const payload = clonePayload(instance.instance_payload || {});
+      const stage = (payload.stages || []).find((item) => item.key === stageKey);
+
+      if (stage) {
+        stage.status = "Clarification Submitted";
+        stage.completion_pct = Math.max(stage.completion_pct || 0, 30);
+      }
+
+      if (!Array.isArray(payload.timeline)) {
+        payload.timeline = [];
+      }
+
+      payload.timeline.push({
+        id: `tl-${Date.now()}`,
+        time: new Date().toISOString(),
+        actor: user.name,
+        role: user.role,
+        action: "Clarification Submitted",
+        event_type: "clarification",
+        comment: clarificationComments || null,
+        stage_key: stageKey
+      });
+
+      await persistInstance(
+        client,
+        {
+          instance_id: instanceId,
+          status: instance.status,
+          current_stage_key: stageKey,
+          execution_context: instance.execution_context,
+          instance_payload: payload
+        },
+        user.name
+      );
+
+      await appendHistory(client, instanceId, {
+        eventType: "ClarificationSubmitted",
+        stageKey,
+        actor: user.name,
+        actorRole: user.role,
+        action: "Clarification submitted",
+        comments: clarificationComments || ""
+      });
+
+      await writeEnterpriseAudit(client, {
+        eventType: "ClarificationSubmitted",
+        module: "Workflow Engine",
+        entity: "Workflow Instance",
+        entityId: instanceId,
+        action: "Clarification submitted",
+        userName: user.name,
+        userRole: user.role,
+        metadata: { comments: clarificationComments || "", stageKey }
+      });
+
+      await client.query("COMMIT");
+
+      return {
+        hiringProcess: payload,
+        stage,
+        toastMessage: "Clarification submitted. Workflow resumed."
+      };
+    }
+
+    // 2. Verify workflow is paused (task-hold resume path)
+    if (instanceStatus !== INSTANCE_STATUS.PAUSED) {
+      throw httpError(
+        `Workflow instance ${instanceId} is not paused for clarification.`,
+        400
+      );
+    }
+
+    const heldTaskId = Number(clarificationHold.task_id);
+    const heldAssignmentId = clarificationHold.assignment_id
+      ? Number(clarificationHold.assignment_id)
+      : null;
+
+    // 3. Lock and restore the same approval task (do NOT create a new task)
+    // Note: instance already locked; task lock acquired second — see remaining risks for lock-order.
+    const taskResult = await client.query(
+      "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+      [heldTaskId]
+    );
+
+    if (!taskResult.rows.length) {
+      throw httpError(`Clarification task not found: ${heldTaskId}`, 404);
+    }
+
+    const task = taskResult.rows[0];
+
+    if (String(task.instance_id) !== String(instanceId)) {
+      throw httpError("Clarification task does not belong to this workflow instance.", 400);
+    }
+
+    // Re-read hold under instance lock to prevent stale resume
+    const lockedContext =
+      instance.execution_context && typeof instance.execution_context === "object"
+        ? instance.execution_context
+        : {};
+    const lockedHold = lockedContext.clarification || clarificationHold;
+
+    if (!lockedHold || Number(lockedHold.task_id) !== heldTaskId) {
+      throw httpError(
+        `Stale clarification hold for workflow instance ${instanceId}.`,
+        409
+      );
+    }
+
+    if (String(instance.status) !== INSTANCE_STATUS.PAUSED) {
+      throw httpError(
+        `Workflow instance ${instanceId} is not paused for clarification.`,
+        400
+      );
+    }
+
+    if (String(task.status) !== TASK_STATUS.CLARIFICATION) {
+      throw httpError(
+        `Clarification task ${heldTaskId} is not held for clarification. Current status: ${task.status}`,
+        400
+      );
+    }
+
+    // 5. Task returns to Pending
+    await client.query(
+      `UPDATE wf_tasks
+       SET status = $2, completed_on = NULL
+       WHERE task_id = $1`,
+      [heldTaskId, TASK_STATUS.PENDING]
+    );
+
+    // 4. Reactivate previous assignment — exactly one active on the instance
+    if (heldAssignmentId) {
+      const assignmentResult = await client.query(
+        `SELECT assignment_id
+         FROM wf_assignments
+         WHERE assignment_id = $1
+           AND task_id = $2
+         FOR UPDATE`,
+        [heldAssignmentId, heldTaskId]
+      );
+
+      if (!assignmentResult.rows.length) {
+        throw httpError(
+          `Clarification assignment ${heldAssignmentId} not found for task ${heldTaskId}.`,
+          404
+        );
+      }
+
+      await client.query(
+        `UPDATE wf_assignments a
+         SET active = FALSE
+         FROM wf_tasks t
+         WHERE a.task_id = t.task_id
+           AND t.instance_id = $1
+           AND a.active = TRUE`,
+        [instanceId]
+      );
+
+      await client.query(
+        `UPDATE wf_assignments
+         SET active = TRUE
+         WHERE assignment_id = $1
+           AND task_id = $2`,
+        [heldAssignmentId, heldTaskId]
+      );
+    }
+
+    let reactivatedAssignmentId = heldAssignmentId;
+
+    if (!reactivatedAssignmentId) {
+      reactivatedAssignmentId = await activateSingleAssignment(
+        client,
+        instanceId,
+        heldTaskId
+      );
+    }
+
+    if (!reactivatedAssignmentId) {
+      throw httpError(
+        `No assignment found to reactivate for task ${heldTaskId}.`,
+        400
+      );
+    }
+
+    const payload = clonePayload(instance.instance_payload || {});
+    const stageKey =
+      clarificationHold.stage_key || task.stage_key || instance.current_stage_key;
+    const stage = (payload.stages || []).find((item) => item.key === stageKey);
+
+    if (stage) {
+      stage.status = "In Progress";
+      stage.completion_pct = Math.max(stage.completion_pct || 0, 30);
+    }
+
+    if (!Array.isArray(payload.timeline)) {
+      payload.timeline = [];
+    }
+
+    payload.timeline.push({
+      id: `tl-${Date.now()}`,
+      time: new Date().toISOString(),
+      actor: user.name,
+      role: user.role,
+      action: "Clarification Submitted",
+      event_type: "clarification",
+      comment: clarificationComments || null,
+      stage_key: stageKey,
+      task_id: heldTaskId
+    });
+
+    const {
+      clarification: _clearedHold,
+      ...contextWithoutHold
+    } = priorContext;
+
+    const nextContext = {
+      ...contextWithoutHold,
+      clarification_history: [
+        ...((priorContext.clarification_history || [])),
+        {
+          ...clarificationHold,
+          status: "submitted",
+          response_comments: clarificationComments || "",
+          submitted_by: user.name,
+          submitted_by_role: user.role,
+          submitted_on: new Date().toISOString()
+        }
+      ]
+    };
+
+    // 6. Workflow returns to Running
+    await client.query(
+      `UPDATE wf_instances
+       SET status = $2,
+           execution_context = $3,
+           instance_payload = $4,
+           modified_by = $5,
+           modified_on = NOW()
+       WHERE instance_id = $1`,
+      [
+        instanceId,
+        INSTANCE_STATUS.RUNNING,
+        JSON.stringify(nextContext),
+        JSON.stringify(payload),
+        user.name
+      ]
+    );
+
+    // 7–8. History + audit
+    await appendHistory(client, instanceId, {
+      eventType: "ClarificationSubmitted",
+      stageKey,
+      actor: user.name,
+      actorRole: user.role,
+      action: "Clarification submitted — workflow resumed",
+      comments: clarificationComments || "",
+      metadata: {
+        taskId: heldTaskId,
+        assignmentId: reactivatedAssignmentId,
+        taskStatus: TASK_STATUS.PENDING,
+        instanceStatus: INSTANCE_STATUS.RUNNING,
+        requestComments: clarificationHold.comments || ""
+      }
+    });
+
+    await writeEnterpriseAudit(client, {
+      eventType: "ClarificationSubmitted",
+      module: "Workflow Engine",
+      entity: "Workflow Instance",
+      entityId: String(instanceId),
+      action: "Clarification submitted — workflow resumed",
+      userName: user.name,
+      userRole: user.role,
+      previousValue: INSTANCE_STATUS.PAUSED,
+      newValue: INSTANCE_STATUS.RUNNING,
+      metadata: {
+        taskId: heldTaskId,
+        assignmentId: reactivatedAssignmentId,
+        comments: clarificationComments || "",
+        stageKey
+      }
+    });
+
+    // Complete any requestor clarification tasks created for Budget pause.
+    const requestorTaskId = clarificationHold.requestor_task_id
+      ? Number(clarificationHold.requestor_task_id)
+      : null;
+
+    if (requestorTaskId) {
+      await client.query(
+        `UPDATE wf_tasks
+         SET status = $2, completed_on = NOW()
+         WHERE task_id = $1
+           AND instance_id = $3`,
+        [requestorTaskId, TASK_STATUS.COMPLETED, instanceId]
+      );
+      await client.query(
+        `UPDATE wf_assignments
+         SET active = FALSE
+         WHERE task_id = $1`,
+        [requestorTaskId]
+      );
+    } else {
+      await client.query(
+        `UPDATE wf_tasks
+         SET status = $2, completed_on = NOW()
+         WHERE instance_id = $1
+           AND task_type = 'clarification'
+           AND LOWER(status) = 'pending'`,
+        [instanceId, TASK_STATUS.COMPLETED]
+      );
+      await client.query(
+        `UPDATE wf_assignments a
+         SET active = FALSE
+         FROM wf_tasks t
+         WHERE a.task_id = t.task_id
+           AND t.instance_id = $1
+           AND t.task_type = 'clarification'`,
+        [instanceId]
+      );
+    }
+
+    // Ensure only the restored approval assignment remains active.
+    await client.query(
+      `UPDATE wf_assignments a
+       SET active = FALSE
+       FROM wf_tasks t
+       WHERE a.task_id = t.task_id
+         AND t.instance_id = $1
+         AND a.active = TRUE
+         AND a.assignment_id <> $2`,
+      [instanceId, reactivatedAssignmentId]
+    );
+
+    const assigneeResult = await client.query(
+      `SELECT assignee FROM wf_assignments WHERE assignment_id = $1`,
+      [reactivatedAssignmentId]
+    );
+
+    const domainResume = await workflowDomainHooks.notifyClarificationSubmitted(
+      client,
+      {
+        instanceId,
+        workflowCode: instance.workflow_code,
+        comments: clarificationComments || "",
+        reactivatedTaskId: heldTaskId,
+        reactivatedAssignmentId,
+        reactivatedAssignee: assigneeResult.rows[0]?.assignee || task.assignee || null,
+        executionContext: {
+          ...nextContext,
+          meta: {
+            ...((priorContext.meta && typeof priorContext.meta === "object")
+              ? priorContext.meta
+              : {}),
+            ...((nextContext.meta && typeof nextContext.meta === "object")
+              ? nextContext.meta
+              : {})
+          }
+        },
+        instancePayload: payload
+      },
+      req
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      hiringProcess: payload,
+      stage,
+      taskId: heldTaskId,
+      assignmentId: reactivatedAssignmentId,
+      instanceId,
+      taskStatus: TASK_STATUS.PENDING,
+      instanceStatus: INSTANCE_STATUS.RUNNING,
+      workflowResumed: true,
+      businessActionCompleted: Boolean(domainResume?.businessActionCompleted),
+      toastMessage: "Clarification submitted. Workflow resumed."
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // Preserve original error
+    }
+    throw error;
+  } finally {
+    client.release();
   }
-
-  const instance = row.rows[0];
-  const stageKey = instance.current_stage_key;
-  const payload = clonePayload(instance.instance_payload);
-  const stage = payload.stages.find((item) => item.key === stageKey);
-
-  if (stage) {
-    stage.status = "Clarification Submitted";
-    stage.completion_pct = Math.max(stage.completion_pct || 0, 30);
-  }
-
-  payload.timeline.push({
-    id: `tl-${Date.now()}`,
-    time: new Date().toISOString(),
-    actor: user.name,
-    role: user.role,
-    action: "Clarification Submitted",
-    event_type: "clarification",
-    comment: comments,
-    stage_key: stageKey
-  });
-
-  await persistInstance(pool, {
-    instance_id: instanceId,
-    status: instance.status,
-    current_stage_key: stageKey,
-    execution_context: instance.execution_context,
-    instance_payload: payload
-  }, user.name);
-
-  await appendHistory(pool, instanceId, {
-    eventType: "ClarificationSubmitted",
-    stageKey,
-    actor: user.name,
-    actorRole: user.role,
-    action: "Clarification submitted",
-    comments
-  });
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "ClarificationSubmitted",
-    module: "Workflow Engine",
-    entity: "Workflow Instance",
-    entityId: instanceId,
-    action: "Clarification submitted",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comments, stageKey }
-  });
-
-  return { hiringProcess: payload, stage };
 }
 
-async function completeTask(pool, taskId, req) {
+async function completeTask(queryable, taskId, req, options = {}) {
   const user = userContext(req);
-  const taskResult = await pool.query("SELECT * FROM wf_tasks WHERE task_id = $1", [taskId]);
+  const requireActiveAssignee = Boolean(options.requireActiveAssignee);
+  const isClient = typeof queryable.release === "function";
+  const client = isClient ? queryable : await queryable.connect();
+  const manageTx = !isClient;
 
-  if (!taskResult.rows.length) {
-    throw httpError(`Task not found: ${taskId}`, 404);
+  try {
+    if (manageTx) {
+      await client.query("BEGIN");
+    }
+
+    // Lock order: task → instance (consistent with reject / clarification request)
+    const taskResult = await client.query(
+      "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+      [taskId]
+    );
+
+    if (!taskResult.rows.length) {
+      throw httpError(`Task not found: ${taskId}`, 404);
+    }
+
+    const task = taskResult.rows[0];
+
+    // Pending-only completion — Waiting / Clarification / Completed / Cancelled never complete
+    assertTaskStatusPending(task);
+
+    const instanceResult = await client.query(
+      "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
+      [task.instance_id]
+    );
+
+    if (!instanceResult.rows.length) {
+      throw httpError(`Workflow instance not found: ${task.instance_id}`, 404);
+    }
+
+    const instance = instanceResult.rows[0];
+    assertInstanceRunning(instance);
+
+    // Revalidate assignee after locks when called from My Approvals approve
+    if (requireActiveAssignee) {
+      await assertActiveAssignee(client, taskId, req, { forUpdate: true });
+    }
+
+    // 1. Mark current task Completed
+    await client.query(
+      `UPDATE wf_tasks
+       SET status = $2, completed_on = NOW()
+       WHERE task_id = $1
+         AND LOWER(status) = 'pending'`,
+      [taskId, TASK_STATUS.COMPLETED]
+    );
+
+    // 2. Deactivate current assignment(s)
+    await client.query(
+      `UPDATE wf_assignments
+       SET active = FALSE
+       WHERE task_id = $1`,
+      [taskId]
+    );
+
+    await appendHistory(client, task.instance_id, {
+      eventType: "TaskCompleted",
+      stageKey: task.stage_key,
+      actor: user.name,
+      actorRole: user.role,
+      action: "Task Completed",
+      metadata: { taskId, previousStatus: task.status }
+    });
+
+    // 3. Locate next Waiting task (creation order); accept legacy WAITING casing
+    const nextResult = await client.query(
+      `SELECT *
+       FROM wf_tasks
+       WHERE instance_id = $1
+         AND task_id <> $2
+         AND LOWER(status) = 'waiting'
+       ORDER BY created_on ASC, task_id ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [task.instance_id, taskId]
+    );
+
+    let activatedTaskId = null;
+    let activatedAssignmentId = null;
+    let workflowCompleted = false;
+    let businessAction = {
+      businessActionCompleted: false
+    };
+
+    if (nextResult.rows.length > 0) {
+      const nextTask = nextResult.rows[0];
+
+      // 4. Activate next task → Pending
+      await client.query(
+        `UPDATE wf_tasks
+         SET status = $2, completed_on = NULL
+         WHERE task_id = $1`,
+        [nextTask.task_id, TASK_STATUS.PENDING]
+      );
+
+      // 5. Exactly one active assignment on the instance
+      activatedAssignmentId = await activateSingleAssignment(
+        client,
+        task.instance_id,
+        nextTask.task_id
+      );
+
+      activatedTaskId = nextTask.task_id;
+
+      // 6. History — Task Activated
+      await appendHistory(client, task.instance_id, {
+        eventType: "TaskActivated",
+        stageKey: nextTask.stage_key,
+        actor: user.name,
+        actorRole: user.role,
+        action: "Task Activated",
+        metadata: {
+          taskId: nextTask.task_id,
+          assignmentId: activatedAssignmentId,
+          previousStatus: nextTask.status,
+          activatedFromTaskId: taskId
+        }
+      });
+
+      const activatedAssigneeResult = await client.query(
+        `SELECT assignee
+         FROM wf_assignments
+         WHERE assignment_id = $1`,
+        [activatedAssignmentId]
+      );
+
+      businessAction = await workflowDomainHooks.notifyApprovalStepActivated(
+        client,
+        {
+          instanceId: task.instance_id,
+          workflowCode: instance.workflow_code,
+          completedByTaskId: taskId,
+          activatedTaskId: nextTask.task_id,
+          activatedAssignmentId,
+          activatedAssignee: activatedAssigneeResult.rows[0]?.assignee || nextTask.assignee || null,
+          comments: options.comments || null,
+          executionContext: instance.execution_context || {},
+          instancePayload: instance.instance_payload || {}
+        },
+        req
+      );
+    } else {
+      // Ensure no lingering active assignments when workflow completes
+      await client.query(
+        `UPDATE wf_assignments a
+         SET active = FALSE
+         FROM wf_tasks t
+         WHERE a.task_id = t.task_id
+           AND t.instance_id = $1
+           AND a.active = TRUE`,
+        [task.instance_id]
+      );
+
+      // 7. No waiting task — complete workflow instance
+      await client.query(
+        `UPDATE wf_instances
+         SET status = $2,
+             completed_on = NOW(),
+             modified_by = $3,
+             modified_on = NOW()
+         WHERE instance_id = $1`,
+        [task.instance_id, INSTANCE_STATUS.COMPLETED, user.name]
+      );
+
+      workflowCompleted = true;
+
+      await appendHistory(client, task.instance_id, {
+        eventType: "WorkflowCompleted",
+        stageKey: task.stage_key,
+        actor: user.name,
+        actorRole: user.role,
+        action: "Workflow Completed",
+        metadata: { completedByTaskId: taskId }
+      });
+    }
+
+    // Notify domain modules on final completion (same TX).
+    if (workflowCompleted) {
+      const completedInstanceResult = await client.query(
+        `SELECT instance_id, workflow_code, execution_context, instance_payload
+         FROM wf_instances
+         WHERE instance_id = $1`,
+        [task.instance_id]
+      );
+      const instanceRow = completedInstanceResult.rows[0] || {};
+
+      businessAction = await workflowDomainHooks.notifyWorkflowCompleted(
+        client,
+        {
+          instanceId: task.instance_id,
+          workflowCode: instanceRow.workflow_code,
+          completedByTaskId: taskId,
+          comments: options.comments || null,
+          executionContext: instanceRow.execution_context || {},
+          instancePayload: instanceRow.instance_payload || {}
+        },
+        req
+      );
+    }
+
+    await writeEnterpriseAudit(client, {
+      eventType: workflowCompleted ? "WorkflowCompleted" : "TaskCompleted",
+      module: "Workflow Engine",
+      entity: "Workflow Task",
+      entityId: String(taskId),
+      action: workflowCompleted
+        ? "Task completed; workflow completed"
+        : "Task completed; next approval task activated",
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        taskId,
+        activatedTaskId,
+        activatedAssignmentId,
+        workflowCompleted,
+        instanceId: task.instance_id,
+        businessActionCompleted: Boolean(
+          businessAction?.businessActionCompleted
+        )
+      }
+    });
+
+    if (manageTx) {
+      await client.query("COMMIT");
+    }
+
+    return {
+      taskId,
+      status: TASK_STATUS.COMPLETED,
+      activatedTaskId,
+      activatedAssignmentId,
+      workflowCompleted,
+      businessActionCompleted: Boolean(
+        businessAction?.businessActionCompleted
+      ),
+      businessAction: businessAction || null,
+      instanceId: task.instance_id
+    };
+  } catch (error) {
+    if (manageTx) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_rollbackError) {
+        // Preserve original error
+      }
+    }
+    throw error;
+  } finally {
+    if (manageTx) {
+      client.release();
+    }
   }
-
-  const task = taskResult.rows[0];
-
-  await pool.query(
-    `UPDATE wf_tasks SET status = 'Completed', completed_on = NOW() WHERE task_id = $1`,
-    [taskId]
-  );
-
-  await writeEnterpriseAudit(pool, {
-    eventType: "TaskAssigned",
-    module: "Workflow Engine",
-    entity: "Workflow Task",
-    entityId: String(taskId),
-    action: "Task completed",
-    userName: user.name,
-    userRole: user.role
-  });
-
-  return { taskId, status: "Completed" };
 }
 
 async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
   const user = userContext(req);
-  const taskResult = await pool.query("SELECT * FROM wf_tasks WHERE task_id = $1", [taskId]);
+  const nextAssignee = assignee ? String(assignee).trim() : "";
 
-  if (!taskResult.rows.length) {
-    throw httpError(`Task not found: ${taskId}`, 404);
+  if (!nextAssignee) {
+    throw httpError("assignee is required for reassignment.", 400);
   }
 
-  const task = taskResult.rows[0];
+  const client = await pool.connect();
 
-  await pool.query(
-    `UPDATE wf_tasks SET assignee = $1, assignee_role = $2 WHERE task_id = $3`,
-    [assignee, assigneeRole, taskId]
-  );
+  try {
+    await client.query("BEGIN");
 
-  await pool.query(
-    `UPDATE wf_assignments SET active = FALSE WHERE task_id = $1`,
-    [taskId]
-  );
+    const taskResult = await client.query(
+      "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
+      [taskId]
+    );
 
-  await pool.query(
-    `INSERT INTO wf_assignments (task_id, assignee, assignee_role, assigned_by)
-     VALUES ($1,$2,$3,$4)`,
-    [taskId, assignee, assigneeRole, user.name]
-  );
+    if (!taskResult.rows.length) {
+      throw httpError(`Task not found: ${taskId}`, 404);
+    }
 
-  await writeEnterpriseAudit(pool, {
-    eventType: "TaskReassigned",
-    module: "Workflow Engine",
-    entity: "Workflow Task",
-    entityId: String(taskId),
-    action: `Task reassigned to ${assignee}`,
-    userName: user.name,
-    userRole: user.role
-  });
+    const task = taskResult.rows[0];
 
-  return { taskId, assignee, assigneeRole, status: task.status };
+    await client.query(
+      "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
+      [task.instance_id]
+    );
+
+    await client.query(
+      `UPDATE wf_tasks SET assignee = $1, assignee_role = $2 WHERE task_id = $3`,
+      [nextAssignee, assigneeRole, taskId]
+    );
+
+    await client.query(
+      `UPDATE wf_assignments a
+       SET active = FALSE
+       FROM wf_tasks t
+       WHERE a.task_id = t.task_id
+         AND t.instance_id = $1
+         AND a.active = TRUE`,
+      [task.instance_id]
+    );
+
+    const insertResult = await client.query(
+      `INSERT INTO wf_assignments (task_id, assignee, assignee_role, assigned_by, active)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING assignment_id`,
+      [
+        taskId,
+        nextAssignee,
+        assigneeRole,
+        user.name,
+        String(task.status).toLowerCase() === "pending"
+      ]
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "TaskReassigned",
+      module: "Workflow Engine",
+      entity: "Workflow Task",
+      entityId: String(taskId),
+      action: `Task reassigned to ${nextAssignee}`,
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        assignmentId: insertResult.rows[0]?.assignment_id || null,
+        previousAssignee: task.assignee || null
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      taskId,
+      assignee: nextAssignee,
+      assigneeRole,
+      status: task.status,
+      assignmentId: insertResult.rows[0]?.assignment_id || null
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // Preserve original error
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function publishBundle(pool, payload, req, reason = "") {
@@ -1198,11 +2899,18 @@ async function seedConfiguration(pool, payload, primaryInstance, user = { name: 
 }
 
 module.exports = {
+  TASK_STATUS,
+  INSTANCE_STATUS,
   getDefaultSeedPayload,
   getWorkflowsBundle,
   getInstanceById,
   getCurrentTasks,
+  getMyActiveApprovals,
+  approveMyActiveApproval,
+  rejectMyActiveApproval,
+  requestClarificationMyActiveApproval,
   createTask,
+  createApprovalRouteWorkflowTasks,
   startWorkflow,
   advanceWorkflow,
   requestClarification,

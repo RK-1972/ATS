@@ -22,6 +22,11 @@ DROP TABLE IF EXISTS can_language CASCADE;
 DROP TABLE IF EXISTS can_certification CASCADE;
 DROP TABLE IF EXISTS can_skill_map CASCADE;
 DROP TABLE IF EXISTS can_experience CASCADE;
+
+ALTER TABLE can_education DROP COLUMN IF EXISTS from_date;
+ALTER TABLE can_education DROP COLUMN IF EXISTS to_date;
+ALTER TABLE can_education DROP COLUMN IF EXISTS score_type;
+
 DROP TABLE IF EXISTS can_education CASCADE;
 DROP TABLE IF EXISTS can_address CASCADE;
 

@@ -708,6 +708,18 @@ async function submitFeedback(pool, payload, req) {
     [finalOutcome, user.name, interview.interviewId]
   );
 
+  // Always flip legacy schedule flag when linked — Interviewer Home reads this row.
+  // Full feedback hdr/dtl dual-write remains gated in syncLegacyFeedback.
+  const linkedScheduleId = interview.scheduleId || scheduleId;
+  if (linkedScheduleId && (await tableExists(pool, "interview_schedule_trn"))) {
+    await pool.query(
+      `UPDATE interview_schedule_trn
+       SET feedback_submitted = true, interview_status = 'Completed', updated_on = NOW()
+       WHERE schedule_id = $1`,
+      [linkedScheduleId]
+    );
+  }
+
   const feedbackTasks = (await taskService.listInbox(pool, { module: "Interview Management" }))
     .filter(
       (item) =>

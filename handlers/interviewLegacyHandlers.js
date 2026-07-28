@@ -44,13 +44,23 @@ async function handleScheduleInterview(pool, req, res, helpers = {}) {
     let teamsEventId = null;
 
     if (helpers.createInterviewMeeting) {
-      const candidateResult = await pool.query(
+      let candidateResult = await pool.query(
         `SELECT CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name, cm.email_id AS candidate_email
          FROM cand_mstr cm
-         INNER JOIN candidate_req_map crm ON crm.candidate_id = cm.candidate_id
-         WHERE crm.map_id = $1`,
+         INNER JOIN rm_candidate_mappings rcm ON rcm.candidate_id = cm.candidate_id
+         WHERE rcm.map_id = $1 AND rcm.is_active = true`,
         [body.map_id]
       ).catch(() => ({ rows: [] }));
+
+      if (!candidateResult.rows.length) {
+        candidateResult = await pool.query(
+          `SELECT CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name, cm.email_id AS candidate_email
+           FROM cand_mstr cm
+           INNER JOIN candidate_req_map crm ON crm.candidate_id = cm.candidate_id
+           WHERE crm.map_id = $1`,
+          [body.map_id]
+        ).catch(() => ({ rows: [] }));
+      }
 
       const candidateName = candidateResult.rows[0]?.candidate_name;
       const candidateEmail = candidateResult.rows[0]?.candidate_email;

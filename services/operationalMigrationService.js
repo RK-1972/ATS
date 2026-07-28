@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
 
 const MIGRATION_MARKER = "operational-consolidation-v1";
 const STATE_PATH = path.join(__dirname, "..", "migration", "operational-migration-state.json");
@@ -103,7 +104,7 @@ async function migrateRequisitions(client) {
           row.work_location,
           row.openings_count || 1,
           row.primary_skill,
-          row.req_status || "Open",
+          row.req_status || REQUISITION_STATUS.OPEN,
           row.hiring_manager,
           row.employment_type,
           row.created_by,
@@ -135,7 +136,7 @@ async function migrateRequisitions(client) {
         row.employment_type || "Full-time",
         row.openings_count || 1,
         row.primary_skill,
-        row.req_status || "Open",
+        row.req_status || REQUISITION_STATUS.OPEN,
         1.0,
         "Published",
         row.created_on,

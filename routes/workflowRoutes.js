@@ -9,6 +9,111 @@ function handleError(res, error) {
 
 function registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin) {
   const guard = [verifyToken, verifyAdmin];
+  const runtimeGuard = [verifyToken];
+
+  // =====================================================
+  // My Approvals Workbench (active assignments for actor)
+  // Registered before /:workflowCode to avoid path capture.
+  // =====================================================
+  app.get("/api/v1/workflows/my-approvals", runtimeGuard, async (req, res) => {
+    try {
+      const data = await workflowService.getMyActiveApprovals(pool, req);
+      res.json({
+        success: true,
+        message: "Active approvals retrieved successfully",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post(
+    "/api/v1/workflows/my-approvals/:taskId/approve",
+    runtimeGuard,
+    async (req, res) => {
+      try {
+        const result = await workflowService.approveMyActiveApproval(
+          pool,
+          Number(req.params.taskId),
+          req
+        );
+        res.json({
+          success: true,
+          message: "Approval completed successfully",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.post(
+    "/api/v1/workflows/my-approvals/:taskId/reject",
+    runtimeGuard,
+    async (req, res) => {
+      try {
+        const result = await workflowService.rejectMyActiveApproval(
+          pool,
+          Number(req.params.taskId),
+          req.body?.comments || req.body?.comment || "",
+          req
+        );
+        res.json({
+          success: true,
+          message: "Approval rejected successfully",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.post(
+    "/api/v1/workflows/my-approvals/:taskId/request-clarification",
+    runtimeGuard,
+    async (req, res) => {
+      try {
+        const result = await workflowService.requestClarificationMyActiveApproval(
+          pool,
+          Number(req.params.taskId),
+          req.body?.comments || req.body?.comment || "",
+          req
+        );
+        res.json({
+          success: true,
+          message: "Clarification requested successfully",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.post(
+    "/api/v1/workflows/my-approvals/instances/:instanceId/submit-clarification",
+    runtimeGuard,
+    async (req, res) => {
+      try {
+        const result = await workflowService.submitClarification(
+          pool,
+          req.params.instanceId,
+          req.body?.comments || req.body?.comment || "",
+          req
+        );
+        res.json({
+          success: true,
+          message: "Clarification submitted successfully",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.get("/api/v1/workflows", guard, async (req, res) => {
     try {
@@ -151,7 +256,7 @@ function registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workflows/instances/:instanceId/submit-clarification", guard, async (req, res) => {
+  app.post("/api/v1/workflows/instances/:instanceId/submit-clarification", runtimeGuard, async (req, res) => {
     try {
       const result = await workflowService.submitClarification(
         pool,
@@ -167,7 +272,13 @@ function registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin) {
 
   app.post("/api/v1/workflows/tasks/:taskId/complete", guard, async (req, res) => {
     try {
-      const result = await workflowService.completeTask(pool, Number(req.params.taskId), req);
+      // Admin tool path: Pending-only + Running instance enforced inside completeTask.
+      // Assignee enforcement remains on My Approvals approve (requireActiveAssignee).
+      const result = await workflowService.completeTask(
+        pool,
+        Number(req.params.taskId),
+        req
+      );
       res.json(result);
     } catch (error) {
       handleError(res, error);

@@ -3,6 +3,7 @@ const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled } = require("../config/operationalCutover");
+const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "recruitment.seed.json");
 
@@ -10,6 +11,58 @@ function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+const ASSIGN_RECRUITER_ROLES = ["Admin", "TA Lead", "TA Leader"];
+const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
+
+/**
+ * V1.0 assign gate: keep legacy Admin/TA Lead roles, and also allow
+ * employees with an active REQUISITION_ASSIGNER work assignment.
+ */
+async function assertCanAssignRecruiter(pool, req) {
+  const user = userContext(req);
+
+  if (ASSIGN_RECRUITER_ROLES.includes(user.role)) {
+    return;
+  }
+
+  const employeeCode = req.user?.employee_code
+    ? String(req.user.employee_code).trim()
+    : "";
+
+  if (!employeeCode) {
+    throw httpError(
+      "Only Admin, TA Lead, or users with Requisition Assigner work assignment can assign recruiters.",
+      403
+    );
+  }
+
+  const workAssignmentService = require("./workAssignmentService");
+  const assignments =
+    await workAssignmentService.getEmployeeWorkAssignments(pool, employeeCode);
+
+  const hasAssignerCapacity = (assignments || []).some((row) => {
+    if (row.is_active !== true) {
+      return false;
+    }
+
+    if (row.master_is_active === false) {
+      return false;
+    }
+
+    return (
+      String(row.assignment_code || "").trim().toUpperCase() ===
+      REQUISITION_ASSIGNER_CODE
+    );
+  });
+
+  if (!hasAssignerCapacity) {
+    throw httpError(
+      "Only Admin, TA Lead, or users with Requisition Assigner work assignment can assign recruiters.",
+      403
+    );
+  }
 }
 
 function clonePayload(payload) {
@@ -62,7 +115,8 @@ async function validateMasterDataReferences(pool, data) {
   const checks = [
     { field: "department", entityType: "departments" },
     { field: "grade", entityType: "grades" },
-    { field: "location", entityType: "locations" },
+    // Geography masters use cities / work_locations — entity type "locations" does not exist.
+    { field: "location", entityType: "cities", alternateEntityTypes: ["work_locations"] },
     { field: "primary_skill", entityType: "skills" },
     { field: "employment_type", entityType: "employment_types" },
     { field: "source_type", entityType: "candidate_sources" },
@@ -75,18 +129,36 @@ async function validateMasterDataReferences(pool, data) {
       continue;
     }
 
-    const records = await masterDataService.listByEntityType(pool, check.entityType);
-    const names = new Set(records.map((row) => row.name.toLowerCase()));
-    const codes = new Set(records.map((row) => row.code.toLowerCase()));
+    const entityTypes = [
+      check.entityType,
+      ...(check.alternateEntityTypes || [])
+    ];
     const key = String(value).toLowerCase();
+    let matched = false;
 
-    if (!names.has(key) && !codes.has(key)) {
+    for (const entityType of entityTypes) {
+      const records = await masterDataService.listByEntityType(pool, entityType);
+      const names = new Set(records.map((row) => row.name.toLowerCase()));
+      const codes = new Set(records.map((row) => row.code.toLowerCase()));
+
+      if (names.has(key) || codes.has(key)) {
+        matched = true;
+        break;
+      }
+
       const partial = records.find((row) =>
         row.name.toLowerCase().includes(key) || row.code.toLowerCase().includes(key)
       );
-      if (!partial) {
-        errors.push(`"${value}" not found in Master Data (${check.entityType}).`);
+      if (partial) {
+        matched = true;
+        break;
       }
+    }
+
+    if (!matched) {
+      errors.push(
+        `"${value}" not found in Master Data (${entityTypes.join(" / ")}).`
+      );
     }
   }
 
@@ -136,7 +208,7 @@ async function allocateMapId(pool) {
   return result.rows[0].next_id;
 }
 
-async function insertLegacyRequisition(pool, position, requisitionCode, user) {
+async function insertLegacyRequisition(pool, position, requisitionCode, user, approvalRouteId = null) {
   if (!isLegacyDualWriteEnabled() || !(await tableExists(pool, "req_mstr"))) {
     return null;
   }
@@ -152,8 +224,9 @@ async function insertLegacyRequisition(pool, position, requisitionCode, user) {
       req_code, client_name, project_name, job_title, job_description,
       primary_skill, secondary_skill, experience_min, experience_max,
       openings_count, work_location, employment_type, priority_level,
-      req_status, recruiter_id, hiring_manager, target_date, created_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      req_status, recruiter_id, hiring_manager, target_date, created_by,
+      approval_route_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     RETURNING *`,
     [
       legacyCode,
@@ -166,14 +239,15 @@ async function insertLegacyRequisition(pool, position, requisitionCode, user) {
       null,
       null,
       position.headcount || 1,
-      position.location || "Bangalore",
-      position.employment_type || "Full-time",
+      position.location || null,
+      position.employment_type || null,
       "High",
-      "Open",
+      REQUISITION_STATUS.OPEN,
       null,
       position.hiring_manager || "Hiring Manager",
       position.expiry_date || null,
-      user.name
+      user.name,
+      approvalRouteId
     ]
   );
 
@@ -181,13 +255,43 @@ async function insertLegacyRequisition(pool, position, requisitionCode, user) {
 }
 
 async function getRecruitmentBundle(pool) {
+  const hasLegacyReq = await tableExists(pool, "req_mstr");
+
   const requisitions = await pool.query(
-    `SELECT r.*,
-      p.position_title AS approved_position_title,
-      p.department AS approved_department
-     FROM rm_requisitions r
-     LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
-     ORDER BY r.created_on DESC`
+    hasLegacyReq
+      ? `SELECT r.*,
+          p.position_title AS approved_position_title,
+          p.department AS approved_department,
+          p.grade AS approved_grade,
+          p.headcount AS approved_headcount,
+          p.expiry_date AS approved_expiry_date,
+          p.remaining_budget AS approved_remaining_budget,
+          lm.job_description AS legacy_job_description,
+          lm.secondary_skill AS legacy_secondary_skill,
+          lm.experience_min AS legacy_experience_min,
+          lm.experience_max AS legacy_experience_max,
+          lm.priority_level AS legacy_priority_level,
+          lm.target_date AS legacy_target_date,
+          lm.client_name AS legacy_client_name,
+          lm.project_name AS legacy_project_name,
+          lm.hiring_manager AS legacy_hiring_manager,
+          lm.work_location AS legacy_work_location,
+          lm.employment_type AS legacy_employment_type,
+          lm.primary_skill AS legacy_primary_skill
+         FROM rm_requisitions r
+         LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
+         LEFT JOIN req_mstr lm ON lm.req_id = r.req_id
+         ORDER BY r.created_on DESC`
+      : `SELECT r.*,
+          p.position_title AS approved_position_title,
+          p.department AS approved_department,
+          p.grade AS approved_grade,
+          p.headcount AS approved_headcount,
+          p.expiry_date AS approved_expiry_date,
+          p.remaining_budget AS approved_remaining_budget
+         FROM rm_requisitions r
+         LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
+         ORDER BY r.created_on DESC`
   );
 
   const assignments = await pool.query(
@@ -682,12 +786,20 @@ async function getMyRecruiterDashboard(pool, req) {
   };
 }
 
-async function createFromApprovedPosition(pool, positionId, options = {}, req) {
+/**
+ * @param {object} queryable - pg Pool or Client (shared TX handle)
+ */
+async function createFromApprovedPosition(
+  queryable,
+  positionId,
+  options = {},
+  req
+) {
   const user = userContext(req);
-  const platformConfig = await loadPlatformConfig(pool);
+  const platformConfig = await loadPlatformConfig(queryable);
   await assertRecruitmentModuleEnabled(platformConfig);
 
-  const position = await loadApprovedPosition(pool, positionId);
+  const position = await loadApprovedPosition(queryable, positionId);
   if (!position) {
     throw httpError(`Approved position not found: ${positionId}`, 404);
   }
@@ -696,31 +808,52 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
     throw httpError("Approved position budget is fully utilized.", 400);
   }
 
-  const mdValidation = await validateMasterDataReferences(pool, {
+  const existingForPosition = await queryable.query(
+    `SELECT requisition_code
+     FROM rm_requisitions
+     WHERE approved_position_id = $1
+     ORDER BY created_on ASC
+     LIMIT 1`,
+    [positionId]
+  );
+
+  if (existingForPosition.rows.length > 0) {
+    throw httpError(
+      `A requisition already exists for approved position ${positionId}: ${existingForPosition.rows[0].requisition_code}. One Approved Position creates exactly one Requisition.`,
+      409
+    );
+  }
+
+  const mdValidation = await validateMasterDataReferences(queryable, {
     department: position.department,
     grade: position.grade,
-    location: position.location || options.location,
-    employment_type: position.employment_type || "Full-time"
+    location: options.location || position.location || null,
+    employment_type:
+      options.employment_type || position.employment_type || null
   });
 
   if (!mdValidation.valid) {
     throw httpError(mdValidation.errors.join(" "), 400);
   }
 
+  const resolvedEmploymentType =
+    options.employment_type || position.employment_type || null;
+
   const budgetLpa = Number(position.budget_approved || 0) / 100000;
-  const ruleEval = await evaluateRecruitmentRules(pool, {
+  const ruleEval = await evaluateRecruitmentRules(queryable, {
     department: position.department,
     grade: position.grade,
     approved_budget_lpa: budgetLpa,
     offered_salary_lpa: budgetLpa,
     headcount: position.headcount,
-    employment_type: position.employment_type || "Full-time",
+    employment_type: resolvedEmploymentType,
     action: "create_requisition"
   }, req);
 
-  const requisitionCode = options.requisitionId || await generateRequisitionCode(pool);
+  const requisitionCode =
+    options.requisitionId || (await generateRequisitionCode(queryable));
 
-  const existing = await pool.query(
+  const existing = await queryable.query(
     "SELECT requisition_code FROM rm_requisitions WHERE requisition_code = $1",
     [requisitionCode]
   );
@@ -729,16 +862,27 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
     throw httpError(`Requisition already exists: ${requisitionCode}`, 409);
   }
 
-  const legacyRow = await insertLegacyRequisition(pool, position, requisitionCode, user);
-  const reqId = legacyRow?.req_id || await allocateReqId(pool);
+  const legacyRow = await insertLegacyRequisition(
+    queryable,
+    {
+      ...position,
+      employment_type: resolvedEmploymentType,
+      location: options.location || position.location || null
+    },
+    requisitionCode,
+    user,
+    options.approval_route_id ?? null
+  );
+  const reqId = legacyRow?.req_id || (await allocateReqId(queryable));
 
   const instance = await workflowService.startWorkflow(
-    pool,
+    queryable,
     "REQUISITION",
     {
       instance_id: `WF-RM-${requisitionCode}`,
       meta: {
         process_id: `WF-RM-${requisitionCode}`,
+        document_type: "REQUISITION",
         requisition_id: requisitionCode,
         approved_position_id: positionId,
         department: position.department,
@@ -752,16 +896,17 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
   );
 
   const initialStatus = ruleEval.approvers.some((item) => /finance|ta/i.test(item))
-    ? "Pending TA Lead"
-    : "Open";
+    ? REQUISITION_STATUS.PENDING_LEVEL_1
+    : REQUISITION_STATUS.OPEN;
 
-  await pool.query(
+  await queryable.query(
     `INSERT INTO rm_requisitions (
       requisition_code, approved_position_id, req_id, position_title, grade,
       department, business_unit, location, budget_approved, hiring_manager,
       employment_type, headcount, primary_skill, req_status, workflow_instance_id,
-      version, version_status, effective_from, created_by, modified_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+      version, version_status, effective_from, created_by, modified_by,
+      approval_route_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
     [
       requisitionCode,
       positionId,
@@ -770,10 +915,10 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
       position.grade,
       position.department,
       options.business_unit || position.business_unit || position.department,
-      options.location || position.location || "Bangalore",
+      options.location || position.location || null,
       position.budget_approved,
       options.hiring_manager || position.hiring_manager || "Hiring Manager",
-      position.employment_type || "Full-time",
+      resolvedEmploymentType,
       position.headcount || 1,
       options.primary_skill || null,
       initialStatus,
@@ -782,11 +927,32 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
       "Published",
       new Date(),
       user.name,
-      user.name
+      user.name,
+      options.approval_route_id ?? null
     ]
   );
 
-  await writeEnterpriseAudit(pool, {
+  // When an approval route is provided at create (draft submit), expand L1/Ln
+  // tasks immediately — same as Budget submit. Idempotent if submit expands again.
+  // Catalogue create passes no route; EDIT submit expands via submitRequisition.
+  let approvalTasks = [];
+  if (options.approval_route_id != null && String(options.approval_route_id).trim() !== "") {
+    const employeeCode = req.user?.employee_code
+      ? String(req.user.employee_code).trim()
+      : user.name;
+    approvalTasks = await workflowService.createApprovalRouteWorkflowTasks(
+      queryable,
+      instance.instanceId,
+      options.approval_route_id,
+      {
+        stageKey: instance.currentStageKey || "approval",
+        assignedBy: employeeCode,
+        requisitionCode
+      }
+    );
+  }
+
+  await writeEnterpriseAudit(queryable, {
     eventType: "RequisitionCreated",
     module: "Recruitment Management",
     entity: "Requisition",
@@ -816,8 +982,10 @@ async function createFromApprovedPosition(pool, positionId, options = {}, req) {
       department: position.department,
       budget_approved: position.budget_approved,
       req_status: initialStatus,
-      workflow_instance_id: instance.instanceId
+      workflow_instance_id: instance.instanceId,
+      approval_route_id: options.approval_route_id ?? null
     },
+    approval_tasks: approvalTasks,
     legacyRequisition: legacyRow,
     ruleEvaluation: ruleEval,
     hiringProcessUpdate: {
@@ -866,7 +1034,11 @@ async function approveRequisition(pool, requisitionCode, comment, req) {
     );
   }
 
-  const nextStatus = requisition.req_status === "Pending TA Lead" ? "Approved" : "Open";
+  const nextStatus =
+    requisition.req_status === REQUISITION_STATUS.PENDING_LEVEL_1
+    || requisition.req_status === REQUISITION_STATUS.PENDING_LEVEL_2
+      ? REQUISITION_STATUS.APPROVED
+      : REQUISITION_STATUS.OPEN;
 
   await pool.query(
     `UPDATE rm_requisitions
@@ -878,7 +1050,7 @@ async function approveRequisition(pool, requisitionCode, comment, req) {
   if (isLegacyDualWriteEnabled() && requisition.req_id && (await tableExists(pool, "req_mstr"))) {
     await pool.query(
       "UPDATE req_mstr SET req_status = $1, updated_on = CURRENT_TIMESTAMP WHERE req_id = $2",
-      ["Open", requisition.req_id]
+      [REQUISITION_STATUS.OPEN, requisition.req_id]
     );
   }
 
@@ -907,10 +1079,7 @@ async function assignRecruiter(pool, reqId, recruiterCode, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
   await assertRecruitmentModuleEnabled(platformConfig);
-
-  if (!["Admin", "TA Lead", "TA Leader"].includes(user.role)) {
-    throw httpError("Only Admin or TA Lead can assign recruiters.", 403);
-  }
+  await assertCanAssignRecruiter(pool, req);
 
   let requisition = null;
 
@@ -1064,24 +1233,6 @@ async function mapCandidate(pool, payload, req) {
     throw httpError("Duplicate candidate detected by Business Rules Engine.", 400);
   }
 
-  if (candidateId && (await tableExists(pool, "candidate_req_map"))) {
-    const activeMapping = await pool.query(
-      `SELECT map_id
-       FROM candidate_req_map
-       WHERE candidate_id = $1
-         AND is_active = true
-       LIMIT 1`,
-      [candidateId]
-    );
-
-    if (activeMapping.rows.length > 0) {
-      throw httpError(
-        "Candidate is already assigned to an active requisition. Release the existing mapping before assigning a new requisition.",
-        409
-      );
-    }
-  }
-
   const existingEnterprise = await pool.query(
   `SELECT mapping_id
    FROM rm_candidate_mappings
@@ -1101,33 +1252,11 @@ if (existingEnterprise.rows.length > 0) {
 }
   let legacyMap = null;
   let allocatedMapId = null;
+  const legacyMapTableExists = await tableExists(pool, "candidate_req_map");
+  const dualWriteLegacy =
+    isLegacyDualWriteEnabled() && legacyMapTableExists;
 
-  if (isLegacyDualWriteEnabled() && (await tableExists(pool, "candidate_req_map"))) {
-    const existing = await pool.query(
-      `SELECT * FROM candidate_req_map
-       WHERE candidate_id = $1 AND req_id = $2 AND is_active = true`,
-      [candidateId, requisition.req_id || reqId]
-    );
-
-    if (existing.rows.length > 0) {
-      throw httpError("Candidate already mapped to requisition.", 400);
-    }
-
-    const insert = await pool.query(
-      `INSERT INTO candidate_req_map (
-        candidate_id, req_id, recruiter_id, stage_name, source_type, remarks
-      ) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [
-        candidateId,
-        requisition.req_id || reqId,
-        user.name,
-        stageName,
-        sourceType,
-        remarks
-      ]
-    );
-    legacyMap = insert.rows[0];
-  } else {
+  if (!dualWriteLegacy) {
     allocatedMapId = await allocateMapId(pool);
   }
 
@@ -1147,44 +1276,198 @@ if (existingEnterprise.rows.length > 0) {
     req
   );
 
-  const mapping = await pool.query(
-    `INSERT INTO rm_candidate_mappings (
-      candidate_id, requisition_code, req_id, map_id, recruiter_id,
-      stage_name, source_type, workflow_instance_id, remarks,
-      version, version_status, effective_from
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-    [
-      candidateId,
-      requisition.requisition_code,
-      requisition.req_id || reqId,
-      legacyMap?.map_id || allocatedMapId,
-      user.name,
-      stageName,
-      sourceType,
-      instance.instanceId,
-      remarks,
-      1.0,
-      "Published",
-      new Date()
-    ]
-  );
+  const client = await pool.connect();
+  let mappingRow = null;
 
-  await pool.query(
-    `INSERT INTO rm_pipeline_history (
-      requisition_code, mapping_id, candidate_id, event_type, to_stage, actor, actor_role, comments, metadata
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [
-      requisition.requisition_code,
-      mapping.rows[0].mapping_id,
-      candidateId,
-      "CandidateMapped",
-      stageName,
-      user.name,
-      user.role,
-      remarks,
-      JSON.stringify({ sourceType, ruleEvaluation: ruleEval })
-    ]
-  );
+  try {
+    await client.query("BEGIN");
+
+    const candLock = await client.query(
+      `SELECT candidate_container, owner_employee_code
+       FROM cand_mstr
+       WHERE candidate_id = $1
+       FOR UPDATE`,
+      [candidateId]
+    );
+    const candRow = candLock.rows[0] || null;
+    const shouldAcquireOwnership =
+      candRow &&
+      String(candRow.candidate_container || "").toUpperCase() === "TALENT_POOL" &&
+      candRow.owner_employee_code == null;
+
+    // One active assignment — authoritative check under candidate row lock
+    const activeEnterpriseMapping = await client.query(
+      `SELECT mapping_id
+       FROM rm_candidate_mappings
+       WHERE candidate_id = $1
+         AND is_active = true
+       LIMIT 1`,
+      [candidateId]
+    );
+
+    if (activeEnterpriseMapping.rows.length > 0) {
+      throw httpError(
+        "Candidate is already assigned to an active requisition. Release the existing mapping before assigning a new requisition.",
+        409
+      );
+    }
+
+    if (legacyMapTableExists) {
+      const activeLegacyMapping = await client.query(
+        `SELECT map_id
+         FROM candidate_req_map
+         WHERE candidate_id = $1
+           AND is_active = true
+         LIMIT 1`,
+        [candidateId]
+      );
+
+      if (activeLegacyMapping.rows.length > 0) {
+        throw httpError(
+          "Candidate is already assigned to an active requisition. Release the existing mapping before assigning a new requisition.",
+          409
+        );
+      }
+    }
+
+    if (dualWriteLegacy) {
+      const existing = await client.query(
+        `SELECT * FROM candidate_req_map
+         WHERE candidate_id = $1 AND req_id = $2 AND is_active = true`,
+        [candidateId, requisition.req_id || reqId]
+      );
+
+      if (existing.rows.length > 0) {
+        throw httpError("Candidate already mapped to requisition.", 400);
+      }
+
+      const insert = await client.query(
+        `INSERT INTO candidate_req_map (
+          candidate_id, req_id, recruiter_id, stage_name, source_type, remarks
+        ) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [
+          candidateId,
+          requisition.req_id || reqId,
+          user.name,
+          stageName,
+          sourceType,
+          remarks
+        ]
+      );
+      legacyMap = insert.rows[0];
+    }
+
+    const mapping = await client.query(
+      `INSERT INTO rm_candidate_mappings (
+        candidate_id, requisition_code, req_id, map_id, recruiter_id,
+        stage_name, source_type, workflow_instance_id, remarks,
+        version, version_status, effective_from
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [
+        candidateId,
+        requisition.requisition_code,
+        requisition.req_id || reqId,
+        legacyMap?.map_id || allocatedMapId,
+        user.name,
+        stageName,
+        sourceType,
+        instance.instanceId,
+        remarks,
+        1.0,
+        "Published",
+        new Date()
+      ]
+    );
+    mappingRow = mapping.rows[0];
+
+    // Guarantee legacy candidate_req_map parent for schedule FK consumers.
+    // Existing dual-write path already inserts; when dual-write is off, create
+    // the bridge only if this map_id is missing (idempotent).
+    if (legacyMapTableExists && mappingRow.map_id) {
+      const legacyParent = await client.query(
+        `SELECT map_id
+         FROM candidate_req_map
+         WHERE map_id = $1`,
+        [mappingRow.map_id]
+      );
+
+      if (legacyParent.rows.length === 0) {
+        const bridgeReqId = requisition.req_id || reqId;
+        if (!bridgeReqId) {
+          throw httpError(
+            "Enterprise requisition is not linked to a legacy Req ID.",
+            400
+          );
+        }
+
+        await client.query(
+          `INSERT INTO candidate_req_map (
+            map_id, candidate_id, req_id, recruiter_id,
+            stage_name, source_type, remarks, is_active
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+          ON CONFLICT (map_id) DO NOTHING`,
+          [
+            mappingRow.map_id,
+            candidateId,
+            bridgeReqId,
+            user.name,
+            stageName,
+            sourceType,
+            remarks
+          ]
+        );
+
+        await client.query(
+          `SELECT setval(
+             'candidate_req_map_map_id_seq',
+             (SELECT COALESCE(MAX(map_id), 1) FROM candidate_req_map)
+           )`
+        );
+      }
+    }
+
+    await client.query(
+      `INSERT INTO rm_pipeline_history (
+        requisition_code, mapping_id, candidate_id, event_type, to_stage, actor, actor_role, comments, metadata
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        requisition.requisition_code,
+        mappingRow.mapping_id,
+        candidateId,
+        "CandidateMapped",
+        stageName,
+        user.name,
+        user.role,
+        remarks,
+        JSON.stringify({ sourceType, ruleEvaluation: ruleEval })
+      ]
+    );
+
+    // Talent Pool unowned → acquire ownership on map (same transaction).
+    // PIPELINE + owned by another recruiter: leave ownership unchanged (request workflow).
+    if (shouldAcquireOwnership) {
+      await client.query(
+        `UPDATE cand_mstr
+         SET candidate_container = 'PIPELINE',
+             owner_employee_code = $1
+         WHERE candidate_id = $2
+           AND candidate_container = 'TALENT_POOL'
+           AND owner_employee_code IS NULL`,
+        [recruiterEmployeeCode(req), candidateId]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 
   await writeEnterpriseAudit(pool, {
     eventType: "CandidateMapped",
@@ -1198,7 +1481,7 @@ if (existingEnterprise.rows.length > 0) {
   });
 
   return {
-    mapping: mapping.rows[0],
+    mapping: mappingRow,
     legacyMapping: legacyMap,
     toastMessage: "Candidate mapped successfully."
   };
@@ -1337,7 +1620,10 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
   };
 }
 
-async function handleLegacyCreateRequisition(pool, body, req) {
+/**
+ * @param {object} queryable - pg Pool or Client (shared TX handle)
+ */
+async function handleLegacyCreateRequisition(queryable, body, req) {
   const approvedPositionId = body.approved_position_id;
 
   if (!approvedPositionId) {
@@ -1347,11 +1633,13 @@ async function handleLegacyCreateRequisition(pool, body, req) {
     );
   }
 
-  return createFromApprovedPosition(pool, approvedPositionId, {
+  return createFromApprovedPosition(queryable, approvedPositionId, {
     business_unit: body.client_name,
-    location: body.work_location,
+    location: body.work_location || null,
     hiring_manager: body.hiring_manager,
-    primary_skill: body.primary_skill
+    primary_skill: body.primary_skill,
+    employment_type: body.employment_type || null,
+    approval_route_id: body.approval_route_id ?? body.route_id ?? null
   }, req);
 }
 
@@ -1383,7 +1671,7 @@ async function seedConfiguration(pool, payload, user = { name: "System Seed", ro
         requisition.employment_type || "Full-time",
         requisition.headcount || 1,
         requisition.primary_skill || null,
-        requisition.req_status || "Open",
+        requisition.req_status || REQUISITION_STATUS.OPEN,
         requisition.workflow_instance_id || null,
         1.0,
         "Published",
@@ -1541,6 +1829,7 @@ async function resolveRequisitionIdentifier(pool, reqIdOrCode) {
 async function listRequisitionsForManagement(pool) {
   const result = await pool.query(
     `SELECT * FROM rm_requisitions
+     WHERE UPPER(COALESCE(req_status, '')) = 'APPROVED'
      ORDER BY COALESCE(req_id, 0) DESC, created_on DESC`
   );
 
@@ -1617,10 +1906,7 @@ async function removeRecruiterAssignment(pool, mapId, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
   await assertRecruitmentModuleEnabled(platformConfig);
-
-  if (!["Admin", "TA Lead", "TA Leader"].includes(user.role)) {
-    throw httpError("Only Admin or TA Lead can remove recruiter assignments.", 403);
-  }
+  await assertCanAssignRecruiter(pool, req);
 
   const target = await resolveRecruiterAssignmentTarget(pool, mapId);
   const assignment = target.assignment;
@@ -1687,6 +1973,755 @@ async function removeRecruiterAssignment(pool, mapId, req) {
   };
 }
 
+/**
+ * Release Candidate — inverse of mapCandidate.
+ * Deactivates active requisition assignment(s) and returns the candidate
+ * to Enterprise Talent Pool (unowned). Does not unregister or delete.
+ */
+async function releaseCandidate(pool, candidateId, req) {
+  const user = userContext(req);
+  const legacyMapTableExists = await tableExists(pool, "candidate_req_map");
+
+  const client = await pool.connect();
+  let primaryMapping = null;
+
+  try {
+    await client.query("BEGIN");
+
+    // Step 1 — same lock strategy as mapCandidate
+    await client.query(
+      `SELECT candidate_id, candidate_container, owner_employee_code
+       FROM cand_mstr
+       WHERE candidate_id = $1
+       FOR UPDATE`,
+      [candidateId]
+    );
+
+    // Step 2 — verify at least one ACTIVE assignment under the lock
+    const activeEnterprise = await client.query(
+      `SELECT mapping_id, candidate_id, requisition_code, map_id
+       FROM rm_candidate_mappings
+       WHERE candidate_id = $1
+         AND is_active = true
+       ORDER BY applied_on DESC`,
+      [candidateId]
+    );
+
+    let activeLegacy = { rows: [] };
+    if (legacyMapTableExists) {
+      activeLegacy = await client.query(
+        `SELECT map_id, candidate_id, req_id
+         FROM candidate_req_map
+         WHERE candidate_id = $1
+           AND is_active = true`,
+        [candidateId]
+      );
+    }
+
+    if (activeEnterprise.rows.length === 0 && activeLegacy.rows.length === 0) {
+      throw httpError("No active requisition mapping found.", 404);
+    }
+
+    primaryMapping = activeEnterprise.rows[0] || null;
+
+    // Step 3 — deactivate ACTIVE mapping(s); preserve history rows
+    if (activeEnterprise.rows.length > 0) {
+      await client.query(
+        `UPDATE rm_candidate_mappings
+         SET is_active = false,
+             modified_on = NOW()
+         WHERE candidate_id = $1
+           AND is_active = true`,
+        [candidateId]
+      );
+    }
+
+    if (legacyMapTableExists && activeLegacy.rows.length > 0) {
+      await client.query(
+        `UPDATE candidate_req_map
+         SET is_active = false
+         WHERE candidate_id = $1
+           AND is_active = true`,
+        [candidateId]
+      );
+    }
+
+    // Step 4 — return to Talent Pool (unowned). Step 5 — leave
+    // registered_by, registered_on, recruiter_id, candidate_status unchanged.
+    await client.query(
+      `UPDATE cand_mstr
+       SET candidate_container = 'TALENT_POOL',
+           owner_employee_code = NULL
+       WHERE candidate_id = $1`,
+      [candidateId]
+    );
+
+    if (primaryMapping) {
+      await client.query(
+        `INSERT INTO rm_pipeline_history (
+          requisition_code, mapping_id, candidate_id, event_type,
+          actor, actor_role, comments, metadata
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          primaryMapping.requisition_code,
+          primaryMapping.mapping_id,
+          primaryMapping.candidate_id,
+          "CandidateReleased",
+          user.name,
+          user.role,
+          "Candidate released from requisition",
+          JSON.stringify({
+            actorCode: req.user?.employee_code || null
+          })
+        ]
+      );
+    }
+
+    // Step 6
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await writeEnterpriseAudit(pool, {
+    eventType: "CandidateReleased",
+    module: "Recruitment Management",
+    entity: "Candidate",
+    entityId: String(candidateId),
+    action: primaryMapping
+      ? `Candidate released from requisition ${primaryMapping.requisition_code}`
+      : "Candidate released from active requisition",
+    previousValue: "PIPELINE",
+    newValue: "TALENT_POOL",
+    userName: user.name,
+    userRole: user.role,
+    metadata: {
+      mappingId: primaryMapping?.mapping_id || null,
+      requisitionCode: primaryMapping?.requisition_code || null
+    }
+  });
+
+  return {
+    message: "Candidate released from active requisition.",
+    mapping: primaryMapping
+  };
+}
+
+/**
+ * Return to Talent Pool — release PIPELINE ownership without an active assignment.
+ * Separate from releaseCandidate (which requires an active requisition mapping).
+ */
+async function returnCandidateToTalentPool(pool, candidateId, req) {
+  const user = userContext(req);
+  const employeeCode = recruiterEmployeeCode(req);
+  const legacyMapTableExists = await tableExists(pool, "candidate_req_map");
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const candLock = await client.query(
+      `SELECT candidate_id, candidate_container, owner_employee_code
+       FROM cand_mstr
+       WHERE candidate_id = $1
+       FOR UPDATE`,
+      [candidateId]
+    );
+    const candRow = candLock.rows[0];
+
+    if (!candRow) {
+      throw httpError("Candidate not found.", 404);
+    }
+
+    if (String(candRow.candidate_container || "").toUpperCase() !== "PIPELINE") {
+      throw httpError(
+        "Only Pipeline candidates can be returned to the Enterprise Talent Pool.",
+        400
+      );
+    }
+
+    if (candRow.owner_employee_code !== employeeCode) {
+      throw httpError(
+        "Only the current owner can return this candidate to the Enterprise Talent Pool.",
+        403
+      );
+    }
+
+    const activeEnterprise = await client.query(
+      `SELECT mapping_id
+       FROM rm_candidate_mappings
+       WHERE candidate_id = $1
+         AND is_active = true
+       LIMIT 1`,
+      [candidateId]
+    );
+
+    if (activeEnterprise.rows.length > 0) {
+      throw httpError(
+        "Candidate has an active requisition assignment. Use Release Candidate instead.",
+        400
+      );
+    }
+
+    if (legacyMapTableExists) {
+      const activeLegacy = await client.query(
+        `SELECT map_id
+         FROM candidate_req_map
+         WHERE candidate_id = $1
+           AND is_active = true
+         LIMIT 1`,
+        [candidateId]
+      );
+
+      if (activeLegacy.rows.length > 0) {
+        throw httpError(
+          "Candidate has an active requisition assignment. Use Release Candidate instead.",
+          400
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE cand_mstr
+       SET candidate_container = 'TALENT_POOL',
+           owner_employee_code = NULL
+       WHERE candidate_id = $1`,
+      [candidateId]
+    );
+
+    await client.query(
+      `INSERT INTO rm_pipeline_history (
+        requisition_code, mapping_id, candidate_id, event_type,
+        actor, actor_role, comments, metadata
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        null,
+        null,
+        candidateId,
+        "ReturnedToTalentPool",
+        user.name,
+        user.role,
+        "Candidate returned to Enterprise Talent Pool",
+        JSON.stringify({ ownerReleased: employeeCode })
+      ]
+    );
+
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await writeEnterpriseAudit(pool, {
+    eventType: "ReturnedToTalentPool",
+    module: "Recruitment Management",
+    entity: "Candidate",
+    entityId: String(candidateId),
+    action: "Candidate returned to Enterprise Talent Pool",
+    previousValue: "PIPELINE",
+    newValue: "TALENT_POOL",
+    userName: user.name,
+    userRole: user.role,
+    metadata: { ownerReleased: employeeCode }
+  });
+
+  return {
+    message: "Candidate returned to Enterprise Talent Pool."
+  };
+}
+
+/**
+ * List Active approved positions for Talent Demand draft selection.
+ * Read-only catalogue lookup — no workflow / assignment changes.
+ */
+async function listApprovedPositions(pool) {
+  const result = await pool.query(
+    `SELECT
+       position_id,
+       position_title,
+       department,
+       grade,
+       headcount,
+       status,
+       remaining_budget,
+       expiry_date
+     FROM wp_approved_positions
+     WHERE LOWER(COALESCE(status, 'active')) = 'active'
+     ORDER BY position_title ASC, position_id ASC`
+  );
+
+  return result.rows.map((row) => ({
+    position_id: row.position_id,
+    position_title: row.position_title,
+    department: row.department,
+    grade: row.grade,
+    headcount: row.headcount,
+    status: row.status,
+    remaining_budget: row.remaining_budget,
+    expiry_date: row.expiry_date
+  }));
+}
+
+async function loadRequisitionByCode(queryable, code) {
+  const requisitionCode = String(code || "").trim();
+  if (!requisitionCode) {
+    throw httpError("requisition code is required.", 400);
+  }
+
+  const result = await queryable.query(
+    `SELECT r.*,
+      p.position_title AS approved_position_title,
+      p.department AS approved_department,
+      p.grade AS approved_grade,
+      p.headcount AS approved_headcount,
+      p.expiry_date AS approved_expiry_date,
+      p.remaining_budget AS approved_remaining_budget
+     FROM rm_requisitions r
+     LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
+     WHERE r.requisition_code = $1`,
+    [requisitionCode]
+  );
+
+  return result.rows[0] || null;
+}
+
+function blankToNull(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text === "" ? null : value;
+}
+
+function assertExistingRequisitionEditable(requisition) {
+  const status = String(requisition.req_status || "").trim();
+  if (
+    status === REQUISITION_STATUS.APPROVED ||
+    status === REQUISITION_STATUS.REJECTED
+  ) {
+    throw httpError(
+      `Requisition ${requisition.requisition_code} is ${status} and cannot be edited.`,
+      400
+    );
+  }
+}
+
+function assertRequestorSubmitReadiness(requisition) {
+  const errors = [];
+
+  if (requisition.requestor_submitted_on) {
+    throw httpError(
+      `Requisition ${requisition.requisition_code} has already been submitted.`,
+      409
+    );
+  }
+
+  if (!blankToNull(requisition.approval_route_id)) {
+    errors.push("approval_route_id is required before submit.");
+  }
+  if (!blankToNull(requisition.business_unit)) {
+    errors.push("client_name is required before submit.");
+  }
+  if (!blankToNull(requisition.position_title)) {
+    errors.push("job_title is required before submit.");
+  }
+  if (!blankToNull(requisition.primary_skill)) {
+    errors.push("primary_skill is required before submit.");
+  }
+  if (!blankToNull(requisition.location)) {
+    errors.push("work_location is required before submit.");
+  }
+  if (!blankToNull(requisition.employment_type)) {
+    errors.push("employment_type is required before submit.");
+  }
+  if (!blankToNull(requisition.priority_level)) {
+    errors.push("priority_level is required before submit.");
+  }
+  if (!blankToNull(requisition.target_date)) {
+    errors.push("target_date is required before submit.");
+  }
+  if (
+    requisition.experience_min != null &&
+    requisition.experience_max != null &&
+    Number(requisition.experience_min) > Number(requisition.experience_max)
+  ) {
+    errors.push("experience_min cannot be greater than experience_max.");
+  }
+
+  if (errors.length > 0) {
+    throw httpError(errors.join(" "), 400);
+  }
+}
+
+/**
+ * Map Talent Demand editor payload onto rm_requisitions columns.
+ * Never creates a requisition and never changes requisition_code / approved_position_id.
+ */
+function buildRequisitionUpdateFields(payload = {}) {
+  const openings =
+    payload.openings_count !== undefined && payload.openings_count !== ""
+      ? Number(payload.openings_count)
+      : undefined;
+
+  return {
+    business_unit:
+      payload.client_name !== undefined
+        ? blankToNull(payload.client_name)
+        : undefined,
+    department:
+      payload.project_name !== undefined
+        ? blankToNull(payload.project_name)
+        : undefined,
+    position_title:
+      payload.job_title !== undefined
+        ? blankToNull(payload.job_title)
+        : undefined,
+    job_description:
+      payload.job_description !== undefined
+        ? blankToNull(payload.job_description)
+        : undefined,
+    primary_skill:
+      payload.primary_skill !== undefined
+        ? blankToNull(payload.primary_skill)
+        : undefined,
+    secondary_skill:
+      payload.secondary_skill !== undefined
+        ? blankToNull(payload.secondary_skill)
+        : undefined,
+    experience_min:
+      payload.experience_min !== undefined
+        ? payload.experience_min === "" || payload.experience_min === null
+          ? null
+          : Number(payload.experience_min)
+        : undefined,
+    experience_max:
+      payload.experience_max !== undefined
+        ? payload.experience_max === "" || payload.experience_max === null
+          ? null
+          : Number(payload.experience_max)
+        : undefined,
+    headcount:
+      openings !== undefined && !Number.isNaN(openings) ? openings : undefined,
+    location:
+      payload.work_location !== undefined
+        ? blankToNull(payload.work_location)
+        : undefined,
+    employment_type:
+      payload.employment_type !== undefined
+        ? blankToNull(payload.employment_type)
+        : undefined,
+    priority_level:
+      payload.priority_level !== undefined
+        ? blankToNull(payload.priority_level)
+        : undefined,
+    hiring_manager:
+      payload.hiring_manager !== undefined
+        ? blankToNull(payload.hiring_manager)
+        : undefined,
+    hiring_manager_id:
+      payload.hiring_manager_id !== undefined
+        ? payload.hiring_manager_id === "" || payload.hiring_manager_id === null
+          ? null
+          : Number(payload.hiring_manager_id)
+        : undefined,
+    target_date:
+      payload.target_date !== undefined
+        ? blankToNull(payload.target_date)
+        : undefined,
+    approval_route_id:
+      payload.approval_route_id !== undefined || payload.route_id !== undefined
+        ? blankToNull(payload.approval_route_id ?? payload.route_id)
+        : undefined,
+    client_id:
+      payload.client_id !== undefined
+        ? payload.client_id === "" || payload.client_id === null
+          ? null
+          : Number(payload.client_id)
+        : undefined,
+    project_id:
+      payload.project_id !== undefined
+        ? payload.project_id === "" || payload.project_id === null
+          ? null
+          : Number(payload.project_id)
+        : undefined,
+    recruiter_id:
+      payload.recruiter_id !== undefined
+        ? blankToNull(payload.recruiter_id)
+        : undefined
+  };
+}
+
+/**
+ * Update existing operational requisition only. Never creates a requisition.
+ */
+async function updateRequisition(pool, code, payload, req) {
+  const user = userContext(req);
+  const platformConfig = await loadPlatformConfig(pool);
+  await assertRecruitmentModuleEnabled(platformConfig);
+
+  const existing = await loadRequisitionByCode(pool, code);
+  if (!existing) {
+    throw httpError(`Requisition not found: ${code}`, 404);
+  }
+
+  assertExistingRequisitionEditable(existing);
+
+  const fields = buildRequisitionUpdateFields(payload || {});
+  const setClauses = [];
+  const params = [];
+  let idx = 1;
+
+  const columnMap = [
+    ["business_unit", fields.business_unit],
+    ["department", fields.department],
+    ["position_title", fields.position_title],
+    ["job_description", fields.job_description],
+    ["primary_skill", fields.primary_skill],
+    ["secondary_skill", fields.secondary_skill],
+    ["experience_min", fields.experience_min],
+    ["experience_max", fields.experience_max],
+    ["headcount", fields.headcount],
+    ["location", fields.location],
+    ["employment_type", fields.employment_type],
+    ["priority_level", fields.priority_level],
+    ["hiring_manager", fields.hiring_manager],
+    ["hiring_manager_id", fields.hiring_manager_id],
+    ["target_date", fields.target_date],
+    ["approval_route_id", fields.approval_route_id],
+    ["client_id", fields.client_id],
+    ["project_id", fields.project_id],
+    ["recruiter_id", fields.recruiter_id]
+  ];
+
+  for (const [column, value] of columnMap) {
+    if (value !== undefined) {
+      setClauses.push(`${column} = $${idx}`);
+      params.push(value);
+      idx += 1;
+    }
+  }
+
+  if (setClauses.length === 0) {
+    return {
+      success: true,
+      requisition: existing,
+      toastMessage: `Requisition ${existing.requisition_code} unchanged.`
+    };
+  }
+
+  setClauses.push(`modified_by = $${idx}`);
+  params.push(user.name);
+  idx += 1;
+  setClauses.push("modified_on = NOW()");
+  params.push(existing.requisition_code);
+
+  const updated = await pool.query(
+    `UPDATE rm_requisitions
+     SET ${setClauses.join(", ")}
+     WHERE requisition_code = $${idx}
+     RETURNING *`,
+    params
+  );
+
+  const requisition = updated.rows[0];
+
+  if (
+    isLegacyDualWriteEnabled() &&
+    requisition.req_id &&
+    (await tableExists(pool, "req_mstr"))
+  ) {
+    await pool.query(
+      `UPDATE req_mstr SET
+         client_name = COALESCE($1, client_name),
+         project_name = COALESCE($2, project_name),
+         job_title = COALESCE($3, job_title),
+         job_description = COALESCE($4, job_description),
+         primary_skill = COALESCE($5, primary_skill),
+         secondary_skill = COALESCE($6, secondary_skill),
+         experience_min = COALESCE($7, experience_min),
+         experience_max = COALESCE($8, experience_max),
+         openings_count = COALESCE($9, openings_count),
+         work_location = COALESCE($10, work_location),
+         employment_type = COALESCE($11, employment_type),
+         priority_level = COALESCE($12, priority_level),
+         hiring_manager = COALESCE($13, hiring_manager),
+         target_date = COALESCE($14, target_date),
+         approval_route_id = COALESCE($15, approval_route_id),
+         updated_on = CURRENT_TIMESTAMP
+       WHERE req_id = $16`,
+      [
+        fields.business_unit !== undefined ? fields.business_unit : null,
+        fields.department !== undefined ? fields.department : null,
+        fields.position_title !== undefined ? fields.position_title : null,
+        fields.job_description !== undefined ? fields.job_description : null,
+        fields.primary_skill !== undefined ? fields.primary_skill : null,
+        fields.secondary_skill !== undefined ? fields.secondary_skill : null,
+        fields.experience_min !== undefined ? fields.experience_min : null,
+        fields.experience_max !== undefined ? fields.experience_max : null,
+        fields.headcount !== undefined ? fields.headcount : null,
+        fields.location !== undefined ? fields.location : null,
+        fields.employment_type !== undefined ? fields.employment_type : null,
+        fields.priority_level !== undefined ? fields.priority_level : null,
+        fields.hiring_manager !== undefined ? fields.hiring_manager : null,
+        fields.target_date !== undefined ? fields.target_date : null,
+        fields.approval_route_id !== undefined ? fields.approval_route_id : null,
+        requisition.req_id
+      ]
+    );
+  }
+
+  await writeEnterpriseAudit(pool, {
+    eventType: "RequisitionUpdated",
+    module: "Recruitment Management",
+    entity: "Requisition",
+    entityId: requisition.requisition_code,
+    action: `Requisition ${requisition.requisition_code} updated by requestor`,
+    userName: user.name,
+    userRole: user.role,
+    metadata: { fields: Object.keys(fields).filter((k) => fields[k] !== undefined) }
+  });
+
+  return {
+    success: true,
+    requisition,
+    toastMessage: `Requisition ${requisition.requisition_code} updated.`
+  };
+}
+
+/**
+ * Submit existing operational requisition into its existing workflow.
+ * Never creates a requisition. Never starts a second workflow when one exists.
+ */
+async function submitRequisition(pool, code, payload, req) {
+  const user = userContext(req);
+  const platformConfig = await loadPlatformConfig(pool);
+  await assertRecruitmentModuleEnabled(platformConfig);
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const existing = await loadRequisitionByCode(client, code);
+    if (!existing) {
+      throw httpError(`Requisition not found: ${code}`, 404);
+    }
+
+    assertExistingRequisitionEditable(existing);
+
+    if (existing.requestor_submitted_on) {
+      throw httpError(
+        `Requisition ${existing.requisition_code} has already been submitted.`,
+        409
+      );
+    }
+
+    // Optional final field flush before submit (same mapper as update).
+    // Never creates a requisition — update path only.
+    if (payload && Object.keys(payload).length > 0) {
+      await updateRequisition(client, code, payload, req);
+    }
+
+    const requisition = await loadRequisitionByCode(client, code);
+    assertRequestorSubmitReadiness(requisition);
+
+    const workflowInstanceId = requisition.workflow_instance_id;
+    if (!workflowInstanceId) {
+      throw httpError(
+        `Requisition ${requisition.requisition_code} has no workflow instance. Catalogue create must start workflow.`,
+        400
+      );
+    }
+
+    let workflow = await workflowService.getInstanceById(
+      client,
+      workflowInstanceId
+    );
+
+    const employeeCode = req.user?.employee_code
+      ? String(req.user.employee_code).trim()
+      : user.name;
+
+    const approvalTasks =
+      await workflowService.createApprovalRouteWorkflowTasks(
+        client,
+        workflowInstanceId,
+        requisition.approval_route_id,
+        {
+          stageKey: workflow?.currentStageKey || "approval",
+          assignedBy: employeeCode,
+          requisitionCode: requisition.requisition_code
+        }
+      );
+
+    const nextStatus =
+      requisition.req_status === REQUISITION_STATUS.OPEN
+        ? REQUISITION_STATUS.PENDING_LEVEL_1
+        : requisition.req_status;
+
+    const submitted = await client.query(
+      `UPDATE rm_requisitions
+       SET requestor_submitted_on = COALESCE(requestor_submitted_on, NOW()),
+           req_status = $1,
+           modified_by = $2,
+           modified_on = NOW()
+       WHERE requisition_code = $3
+       RETURNING *`,
+      [nextStatus, user.name, requisition.requisition_code]
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "RequisitionSubmitted",
+      module: "Recruitment Management",
+      entity: "Requisition",
+      entityId: requisition.requisition_code,
+      action: `Requisition ${requisition.requisition_code} submitted for approval`,
+      previousValue: existing.req_status,
+      newValue: nextStatus,
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        workflow_instance_id: workflowInstanceId,
+        approval_route_id: requisition.approval_route_id,
+        approval_task_count: approvalTasks.length
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      requisition: submitted.rows[0],
+      workflow,
+      approval_tasks: approvalTasks,
+      requisition_code: requisition.requisition_code,
+      workflow_instance_id: workflowInstanceId,
+      toastMessage: `Requisition ${requisition.requisition_code} submitted for approval.`
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getDefaultSeedPayload,
   getRecruitmentBundle,
@@ -1697,6 +2732,8 @@ module.exports = {
   removeRecruiterAssignment,
   resolveRecruiterAssignmentTarget,
   mapCandidate,
+  releaseCandidate,
+  returnCandidateToTalentPool,
   updateCandidateStage,
   validateMasterDataReferences,
   evaluateRecruitmentRules,
@@ -1709,5 +2746,9 @@ module.exports = {
   listFormRecruiters,
   listFormClients,
   listFormProjectsByClient,
-  listFormHiringManagersByProject
+  listFormHiringManagersByProject,
+  listApprovedPositions,
+  updateRequisition,
+  submitRequisition,
+  loadRequisitionByCode
 };

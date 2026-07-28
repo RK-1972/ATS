@@ -1,4 +1,5 @@
 const { isEnterpriseOperationalSor } = require("../config/operationalCutover");
+const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
 
 function mapRequisitionToLegacyRow(row) {
   return {
@@ -51,7 +52,7 @@ async function getMyRequisitions(pool, recruiterCode, options = {}) {
        FROM req_recruiter_map rm
        INNER JOIN req_mstr r ON rm.req_id = r.req_id
        WHERE rm.recruiter_code = $1 AND rm.is_active = true
-       ${openOnly ? "AND r.req_status = 'Open'" : ""}
+       ${openOnly ? `AND r.req_status = '${REQUISITION_STATUS.OPEN}'` : ""}
        ORDER BY ${openOnly ? "r.target_date ASC" : "rm.assigned_on DESC"}`,
       [recruiterCode]
     );
@@ -68,7 +69,7 @@ async function getMyRequisitions(pool, recruiterCode, options = {}) {
      FROM rm_recruiter_assignments a
      INNER JOIN rm_requisitions r ON a.requisition_code = r.requisition_code
      WHERE a.recruiter_code = $1 AND a.is_active = true
-     ${openOnly ? "AND r.req_status = 'Open'" : ""}
+     ${openOnly ? `AND r.req_status = '${REQUISITION_STATUS.OPEN}'` : ""}
      ORDER BY ${openOnly ? "a.assigned_on ASC" : "a.assigned_on DESC"}`,
     [recruiterCode]
   );

@@ -23,6 +23,11 @@ const recruitmentLegacyHandlers = require("./handlers/recruitmentLegacyHandlers"
 const recruitmentLegacyReadHandlers = require("./handlers/recruitmentLegacyReadHandlers");
 const interviewLegacyHandlers = require("./handlers/interviewLegacyHandlers");
 const interviewLegacyReadHandlers = require("./handlers/interviewLegacyReadHandlers");
+const candidateService = require("./services/candidateService");
+const recruitmentService = require("./services/recruitmentService");
+const workAssignmentService = require("./services/workAssignmentService");
+const workspaceResolverService = require("./services/workspaceResolverService");
+const approvalRouteRepository = require("./repositories/approvalRouteRepository");
 
 const app = express();
 
@@ -676,7 +681,55 @@ catch (error) {
 
 function resolveStorageObjectKey(resumePath) {
 
-  return resumePath;
+  const value = String(resumePath || "").trim();
+
+  if (!value) {
+    return value;
+  }
+
+  // Legacy MinIO stored absolute URLs (http://host:9000/bucket/key).
+  // Current R2 uploads store the bare object key. Both must resolve to Key.
+  try {
+    if (/^https?:\/\//i.test(value)) {
+      const parsed = new URL(value);
+      const segments = parsed.pathname.split("/").filter(Boolean);
+      if (segments.length === 0) {
+        return value;
+      }
+      return decodeURIComponent(segments[segments.length - 1]);
+    }
+  } catch {
+    // Fall through — treat as bare object key.
+  }
+
+  return value;
+
+}
+
+function resolveResumeContentType(objectKey) {
+
+  const extension = path.extname(String(objectKey || "")).toLowerCase();
+
+  if (extension === ".pdf") {
+    return "application/pdf";
+  }
+  if (extension === ".png") {
+    return "image/png";
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (extension === ".doc") {
+    return "application/msword";
+  }
+  if (extension === ".docx") {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+  if (extension === ".txt") {
+    return "text/plain";
+  }
+
+  return "application/octet-stream";
 
 }
 
@@ -766,6 +819,78 @@ function parseBasicCandidateInfo(extractedText) {
   const mobileMatch = text.match(mobileRegex);
   const mobile = mobileMatch ? mobileMatch[0].trim() : null;
 
+  const resumeSectionHeadings = [
+    "Education",
+    "Experience",
+    "Work Experience",
+    "Professional Experience",
+    "Skills",
+    "Technical Skills",
+    "Projects",
+    "Projects Undertaken",
+    "Certifications",
+    "Summary",
+    "Professional Summary",
+    "Objective",
+    "Career Objective",
+    "Profile",
+    "Declaration",
+    "Achievements",
+    "Strengths",
+    "Internship",
+    "Internships",
+    "Languages",
+    "Interests",
+    "References",
+    "Contact",
+    "Personal Details",
+    "Personal Information",
+    "About Me",
+    "Work History",
+    "Employment History",
+    "Key Skills",
+    "Core Competencies",
+    "Hobbies",
+    "Extra Curricular Activities",
+    "Extracurricular Activities",
+    "Areas of Interest",
+    "Technical Proficiency",
+    "Qualifications",
+    "Academic Qualifications",
+    "Career Summary",
+    "Resume"
+  ];
+
+  const normalizeResumeHeadingLine = (line) =>
+    String(line || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[:|.\-–—]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isResumeSectionHeading = (line) => {
+    const normalized = normalizeResumeHeadingLine(line);
+
+    if (!normalized) {
+
+      return false;
+
+    }
+
+    return resumeSectionHeadings.some((heading) => {
+
+      const headingNormalized = normalizeResumeHeadingLine(heading);
+
+      return (
+        normalized === headingNormalized ||
+        normalized.startsWith(`${headingNormalized} `)
+      );
+
+    });
+
+  };
+
   const isIgnoredCandidateNameLine = (line) => {
 
     const trimmedLine = line.trim();
@@ -818,7 +943,62 @@ function parseBasicCandidateInfo(extractedText) {
 
     }
 
+    if (isResumeSectionHeading(trimmedLine)) {
+
+      return true;
+
+    }
+
     return false;
+
+  };
+
+  const looksLikeCandidateName = (line) => {
+
+    const normalized = line.replace(/\s+/g, " ").trim();
+
+    if (!normalized) {
+
+      return false;
+
+    }
+
+    if (normalized.includes(":") || normalized.includes("|")) {
+
+      return false;
+
+    }
+
+    if (isResumeSectionHeading(normalized)) {
+
+      return false;
+
+    }
+
+    if (!/^[A-Za-z][A-Za-z .'-]*$/.test(normalized)) {
+
+      return false;
+
+    }
+
+    const words = normalized.split(" ").filter(Boolean);
+
+    if (words.length < 2 || words.length > 4) {
+
+      return false;
+
+    }
+
+    if (
+      normalized === normalized.toUpperCase() &&
+      !words.every((word) => /^[A-Z][A-Z.'-]*$/.test(word) && word.length <= 15)
+    ) {
+
+      return false;
+
+    }
+
+    return true;
 
   };
 
@@ -827,6 +1007,12 @@ function parseBasicCandidateInfo(extractedText) {
   for (const line of lines) {
 
     if (isIgnoredCandidateNameLine(line)) {
+
+      continue;
+
+    }
+
+    if (!looksLikeCandidateName(line)) {
 
       continue;
 
@@ -930,7 +1116,7 @@ function splitCandidateName(candidateName) {
   if (!trimmed) {
 
     return {
-      first_name: "Unknown",
+      first_name: "",
       last_name: ""
     };
 
@@ -942,6 +1128,71 @@ function splitCandidateName(candidateName) {
     first_name: parts[0],
     last_name: parts.slice(1).join(" ") || ""
   };
+
+}
+
+
+function normalizeExperience(value) {
+
+  if (value === null || value === undefined) {
+
+    return null;
+
+  }
+
+  const trimmed = String(value).trim();
+
+  if (!trimmed) {
+
+    return null;
+
+  }
+
+  try {
+
+    const lower = trimmed.toLowerCase();
+
+    if (/\bmonth/.test(lower)) {
+
+      const monthMatch = lower.match(/(\d+(?:\.\d+)?)/);
+
+      if (!monthMatch) {
+
+        return null;
+
+      }
+
+      const months = Number(monthMatch[1]);
+
+      if (!Number.isFinite(months)) {
+
+        return null;
+
+      }
+
+      return months / 12;
+
+    }
+
+    const match = trimmed.match(/(\d+(?:\.\d+)?)/);
+
+    if (!match) {
+
+      return null;
+
+    }
+
+    const parsed = Number(match[1]);
+
+    return Number.isFinite(parsed) ? parsed : null;
+
+  }
+
+  catch {
+
+    return null;
+
+  }
 
 }
 
@@ -986,6 +1237,54 @@ async function createDraftCandidateFromParsedIntake({
     remarksParts.push(
       `Original File: ${intake.original_file_name}`
     );
+
+  }
+
+  const emailId =
+    parsedCandidate.email
+      ? String(parsedCandidate.email).trim()
+      : null;
+
+  if (emailId) {
+
+    const existingByEmail = await pool.query(
+
+      `
+
+      SELECT
+        candidate_id,
+        candidate_code,
+        first_name,
+        last_name,
+        candidate_status,
+        email_id
+      FROM cand_mstr
+      WHERE email_id = $1
+      LIMIT 1
+
+      `,
+
+      [emailId]
+
+    );
+
+    if (existingByEmail.rows.length > 0) {
+
+      const existing = existingByEmail.rows[0];
+
+      return {
+        outcome: "DUPLICATE",
+        duplicate_candidate: {
+          candidate_id: existing.candidate_id,
+          candidate_code: existing.candidate_code,
+          first_name: existing.first_name,
+          last_name: existing.last_name,
+          candidate_status: existing.candidate_status,
+          email_id: existing.email_id
+        }
+      };
+
+    }
 
   }
 
@@ -1055,9 +1354,9 @@ async function createDraftCandidateFromParsedIntake({
       candidateCode,
       first_name,
       last_name,
-      parsedCandidate.email || null,
+      emailId || null,
       parsedCandidate.mobile || null,
-      parsedCandidate.experience || null,
+      normalizeExperience(parsedCandidate.experience),
       primary_skill,
       intake.resume_path || null,
       intake.source_id || null,
@@ -1069,7 +1368,10 @@ async function createDraftCandidateFromParsedIntake({
 
   );
 
-  return result.rows[0].candidate_id;
+  return {
+    outcome: "CREATED",
+    candidate_id: result.rows[0].candidate_id
+  };
 
 }
 
@@ -1491,7 +1793,8 @@ app.get(
             row.current_state || address?.state_code || null,
           city_code:
             row.current_city || address?.city_code || null,
-          address_line: address?.address_line_1 || null
+          address_line: address?.address_line_1 || null,
+          alternate_phone: row.alternate_mobile || null
         }
 
       });
@@ -1508,6 +1811,149 @@ app.get(
 
         success: false,
         message: "Error Fetching Candidate"
+
+      });
+
+    }
+
+  }
+
+);
+
+
+// =====================================================
+// API 3b - Stream Candidate Resume (inline preview)
+// =====================================================
+// Iframes cannot send Authorization headers, so this route also
+// accepts ?token= for authenticated media preview.
+
+app.get(
+
+  "/candidate-resume/:candidateId",
+
+  (req, res, next) => {
+
+    if (!req.headers.authorization && req.query.token) {
+      req.headers.authorization = `Bearer ${req.query.token}`;
+    }
+
+    return verifyToken(req, res, next);
+
+  },
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+
+      const result = await pool.query(
+
+        `
+
+        SELECT
+          candidate_id,
+          resume_path
+        FROM cand_mstr
+        WHERE candidate_id = $1
+
+        `,
+
+        [candidateId]
+
+      );
+
+      const candidate = result.rows[0];
+
+      if (!candidate) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      if (!candidate.resume_path) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Resume not available."
+
+        });
+
+      }
+
+      const objectKey =
+        resolveStorageObjectKey(candidate.resume_path);
+
+      let resumeBuffer;
+
+      try {
+
+        resumeBuffer =
+          await downloadResumeFromStorage(candidate.resume_path);
+
+      }
+
+      catch (downloadError) {
+
+        if (downloadError.isStatObjectFailure) {
+
+          return res.status(404).json({
+
+            success: false,
+            message: "Resume not available."
+
+          });
+
+        }
+
+        throw downloadError;
+
+      }
+
+      const fileName =
+        path.basename(objectKey) || "resume.pdf";
+
+      res.setHeader(
+        "Content-Type",
+        resolveResumeContentType(objectKey)
+      );
+
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${fileName.replace(/"/g, "")}"`
+      );
+
+      res.setHeader(
+        "Content-Length",
+        resumeBuffer.length
+      );
+
+      // Discourage caching of authenticated resume bytes.
+      res.setHeader(
+        "Cache-Control",
+        "private, no-store"
+      );
+
+      return res.status(200).send(resumeBuffer);
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Stream Candidate Resume Error");
+
+      console.log(error);
+
+      return res.status(500).json({
+
+        success: false,
+        message: "Error retrieving resume."
 
       });
 
@@ -1624,6 +2070,55 @@ app.put(
         "current_city"
       );
       const currentLocation = resolveField("current_location");
+      const alternateMobile = resolveAliasedField(
+        "alternate_phone",
+        "alternate_mobile"
+      );
+
+      const isDraftRegistration =
+        String(existing.candidate_status || "").trim().toUpperCase() ===
+        "DRAFT";
+
+      const candidateStatus = isDraftRegistration
+        ? "REGISTERED"
+        : resolveField("candidate_status");
+
+      const registrationEmployeeCode =
+        req.user?.employee_code || null;
+
+      // candidate_container — optional Register Candidate field.
+      // Allowed: PIPELINE | TALENT_POOL. Default PIPELINE when omitted.
+      const rawCandidateContainer = hasBodyField("candidate_container")
+        ? String(req.body.candidate_container || "").trim().toUpperCase()
+        : "";
+
+      let candidateContainer = "PIPELINE";
+
+      if (rawCandidateContainer) {
+
+        if (
+          rawCandidateContainer !== "PIPELINE" &&
+          rawCandidateContainer !== "TALENT_POOL"
+        ) {
+
+          return res.status(400).json({
+
+            success: false,
+            message:
+              "candidate_container must be PIPELINE or TALENT_POOL."
+
+          });
+
+        }
+
+        candidateContainer = rawCandidateContainer;
+
+      }
+
+      const registrationOwnerEmployeeCode =
+        candidateContainer === "TALENT_POOL"
+          ? null
+          : registrationEmployeeCode;
 
       const result = await pool.query(
 
@@ -1640,32 +2135,40 @@ SET
     gender          = $5,
 
     mobile_number   = $6,
-    primary_skill   = $7,
-    total_experience= $8,
-    resume_path     = $9,
-    candidate_status= $10,
+    email_id        = $7,
+    linkedin_url    = $8,
+    alternate_mobile = $9,
+    primary_skill   = $10,
+    total_experience= $11,
+    resume_path     = $12,
+    candidate_status= $13,
 
-    current_country = $11,
-    current_state   = $12,
-    current_city    = $13,
-    current_location= $14,
+    current_country = $14,
+    current_state   = $15,
+    current_city    = $16,
+    current_location= $17,
 
-    relevant_experience = $15,
-    employment_type     = $16,
-    preferred_work_mode = $17,
-    current_company     = $18,
-    current_designation = $19,
-    current_department  = $20,
-    notice_period       = $21,
-    availability        = $22,
-    currency_code       = $23,
-    current_ctc         = $24,
-    expected_ctc        = $25,
-    ctc_negotiable      = $26,
+    relevant_experience = $18,
+    employment_type     = $19,
+    preferred_work_mode = $20,
+    current_company     = $21,
+    current_designation = $22,
+    current_department  = $23,
+    notice_period       = $24,
+    availability        = $25,
+    currency_code       = $26,
+    current_ctc         = $27,
+    expected_ctc        = $28,
+    ctc_negotiable      = $29,
+
+    candidate_container = CASE WHEN $31 THEN $33 ELSE candidate_container END,
+    owner_employee_code = CASE WHEN $31 THEN $34 ELSE owner_employee_code END,
+    registered_by       = CASE WHEN $31 THEN $32 ELSE registered_by END,
+    registered_on       = CASE WHEN $31 THEN CURRENT_TIMESTAMP ELSE registered_on END,
 
     updated_on      = CURRENT_TIMESTAMP
 
-WHERE candidate_id = $27
+WHERE candidate_id = $30
 
 RETURNING *
 
@@ -1678,10 +2181,13 @@ RETURNING *
     resolveField("gender"),
 
     resolveField("mobile_number"),
+    resolveField("email_id"),
+    resolveField("linkedin_url"),
+    alternateMobile,
     resolveField("primary_skill"),
     resolveField("total_experience"),
     resumePath,
-    resolveField("candidate_status"),
+    candidateStatus,
 
     countryCode,
     stateCode,
@@ -1710,7 +2216,11 @@ RETURNING *
       return value;
     })(),
 
-    candidateId
+    candidateId,
+    isDraftRegistration,
+    registrationEmployeeCode,
+    candidateContainer,
+    registrationOwnerEmployeeCode
 ]
 
       );
@@ -1841,7 +2351,12 @@ RETURNING *
           country_code: updatedRow.current_country || countryCode || null,
           state_code: updatedRow.current_state || stateCode || null,
           city_code: updatedRow.current_city || cityCode || null,
-          address_line: addressLine
+          address_line: addressLine,
+          alternate_phone: updatedRow.alternate_mobile || null,
+          candidate_container: updatedRow.candidate_container ?? null,
+          owner_employee_code: updatedRow.owner_employee_code ?? null,
+          registered_by: updatedRow.registered_by ?? null,
+          registered_on: updatedRow.registered_on ?? null
         }
 
       });
@@ -1858,6 +2373,786 @@ RETURNING *
 
         success: false,
         message: "Error Updating Candidate"
+
+      });
+
+    }
+
+  }
+
+);
+
+
+// =====================================================
+// Candidate Education APIs (can_education via candidateService)
+// =====================================================
+
+const EDUCATION_FIELDS = [
+  "qualification",
+  "institution",
+  "specialization",
+  "board_university",
+  "year_of_passing",
+  "percentage",
+  "cgpa",
+  "from_date",
+  "to_date",
+  "score_type",
+  "active_flag"
+];
+
+function pickEducationPayload(body = {}) {
+  const source = { ...body };
+
+  if (
+    source.university !== undefined &&
+    source.board_university === undefined
+  ) {
+    source.board_university = source.university;
+  }
+
+  if (
+    source.university_board !== undefined &&
+    source.board_university === undefined
+  ) {
+    source.board_university = source.university_board;
+  }
+
+  // Map score + score_type → percentage/cgpa.
+  // If score is not provided (missing/empty/invalid), do not touch percentage/cgpa.
+  if (Object.prototype.hasOwnProperty.call(source, "score")) {
+    const scoreType = String(source.score_type || "").trim();
+    const scoreRaw = source.score;
+    const cleanedScore =
+      scoreRaw === "" || scoreRaw === null || scoreRaw === undefined
+        ? null
+        : String(scoreRaw)
+            .trim()
+            .replace(/,/g, "")
+            .replace(/%/g, "")
+            .replace(/cgpa/gi, "")
+            .trim();
+    const numericScore =
+      cleanedScore === null || cleanedScore === ""
+        ? null
+        : Number(cleanedScore);
+    const validScore =
+      numericScore !== null && !Number.isNaN(numericScore)
+        ? numericScore
+        : null;
+
+    if (validScore !== null) {
+      if (scoreType === "CGPA") {
+        source.cgpa = validScore;
+        source.percentage = null;
+      } else if (scoreType === "Percentage") {
+        source.percentage = validScore;
+        source.cgpa = null;
+      }
+    }
+  }
+
+  // Never persist the UI alias column; only percentage/cgpa are stored.
+  delete source.score;
+
+  if (source.to_date) {
+    const year = Number(String(source.to_date).slice(0, 4));
+
+    if (!Number.isNaN(year) && year > 1900 && year < 2100) {
+      source.year_of_passing = year;
+    }
+  }
+
+  const payload = {};
+
+  EDUCATION_FIELDS.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      payload[field] = source[field];
+    }
+  });
+
+  return payload;
+}
+
+app.get(
+
+  "/candidate/:candidateId/education",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const data =
+        await candidateService.listChildRecords(
+          pool,
+          "education",
+          candidateId
+        );
+
+      res.status(200).json({
+
+        success: true,
+        data
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ List Candidate Education Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Fetching Candidate Education"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.post(
+
+  "/candidate/:candidateId/education",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const payload = pickEducationPayload(req.body);
+
+      const data =
+        await candidateService.insertChildRecord(
+          pool,
+          "education",
+          candidateId,
+          payload
+        );
+
+      res.status(201).json({
+
+        success: true,
+        message: "Education record created successfully.",
+        data
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Create Candidate Education Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Creating Candidate Education"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.put(
+
+  "/candidate/:candidateId/education/:educationId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const educationId = req.params.educationId;
+      const payload = pickEducationPayload(req.body);
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const records =
+        await candidateService.listChildRecords(
+          pool,
+          "education",
+          candidateId
+        );
+
+      const existing = records.find(
+        (row) => String(row.education_id) === String(educationId)
+      );
+
+      if (!existing) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Education record not found."
+
+        });
+
+      }
+
+      const columns = Object.keys(payload);
+
+      if (!columns.length) {
+
+        return res.status(400).json({
+
+          success: false,
+          message: "No education fields supplied."
+
+        });
+
+      }
+
+      const educationConfig =
+        candidateService.CHILD_TABLES.education;
+
+      const setClauses = columns.map(
+        (column, index) => `${column} = $${index + 1}`
+      );
+
+      setClauses.push(`modified_on = CURRENT_TIMESTAMP`);
+
+      const values = [
+        ...columns.map((column) => payload[column]),
+        educationId,
+        candidateId
+      ];
+
+      const result = await pool.query(
+
+        `
+
+        UPDATE ${educationConfig.table}
+        SET ${setClauses.join(", ")}
+        WHERE ${educationConfig.idColumn} = $${columns.length + 1}
+          AND ${educationConfig.candidateColumn} = $${columns.length + 2}
+        RETURNING *
+
+        `,
+
+        values
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Education record updated successfully.",
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Update Candidate Education Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Updating Candidate Education"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.delete(
+
+  "/candidate/:candidateId/education/:educationId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const educationId = req.params.educationId;
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const records =
+        await candidateService.listChildRecords(
+          pool,
+          "education",
+          candidateId
+        );
+
+      const existing = records.find(
+        (row) => String(row.education_id) === String(educationId)
+      );
+
+      if (!existing) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Education record not found."
+
+        });
+
+      }
+
+      const educationConfig =
+        candidateService.CHILD_TABLES.education;
+
+      const result = await pool.query(
+
+        `
+
+        DELETE FROM ${educationConfig.table}
+        WHERE ${educationConfig.idColumn} = $1
+          AND ${educationConfig.candidateColumn} = $2
+        RETURNING *
+
+        `,
+
+        [educationId, candidateId]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Education record deleted successfully.",
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Delete Candidate Education Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Deleting Candidate Education"
+
+      });
+
+    }
+
+  }
+
+);
+
+
+// =====================================================
+// Candidate Experience APIs (can_experience via candidateService)
+// =====================================================
+
+const EXPERIENCE_FIELDS = [
+  "company_name",
+  "designation",
+  "joining_date",
+  "relieving_date",
+  "role_summary",
+  "technology",
+  "reason_for_change"
+];
+
+function pickExperiencePayload(body = {}) {
+  const source = { ...body };
+  const payload = {};
+
+  EXPERIENCE_FIELDS.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      payload[field] = source[field];
+    }
+  });
+
+  return payload;
+}
+
+app.get(
+
+  "/candidate/:candidateId/experience",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const data =
+        await candidateService.listChildRecords(
+          pool,
+          "experience",
+          candidateId
+        );
+
+      res.status(200).json({
+
+        success: true,
+        data
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ List Candidate Experience Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Fetching Candidate Experience"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.post(
+
+  "/candidate/:candidateId/experience",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const payload = pickExperiencePayload(req.body);
+
+      const data =
+        await candidateService.insertChildRecord(
+          pool,
+          "experience",
+          candidateId,
+          payload
+        );
+
+      res.status(201).json({
+
+        success: true,
+        message: "Experience record created successfully.",
+        data
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Create Candidate Experience Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Creating Candidate Experience"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.put(
+
+  "/candidate/:candidateId/experience/:experienceId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const experienceId = req.params.experienceId;
+      const payload = pickExperiencePayload(req.body);
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const records =
+        await candidateService.listChildRecords(
+          pool,
+          "experience",
+          candidateId
+        );
+
+      const existing = records.find(
+        (row) => String(row.experience_id) === String(experienceId)
+      );
+
+      if (!existing) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Experience record not found."
+
+        });
+
+      }
+
+      const columns = Object.keys(payload);
+
+      if (!columns.length) {
+
+        return res.status(400).json({
+
+          success: false,
+          message: "No experience fields supplied."
+
+        });
+
+      }
+
+      const experienceConfig =
+        candidateService.CHILD_TABLES.experience;
+
+      const setClauses = columns.map(
+        (column, index) => `${column} = $${index + 1}`
+      );
+
+      setClauses.push(`modified_on = CURRENT_TIMESTAMP`);
+
+      const values = [
+        ...columns.map((column) => payload[column]),
+        experienceId,
+        candidateId
+      ];
+
+      const result = await pool.query(
+
+        `
+
+        UPDATE ${experienceConfig.table}
+        SET ${setClauses.join(", ")}
+        WHERE ${experienceConfig.idColumn} = $${columns.length + 1}
+          AND ${experienceConfig.candidateColumn} = $${columns.length + 2}
+        RETURNING *
+
+        `,
+
+        values
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Experience record updated successfully.",
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Update Candidate Experience Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Updating Candidate Experience"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.delete(
+
+  "/candidate/:candidateId/experience/:experienceId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const experienceId = req.params.experienceId;
+
+      const master =
+        await candidateService.getCandidateMaster(pool, candidateId);
+
+      if (!master) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Candidate not found."
+
+        });
+
+      }
+
+      const records =
+        await candidateService.listChildRecords(
+          pool,
+          "experience",
+          candidateId
+        );
+
+      const existing = records.find(
+        (row) => String(row.experience_id) === String(experienceId)
+      );
+
+      if (!existing) {
+
+        return res.status(404).json({
+
+          success: false,
+          message: "Experience record not found."
+
+        });
+
+      }
+
+      const experienceConfig =
+        candidateService.CHILD_TABLES.experience;
+
+      const result = await pool.query(
+
+        `
+
+        DELETE FROM ${experienceConfig.table}
+        WHERE ${experienceConfig.idColumn} = $1
+          AND ${experienceConfig.candidateColumn} = $2
+        RETURNING *
+
+        `,
+
+        [experienceId, candidateId]
+
+      );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Experience record deleted successfully.",
+        data: result.rows[0]
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Delete Candidate Experience Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Deleting Candidate Experience"
 
       });
 
@@ -3117,6 +4412,48 @@ app.post("/login", async (req, res) => {
       user_id: user.user_id
     });
 
+    let workAssignments = [];
+    let workAssignmentStatus = "NO_ASSIGNMENTS";
+    let workspace = {};
+
+    try {
+      const employeeAssignments =
+        await workAssignmentService.getEmployeeWorkAssignments(
+          pool,
+          user.employee_code
+        );
+
+      workAssignments = (employeeAssignments || [])
+        .filter((row) => row.is_active === true)
+        .map((row) => ({
+          assignment_code: row.assignment_code,
+          assignment_name: row.assignment_name
+        }));
+
+      workAssignmentStatus =
+        workAssignments.length > 0 ? "LOADED" : "NO_ASSIGNMENTS";
+    } catch (workAssignmentError) {
+      console.error("[login] Failed to load work assignments", {
+        employee_code: user.employee_code,
+        message: workAssignmentError.message
+      });
+      workAssignments = [];
+      workAssignmentStatus = "SERVICE_UNAVAILABLE";
+    }
+
+    try {
+      const resolved = await workspaceResolverService.resolveWorkspace(
+        pool,
+        user.employee_code
+      );
+      workspace = resolved?.workspace || {};
+    } catch (workspaceError) {
+      console.error("[login] Failed to resolve workspace", {
+        employee_code: user.employee_code,
+        message: workspaceError.message
+      });
+      workspace = {};
+    }
 
     res.status(200).json({
 
@@ -3135,7 +4472,13 @@ app.post("/login", async (req, res) => {
         role_name: user.role_name,
         secondary_role: user.secondary_role
 
-      }
+      },
+
+      work_assignments: workAssignments,
+
+      work_assignment_status: workAssignmentStatus,
+
+      workspace
 
     });
 
@@ -4347,7 +5690,8 @@ app.get(
 
           WHERE
 
-            cm.recruiter_id = $1
+            cm.candidate_container = 'PIPELINE'
+            AND cm.owner_employee_code = $1
 
           ORDER BY
 
@@ -4902,6 +6246,8 @@ app.put(
 
 // =====================================================
 // API 44 - Active Interviewers
+// Scheduling source remains interview_panel_mstr.panel_id.
+// Eligibility requires active INTERVIEWER work assignment.
 // =====================================================
 
 app.get(
@@ -4919,7 +6265,7 @@ app.get(
 
           `
 
-         SELECT
+         SELECT DISTINCT
 
           ip.panel_id,
           ip.user_id,
@@ -4942,6 +6288,20 @@ app.get(
 
           ON ip.user_id =
             u.user_id
+
+        INNER JOIN employee_work_assignment ewa
+
+          ON ewa.employee_code = u.employee_code
+
+         AND ewa.is_active = true
+
+        INNER JOIN work_assignment_mstr wa
+
+          ON wa.work_assignment_id = ewa.work_assignment_id
+
+         AND wa.is_active = true
+
+         AND wa.assignment_code = 'INTERVIEWER'
 
         WHERE ip.is_active = true
 
@@ -5015,6 +6375,8 @@ app.get(
 
 // =====================================================
 // API 46A - Interview Candidates By Requisition
+// Enterprise SoR (rm_candidate_mappings) + legacy dual-read.
+// Recruiter match: employee_code, full_name, email, or owner.
 // =====================================================
 
 app.get(
@@ -5024,56 +6386,93 @@ app.get(
 
     try {
 
-      const loggedInRecruiter =
-        req.user.employee_code;
+      const employeeCode = req.user.employee_code;
+      const emailId = req.user.email_id || null;
+      const isAdmin = req.user.role_name === "Admin";
+      const reqId = req.params.reqId;
 
-      const reqId =
-        req.params.reqId;
+      // JWT has no full_name; mapCandidate stores recruiter_id as full_name
+      const nameLookup = await pool.query(
+        `SELECT full_name
+         FROM user_mstr
+         WHERE employee_code = $1
+         LIMIT 1`,
+        [employeeCode]
+      );
+      const fullName = nameLookup.rows[0]?.full_name || null;
 
-      const result =
-        await pool.query(
+      const byMapId = new Map();
 
+      const enterprise = await pool.query(
+        `
+        SELECT DISTINCT
+          rcm.map_id,
+          cm.candidate_code,
+          CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name
+        FROM rm_candidate_mappings rcm
+        INNER JOIN cand_mstr cm
+          ON cm.candidate_id = rcm.candidate_id
+        WHERE rcm.is_active = true
+          AND rcm.req_id::text = $1::text
+          AND rcm.map_id IS NOT NULL
+          AND (
+            $2::boolean = true
+            OR rcm.recruiter_id = $3
+            OR ($4::text IS NOT NULL AND rcm.recruiter_id = $4)
+            OR ($5::text IS NOT NULL AND rcm.recruiter_id = $5)
+            OR cm.owner_employee_code = $3
+          )
+        ORDER BY candidate_name
+        `,
+        [reqId, isAdmin, employeeCode, fullName, emailId]
+      );
+
+      for (const row of enterprise.rows) {
+        byMapId.set(String(row.map_id), row);
+      }
+
+      const legacyTable = await pool.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_schema = 'public'
+             AND table_name = 'candidate_req_map'
+         ) AS exists`
+      );
+
+      if (legacyTable.rows[0]?.exists) {
+        const legacy = await pool.query(
           `
           SELECT DISTINCT
-
             crm.map_id,
-
             cm.candidate_code,
-
-            CONCAT(
-              cm.first_name,
-              ' ',
-              cm.last_name
-            ) AS candidate_name
-
+            CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name
           FROM candidate_req_map crm
-
           INNER JOIN cand_mstr cm
-            ON cm.candidate_id =
-               crm.candidate_id
-
+            ON cm.candidate_id = crm.candidate_id
           WHERE crm.is_active = true
-
-          AND crm.recruiter_id = $1
-
-          AND crm.req_id = $2
-
+            AND crm.req_id::text = $1::text
+            AND (
+              $2::boolean = true
+              OR crm.recruiter_id = $3
+              OR ($4::text IS NOT NULL AND crm.recruiter_id = $4)
+              OR ($5::text IS NOT NULL AND crm.recruiter_id = $5)
+              OR cm.owner_employee_code = $3
+            )
           ORDER BY candidate_name
           `,
-
-          [
-            loggedInRecruiter,
-            reqId
-          ]
-
+          [reqId, isAdmin, employeeCode, fullName, emailId]
         );
 
+        for (const row of legacy.rows) {
+          if (!byMapId.has(String(row.map_id))) {
+            byMapId.set(String(row.map_id), row);
+          }
+        }
+      }
+
       res.status(200).json({
-
         success: true,
-
-        data: result.rows
-
+        data: Array.from(byMapId.values())
       });
 
     }
@@ -5100,6 +6499,7 @@ app.get(
 );
 // =====================================================
 // API 46B - Interview Requisitions Dropdown
+// Enterprise SoR (rm_requisitions + mappings) + legacy dual-read.
 // =====================================================
 
 app.get(
@@ -5109,45 +6509,93 @@ app.get(
 
     try {
 
-      const loggedInRecruiter =
-        req.user.employee_code;
+      const employeeCode = req.user.employee_code;
+      const emailId = req.user.email_id || null;
+      const isAdmin = req.user.role_name === "Admin";
 
-      const result =
-        await pool.query(
+      const nameLookup = await pool.query(
+        `SELECT full_name
+         FROM user_mstr
+         WHERE employee_code = $1
+         LIMIT 1`,
+        [employeeCode]
+      );
+      const fullName = nameLookup.rows[0]?.full_name || null;
 
+      const byReqId = new Map();
+
+      const enterprise = await pool.query(
+        `
+        SELECT DISTINCT
+          rr.req_id,
+          rr.requisition_code AS req_code,
+          rr.position_title AS job_title
+        FROM rm_requisitions rr
+        INNER JOIN rm_candidate_mappings rcm
+          ON rcm.requisition_code = rr.requisition_code
+         AND rcm.is_active = true
+        LEFT JOIN cand_mstr cm
+          ON cm.candidate_id = rcm.candidate_id
+        WHERE rr.req_id IS NOT NULL
+          AND (
+            $1::boolean = true
+            OR rcm.recruiter_id = $2
+            OR ($3::text IS NOT NULL AND rcm.recruiter_id = $3)
+            OR ($4::text IS NOT NULL AND rcm.recruiter_id = $4)
+            OR cm.owner_employee_code = $2
+          )
+        ORDER BY rr.requisition_code
+        `,
+        [isAdmin, employeeCode, fullName, emailId]
+      );
+
+      for (const row of enterprise.rows) {
+        byReqId.set(String(row.req_id), row);
+      }
+
+      const legacyTable = await pool.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_schema = 'public'
+             AND table_name = 'candidate_req_map'
+         ) AS exists`
+      );
+
+      if (legacyTable.rows[0]?.exists) {
+        const legacy = await pool.query(
           `
           SELECT DISTINCT
-
             rm.req_id,
-
             rm.req_code,
-
             rm.job_title
-
           FROM req_mstr rm
-
           INNER JOIN candidate_req_map crm
             ON crm.req_id = rm.req_id
-
-          WHERE crm.recruiter_id = $1
-
-          AND crm.is_active = true
-
+          LEFT JOIN cand_mstr cm
+            ON cm.candidate_id = crm.candidate_id
+          WHERE crm.is_active = true
+            AND (
+              $1::boolean = true
+              OR crm.recruiter_id = $2
+              OR ($3::text IS NOT NULL AND crm.recruiter_id = $3)
+              OR ($4::text IS NOT NULL AND crm.recruiter_id = $4)
+              OR cm.owner_employee_code = $2
+            )
           ORDER BY rm.req_code
           `,
-
-          [
-            loggedInRecruiter
-          ]
-
+          [isAdmin, employeeCode, fullName, emailId]
         );
 
+        for (const row of legacy.rows) {
+          if (!byReqId.has(String(row.req_id))) {
+            byReqId.set(String(row.req_id), row);
+          }
+        }
+      }
+
       res.status(200).json({
-
         success: true,
-
-        data: result.rows
-
+        data: Array.from(byReqId.values())
       });
 
     }
@@ -5607,6 +7055,8 @@ app.get(
       const panelId =
         panelResult.rows[0].panel_id;
 
+      // Dual-read: enterprise mappings (rm_*) preferred, legacy candidate_req_map fallback.
+      // INNER JOIN on legacy map alone hid enterprise-scheduled interviews.
       const result =
         await pool.query(
 
@@ -5618,13 +7068,13 @@ app.get(
             s.round_type,
             s.interview_date,
             s.interview_time,
-            s.interview_status,
-            s.feedback_submitted,
-            fh.final_outcome,
-            s.meeting_link,
+            COALESCE(i.interview_status, s.interview_status) AS interview_status,
+            COALESCE(i.feedback_submitted, s.feedback_submitted, false) AS feedback_submitted,
+            COALESCE(i.final_outcome, fh.final_outcome) AS final_outcome,
+            COALESCE(i.meeting_link, s.meeting_link) AS meeting_link,
 
-            crm.map_id,
-            crm.stage_name,
+            COALESCE(rcm.map_id, crm.map_id) AS map_id,
+            COALESCE(rcm.stage_name, crm.stage_name) AS stage_name,
 
             c.candidate_id,
             c.candidate_code,
@@ -5638,13 +7088,13 @@ app.get(
             c.email_id,
             c.resume_path,
 
-            r.req_id,
-            r.req_code,
-            r.client_name,
-            r.job_title,
+            COALESCE(rr_by_id.req_id, rr_by_code.req_id, r.req_id, s.req_id) AS req_id,
+            COALESCE(rr_by_id.requisition_code, rr_by_code.requisition_code, r.req_code) AS req_code,
+            COALESCE(r.client_name, rr_by_id.department, rr_by_code.department) AS client_name,
+            COALESCE(rr_by_id.position_title, rr_by_code.position_title, r.job_title) AS job_title,
 
-            r.primary_skill,
-            r.secondary_skill,
+            COALESCE(rr_by_id.primary_skill, rr_by_code.primary_skill, r.primary_skill, c.primary_skill) AS primary_skill,
+            COALESCE(r.secondary_skill, c.secondary_skill) AS secondary_skill,
 
             r.experience_min,
             r.experience_max,
@@ -5653,16 +7103,29 @@ app.get(
 
           FROM interview_schedule_trn s
 
-          INNER JOIN candidate_req_map crm
+          LEFT JOIN im_interviews i
+            ON i.schedule_id = s.schedule_id
+
+          LEFT JOIN rm_candidate_mappings rcm
+            ON rcm.map_id = s.map_id
+           AND rcm.is_active = true
+
+          LEFT JOIN candidate_req_map crm
             ON crm.map_id = s.map_id
 
           INNER JOIN cand_mstr c
             ON c.candidate_id =
-               crm.candidate_id
+               COALESCE(rcm.candidate_id, crm.candidate_id)
 
-          INNER JOIN req_mstr r
-            ON r.req_id =
-               crm.req_id
+          LEFT JOIN rm_requisitions rr_by_id
+            ON rr_by_id.req_id = COALESCE(i.req_id, rcm.req_id, s.req_id)
+
+          LEFT JOIN rm_requisitions rr_by_code
+            ON rr_by_code.requisition_code =
+               COALESCE(i.requisition_code, rcm.requisition_code)
+
+          LEFT JOIN req_mstr r
+            ON r.req_id = COALESCE(crm.req_id, s.req_id)
 
           INNER JOIN interview_panel_mstr ip
             ON ip.panel_id =
@@ -5723,6 +7186,8 @@ app.get(
 
 // =====================================================
 // API 48 - Interviewer Dropdown
+// Eligibility from active INTERVIEWER work assignment
+// (not role_name / secondary_role).
 // =====================================================
 
 app.get(
@@ -5736,25 +7201,33 @@ app.get(
         await pool.query(
 
           `
-          SELECT
+          SELECT DISTINCT
 
-            user_id,
-            employee_code,
-            full_name,
-            email_id,
-            department,
-            designation,
-            primary_skill
+            u.user_id,
+            u.employee_code,
+            u.full_name,
+            u.email_id,
+            u.department,
+            u.designation,
+            u.primary_skill
 
-          FROM user_mstr
+          FROM user_mstr u
 
-          WHERE
+          INNER JOIN employee_work_assignment ewa
 
-                role_name = 'Interviewer'
+            ON ewa.employee_code = u.employee_code
 
-             OR secondary_role = 'Interviewer'
+           AND ewa.is_active = true
 
-          ORDER BY full_name
+          INNER JOIN work_assignment_mstr wa
+
+            ON wa.work_assignment_id = ewa.work_assignment_id
+
+           AND wa.is_active = true
+
+           AND wa.assignment_code = 'INTERVIEWER'
+
+          ORDER BY u.full_name
           `
 
         );
@@ -5920,6 +7393,7 @@ app.get(
       const scheduleId =
         req.params.scheduleId;
 
+      // Dual-read: enterprise mapping preferred; legacy map fallback (same SoR gap as /my-interviews).
       const result =
         await pool.query(
 
@@ -5940,13 +7414,13 @@ app.get(
               cm.last_name
             ) AS candidate_name,
 
-            rm.req_id,
+            COALESCE(rr_by_id.req_id, rr_by_code.req_id, rm.req_id, ist.req_id) AS req_id,
 
-            rm.req_code,
+            COALESCE(rr_by_id.requisition_code, rr_by_code.requisition_code, rm.req_code) AS req_code,
 
-            rm.client_name,
+            COALESCE(rm.client_name, rr_by_id.department, rr_by_code.department) AS client_name,
 
-            rm.job_title,
+            COALESCE(rr_by_id.position_title, rr_by_code.position_title, rm.job_title) AS job_title,
 
             ip.interviewer_name,
 
@@ -5955,16 +7429,29 @@ app.get(
 
           FROM interview_schedule_trn ist
 
-          INNER JOIN candidate_req_map crm
+          LEFT JOIN im_interviews i
+            ON i.schedule_id = ist.schedule_id
+
+          LEFT JOIN rm_candidate_mappings rcm
+            ON rcm.map_id = ist.map_id
+           AND rcm.is_active = true
+
+          LEFT JOIN candidate_req_map crm
             ON crm.map_id = ist.map_id
 
           INNER JOIN cand_mstr cm
             ON cm.candidate_id =
-               crm.candidate_id
+               COALESCE(rcm.candidate_id, crm.candidate_id)
 
-          INNER JOIN req_mstr rm
-          ON rm.req_id =
-          crm.req_id
+          LEFT JOIN rm_requisitions rr_by_id
+            ON rr_by_id.req_id = COALESCE(i.req_id, rcm.req_id, ist.req_id)
+
+          LEFT JOIN rm_requisitions rr_by_code
+            ON rr_by_code.requisition_code =
+               COALESCE(i.requisition_code, rcm.requisition_code)
+
+          LEFT JOIN req_mstr rm
+            ON rm.req_id = COALESCE(crm.req_id, ist.req_id)
 
           INNER JOIN interview_panel_mstr ip
             ON ip.panel_id =
@@ -6749,16 +8236,7 @@ app.get(
 
         FROM cand_mstr cm
 
-        WHERE NOT EXISTS (
-
-            SELECT 1
-
-            FROM candidate_req_map crm
-
-            WHERE crm.candidate_id = cm.candidate_id
-              AND crm.is_active = true
-
-        )
+        WHERE cm.candidate_container = 'TALENT_POOL'
 
         ORDER BY
 
@@ -6812,6 +8290,13 @@ const { registerRecruitmentRoutes } = require("./routes/recruitmentRoutes");
 const { registerTaskRoutes } = require("./routes/taskRoutes");
 const { registerInterviewRoutes } = require("./routes/interviewRoutes");
 const { registerOfferRoutes } = require("./routes/offerRoutes");
+const { registerUserPermissionRoutes } = require("./routes/userPermissionRoutes");
+const {
+  registerTalentDemandDraftRoutes
+} = require("./routes/talentDemandDraftRoutes");
+const {
+  registerWorkAssignmentRoutes
+} = require("./routes/workAssignmentRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -6822,6 +8307,452 @@ registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerTaskRoutes(app, pool, verifyToken);
 registerInterviewRoutes(app, pool, verifyToken);
 registerOfferRoutes(app, pool, verifyToken);
+registerUserPermissionRoutes(app, pool, verifyToken, verifyAdmin);
+registerTalentDemandDraftRoutes(app, pool, verifyToken);
+registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin);
+
+// =====================================================
+// Approval Route Management APIs
+// =====================================================
+
+app.get("/approval-routes", verifyToken, async (req, res) => {
+  try {
+    const appliesTo = req.query?.applies_to
+      ? String(req.query.applies_to).trim()
+      : null;
+    const data = await approvalRouteRepository.getApprovalRoutes(pool, appliesTo);
+
+    res.status(200).json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    console.log("❌ Get Approval Routes Error");
+    console.log(error);
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error fetching approval routes."
+    });
+  }
+});
+
+app.get("/approval-routes/:routeId", verifyToken, async (req, res) => {
+  try {
+    const routeId = req.params.routeId;
+    const route = await approvalRouteRepository.getApprovalRoute(pool, routeId);
+
+    if (!route) {
+      return res.status(404).json({
+        success: false,
+        message: "Approval route not found."
+      });
+    }
+
+    const steps = await approvalRouteRepository.getApprovalRouteSteps(
+      pool,
+      routeId
+    );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        route,
+        steps
+      }
+    });
+  } catch (error) {
+    console.log("❌ Get Approval Route Error");
+    console.log(error);
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error fetching approval route."
+    });
+  }
+});
+
+app.post("/approval-routes", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const routePayload = req.body?.route || req.body;
+    const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
+
+    if (!routePayload || !routePayload.route_name) {
+      return res.status(400).json({
+        success: false,
+        message: "route.route_name is required."
+      });
+    }
+
+    const appliesTo = routePayload.applies_to || "Requisition";
+    const duplicateResult = await pool.query(
+      `SELECT route_id
+       FROM approval_route_mstr
+       WHERE LOWER(TRIM(route_name)) = LOWER(TRIM($1))
+         AND LOWER(TRIM(applies_to)) = LOWER(TRIM($2))
+       LIMIT 1`,
+      [routePayload.route_name, appliesTo]
+    );
+
+    if (duplicateResult.rows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "An Approval Route with this name already exists for the selected Applies To."
+      });
+    }
+
+    const routeData = {
+      ...routePayload,
+      created_by:
+        routePayload.created_by ||
+        req.user?.employee_code ||
+        req.user?.email_id ||
+        null
+    };
+
+    const routeId = await approvalRouteRepository.createApprovalRoute(
+      pool,
+      routeData
+    );
+
+    if (steps.length > 0) {
+      await approvalRouteRepository.replaceApprovalRouteSteps(
+        pool,
+        routeId,
+        steps
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        route_id: routeId
+      }
+    });
+  } catch (error) {
+    console.log("❌ Create Approval Route Error");
+    console.log(error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "An Approval Route with this name already exists for the selected Applies To."
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error creating approval route."
+    });
+  }
+});
+
+app.put("/approval-routes/:routeId", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const routeId = req.params.routeId;
+    const routePayload = req.body?.route || {};
+    const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
+
+    const existing = await approvalRouteRepository.getApprovalRoute(
+      pool,
+      routeId
+    );
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Approval route not found."
+      });
+    }
+
+    const routeName =
+      routePayload.route_name != null
+        ? routePayload.route_name
+        : existing.route_name;
+    const appliesTo =
+      routePayload.applies_to != null
+        ? routePayload.applies_to
+        : existing.applies_to;
+
+    const duplicateResult = await pool.query(
+      `SELECT route_id
+       FROM approval_route_mstr
+       WHERE LOWER(TRIM(route_name)) = LOWER(TRIM($1))
+         AND LOWER(TRIM(applies_to)) = LOWER(TRIM($2))
+         AND route_id <> $3::bigint
+       LIMIT 1`,
+      [routeName, appliesTo, routeId]
+    );
+
+    if (duplicateResult.rows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "An Approval Route with this name already exists for the selected Applies To."
+      });
+    }
+
+    const routeData = {
+      ...routePayload,
+      updated_by:
+        routePayload.updated_by ||
+        req.user?.employee_code ||
+        req.user?.email_id ||
+        null
+    };
+
+    const route = await approvalRouteRepository.updateApprovalRoute(
+      pool,
+      routeId,
+      routeData
+    );
+
+    const replacedSteps =
+      await approvalRouteRepository.replaceApprovalRouteSteps(
+        pool,
+        routeId,
+        steps
+      );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        route,
+        steps: replacedSteps
+      }
+    });
+  } catch (error) {
+    console.log("❌ Update Approval Route Error");
+    console.log(error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "An Approval Route with this name already exists for the selected Applies To."
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error updating approval route."
+    });
+  }
+});
+
+// =====================================================
+// Approval Route Policy Management APIs
+// =====================================================
+
+app.get("/approval-route-policies", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const data = await approvalRouteRepository.getApprovalRoutePolicies(pool);
+
+    res.status(200).json({
+      success: true,
+      message: "Approval route policies fetched successfully.",
+      data
+    });
+  } catch (error) {
+    console.log("❌ Get Approval Route Policies Error");
+    console.log(error);
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error fetching approval route policies."
+    });
+  }
+});
+
+app.get(
+  "/approval-route-policies/:policyId",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const policy = await approvalRouteRepository.getApprovalRoutePolicy(
+        pool,
+        req.params.policyId
+      );
+
+      if (!policy) {
+        return res.status(404).json({
+          success: false,
+          message: "Approval route policy not found."
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Approval route policy fetched successfully.",
+        data: policy
+      });
+    } catch (error) {
+      console.log("❌ Get Approval Route Policy Error");
+      console.log(error);
+
+      res.status(500).json({
+        success: false,
+        message: error.message || "Error fetching approval route policy."
+      });
+    }
+  }
+);
+
+app.post("/approval-route-policies", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const policyPayload = req.body?.policy || req.body;
+
+    const policy = await approvalRouteRepository.createApprovalRoutePolicy(
+      pool,
+      {
+        ...policyPayload,
+        created_by:
+          policyPayload.created_by
+          || req.user?.employee_code
+          || req.user?.email_id
+          || null
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Approval route policy created successfully.",
+      data: policy
+    });
+  } catch (error) {
+    console.log("❌ Create Approval Route Policy Error");
+    console.log(error);
+
+    const status = error.status || 500;
+    res.status(status).json({
+      success: false,
+      message: error.message || "Error creating approval route policy."
+    });
+  }
+});
+
+app.put(
+  "/approval-route-policies/:policyId",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const policyPayload = req.body?.policy || req.body;
+
+      const policy = await approvalRouteRepository.updateApprovalRoutePolicy(
+        pool,
+        req.params.policyId,
+        {
+          ...policyPayload,
+          updated_by:
+            policyPayload.updated_by
+            || req.user?.employee_code
+            || req.user?.email_id
+            || null
+        }
+      );
+
+      if (!policy) {
+        return res.status(404).json({
+          success: false,
+          message: "Approval route policy not found."
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Approval route policy updated successfully.",
+        data: policy
+      });
+    } catch (error) {
+      console.log("❌ Update Approval Route Policy Error");
+      console.log(error);
+
+      const status = error.status || 500;
+      res.status(status).json({
+        success: false,
+        message: error.message || "Error updating approval route policy."
+      });
+    }
+  }
+);
+
+app.post(
+  "/approval-route-policies/:policyId/activate",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const policy = await approvalRouteRepository.setApprovalRoutePolicyActive(
+        pool,
+        req.params.policyId,
+        true,
+        req.user?.employee_code || req.user?.email_id || null
+      );
+
+      if (!policy) {
+        return res.status(404).json({
+          success: false,
+          message: "Approval route policy not found."
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Approval route policy activated successfully.",
+        data: policy
+      });
+    } catch (error) {
+      console.log("❌ Activate Approval Route Policy Error");
+      console.log(error);
+
+      res.status(500).json({
+        success: false,
+        message: error.message || "Error activating approval route policy."
+      });
+    }
+  }
+);
+
+app.post(
+  "/approval-route-policies/:policyId/deactivate",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const policy = await approvalRouteRepository.setApprovalRoutePolicyActive(
+        pool,
+        req.params.policyId,
+        false,
+        req.user?.employee_code || req.user?.email_id || null
+      );
+
+      if (!policy) {
+        return res.status(404).json({
+          success: false,
+          message: "Approval route policy not found."
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Approval route policy deactivated successfully.",
+        data: policy
+      });
+    } catch (error) {
+      console.log("❌ Deactivate Approval Route Policy Error");
+      console.log(error);
+
+      res.status(500).json({
+        success: false,
+        message: error.message || "Error deactivating approval route policy."
+      });
+    }
+  }
+);
 
 app.get("/health-test", (req, res) => {
   res.json({
@@ -7559,23 +9490,30 @@ app.get(
 
           c.candidate_id,
 
-          c.recruiter_id AS owner_employee_code,
+          c.owner_employee_code,
 
           u.full_name,
 
-          CONCAT(
+          CASE
+            WHEN c.candidate_container = 'TALENT_POOL'
+              AND c.owner_employee_code IS NULL
+            THEN NULL
+            WHEN c.owner_employee_code IS NULL
+            THEN NULL
+            ELSE CONCAT(
+              u.full_name,
+              ' (',
+              u.employee_code,
+              ')'
+            )
+          END AS owner_display_name,
 
-            u.full_name,
-
-            ' (',
-
-            u.employee_code,
-
-            ')'
-
-          ) AS owner_display_name,
-
-          (c.recruiter_id = $2) AS is_owner,
+          CASE
+            WHEN c.candidate_container = 'TALENT_POOL'
+              AND c.owner_employee_code IS NULL
+            THEN FALSE
+            ELSE (c.owner_employee_code IS NOT NULL AND c.owner_employee_code = $2)
+          END AS is_owner,
 
           EXISTS (
 
@@ -7594,7 +9532,7 @@ app.get(
 
         LEFT JOIN user_mstr u
 
-          ON u.employee_code = c.recruiter_id
+          ON u.employee_code = c.owner_employee_code
 
         WHERE c.candidate_id = $1
 
@@ -7662,98 +9600,17 @@ app.put(
 
     try {
 
-      const { candidateId } = req.params;
-
-      const activeMapping = await pool.query(
-
-        `
-
-        SELECT
-          mapping_id,
-          candidate_id,
-          requisition_code
-
-        FROM rm_candidate_mappings
-
-        WHERE candidate_id = $1
-
-          AND is_active = true
-
-        LIMIT 1
-
-        `,
-
-        [candidateId]
-
-      );
-
-      if (activeMapping.rows.length === 0) {
-
-        return res.status(404).json({
-
-          success: false,
-
-          message: "No active requisition mapping found."
-
-        });
-
-      }
-
-      const mappingRow = activeMapping.rows[0];
-
-      await pool.query(
-
-        `
-
-        UPDATE rm_candidate_mappings
-
-        SET is_active = false
-
-        WHERE candidate_id = $1
-
-          AND is_active = true
-
-        `,
-
-        [candidateId]
-
-      );
-
-      await pool.query(
-
-        `
-
-        INSERT INTO rm_pipeline_history (
-          requisition_code,
-          mapping_id,
-          candidate_id,
-          event_type,
-          actor,
-          actor_code,
-          actor_role,
-          comments
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-
-        `,
-
-        [
-          mappingRow.requisition_code,
-          mappingRow.mapping_id,
-          mappingRow.candidate_id,
-          "CandidateReleased",
-          req.user.full_name,
-          req.user.employee_code,
-          req.user.role_name,
-          "Candidate released from requisition"
-        ]
-
+      const result = await recruitmentService.releaseCandidate(
+        pool,
+        req.params.candidateId,
+        req
       );
 
       res.status(200).json({
 
         success: true,
 
-        message: "Candidate released from active requisition."
+        message: result.message || "Candidate released from active requisition."
 
       });
 
@@ -7765,11 +9622,71 @@ app.put(
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
 
-        message: "Error releasing candidate mapping."
+        message:
+          error.status
+            ? error.message
+            : "Error releasing candidate mapping."
+
+      });
+
+    }
+
+  }
+
+);
+
+
+
+// =====================================================
+// API 62b - Return Candidate to Enterprise Talent Pool
+// =====================================================
+
+app.put(
+
+  "/return-candidate-to-talent-pool/:candidateId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const result = await recruitmentService.returnCandidateToTalentPool(
+        pool,
+        req.params.candidateId,
+        req
+      );
+
+      res.status(200).json({
+
+        success: true,
+
+        message:
+          result.message ||
+          "Candidate returned to Enterprise Talent Pool."
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Return to Talent Pool Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+
+        message:
+          error.status
+            ? error.message
+            : "Error returning candidate to Talent Pool."
 
       });
 
@@ -8220,12 +10137,32 @@ app.post(
       const parsed_candidate =
         parseBasicCandidateInfo(extractedText);
 
+      // Idempotent parse: if this intake already created a DRAFT, reuse it.
+      // Prevents duplicate cand_mstr rows on re-parse and keeps Register on the same id.
+      let draftResult;
+
+      if (intake.created_draft_id) {
+
+        draftResult = {
+          outcome: "CREATED",
+          candidate_id: intake.created_draft_id
+        };
+
+      } else {
+
+        draftResult =
+          await createDraftCandidateFromParsedIntake({
+            intake,
+            parsedCandidate: parsed_candidate,
+            createdBy: req.user?.employee_code
+          });
+
+      }
+
       const draft_candidate_id =
-        await createDraftCandidateFromParsedIntake({
-          intake,
-          parsedCandidate: parsed_candidate,
-          createdBy: req.user?.employee_code
-        });
+        draftResult.outcome === "CREATED"
+          ? draftResult.candidate_id
+          : null;
 
       const result = await pool.query(
 
@@ -8235,16 +10172,34 @@ app.post(
         SET
           parsing_status = 'COMPLETED',
           error_message = NULL,
-          created_draft_id = $1
+          created_draft_id = COALESCE($1, created_draft_id)
         WHERE intake_id = $2
 
-        RETURNING intake_id, parsing_status
+        RETURNING intake_id, parsing_status, created_draft_id
 
         `,
 
         [draft_candidate_id, intakeId]
 
       );
+
+      if (draftResult.outcome === "DUPLICATE") {
+
+        return res.status(200).json({
+
+          success: true,
+
+          outcome: "DUPLICATE",
+
+          duplicate_candidate: draftResult.duplicate_candidate,
+
+          parsed_candidate,
+
+          draft_candidate_id: result.rows[0].created_draft_id || null
+
+        });
+
+      }
 
       res.status(200).json({
 
@@ -8256,7 +10211,8 @@ app.post(
 
         parsed_candidate,
 
-        draft_candidate_id
+        draft_candidate_id:
+          result.rows[0].created_draft_id || draft_candidate_id
 
       });
 

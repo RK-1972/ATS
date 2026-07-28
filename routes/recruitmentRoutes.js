@@ -1,4 +1,8 @@
 const recruitmentService = require("../services/recruitmentService");
+const {
+  requireRequisitionAssigner,
+  requireRequisitionRequestor
+} = require("../services/requisitionCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Recruitment API Error:", error.message);
@@ -11,7 +15,8 @@ function handleError(res, error) {
 function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
   const guard = [verifyToken, verifyAdmin];
   const operatorGuard = [verifyToken];
-
+  const requestorGuard = [verifyToken, requireRequisitionRequestor(pool)];
+  const assignerGuard = [verifyToken, requireRequisitionAssigner(pool)];
   app.get("/api/v1/recruitment/my-dashboard", verifyToken, async (req, res) => {
     try {
       const bundle = await recruitmentService.getMyRecruiterDashboard(pool, req);
@@ -30,7 +35,7 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/requisitions", operatorGuard, async (req, res) => {
+  app.get("/api/v1/recruitment/requisitions", assignerGuard, async (req, res) => {
     try {
       const data = await recruitmentService.listRequisitionsForManagement(pool);
       res.json({ success: true, data });
@@ -39,7 +44,20 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/requisitions/:reqId/assigned-recruiters", operatorGuard, async (req, res) => {
+  app.get("/api/v1/recruitment/approved-positions", operatorGuard, async (req, res) => {
+    try {
+      const data = await recruitmentService.listApprovedPositions(pool);
+      res.json({
+        success: true,
+        message: "Approved positions retrieved successfully",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/recruitment/requisitions/:reqId/assigned-recruiters", assignerGuard, async (req, res) => {
     try {
       const data = await recruitmentService.getAssignedRecruitersForRequisition(
         pool,
@@ -77,7 +95,7 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/form-options/recruiters", operatorGuard, async (req, res) => {
+  app.get("/api/v1/recruitment/form-options/recruiters", assignerGuard, async (req, res) => {
     try {
       const data = await recruitmentService.listFormRecruiters(pool);
       res.json({ success: true, count: data.length, data });
@@ -116,11 +134,11 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/requisitions/:code", guard, async (req, res) => {
+  app.get("/api/v1/recruitment/requisitions/:code", requestorGuard, async (req, res) => {
     try {
-      const bundle = await recruitmentService.getRecruitmentBundle(pool);
-      const requisition = bundle.requisitions.find(
-        (item) => item.requisition_code === req.params.code
+      const requisition = await recruitmentService.loadRequisitionByCode(
+        pool,
+        req.params.code
       );
 
       if (!requisition) {
@@ -133,7 +151,43 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/recruitment/requisitions", guard, async (req, res) => {
+  app.put("/api/v1/recruitment/requisitions/:code", requestorGuard, async (req, res) => {
+    try {
+      const result = await recruitmentService.updateRequisition(
+        pool,
+        req.params.code,
+        req.body || {},
+        req
+      );
+      res.json({
+        success: true,
+        message: result.toastMessage,
+        data: result.requisition
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/recruitment/requisitions/:code/submit", requestorGuard, async (req, res) => {
+    try {
+      const result = await recruitmentService.submitRequisition(
+        pool,
+        req.params.code,
+        req.body || {},
+        req
+      );
+      res.json({
+        success: true,
+        message: result.toastMessage,
+        data: result
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/recruitment/requisitions", requestorGuard, async (req, res) => {
     try {
       const result = await recruitmentService.createFromApprovedPosition(
         pool,

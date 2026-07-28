@@ -1,4 +1,7 @@
 const workforcePlanningService = require("../services/workforcePlanningService");
+const {
+  assertCanCreateRequisition
+} = require("../services/requisitionCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Workforce Planning API Error:", error.message);
@@ -8,9 +11,10 @@ function handleError(res, error) {
 }
 
 function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
-  const guard = [verifyToken, verifyAdmin];
+  const adminGuard = [verifyToken, verifyAdmin];
+  const userGuard = [verifyToken];
 
-  app.get("/api/v1/workforce", guard, async (req, res) => {
+  app.get("/api/v1/workforce", userGuard, async (req, res) => {
     try {
       const bundle = await workforcePlanningService.getWorkforceBundle(pool);
       res.json(bundle);
@@ -19,7 +23,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/workforce/export", guard, async (req, res) => {
+  app.get("/api/v1/workforce/export", adminGuard, async (req, res) => {
     try {
       const exported = await workforcePlanningService.exportWorkforce(pool);
       res.json(exported);
@@ -28,7 +32,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/publish", guard, async (req, res) => {
+  app.post("/api/v1/workforce/publish", adminGuard, async (req, res) => {
     try {
       const bundle = await workforcePlanningService.publishBundle(
         pool,
@@ -42,7 +46,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/discard", guard, async (req, res) => {
+  app.post("/api/v1/workforce/discard", adminGuard, async (req, res) => {
     try {
       const bundle = await workforcePlanningService.discardDraft(pool, req);
       res.json(bundle);
@@ -51,7 +55,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/import/preview", guard, async (req, res) => {
+  app.post("/api/v1/workforce/import/preview", adminGuard, async (req, res) => {
     try {
       const preview = await workforcePlanningService.previewImport(
         pool,
@@ -63,7 +67,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/import", guard, async (req, res) => {
+  app.post("/api/v1/workforce/import", adminGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.commitImport(
         pool,
@@ -77,7 +81,33 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/workforce/budget-requests/:id", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.createBudgetRequest(
+        pool,
+        req.body || {},
+        req
+      );
+      res.status(201).json(result);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/workforce/budget-requests/:id/submit", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.submitBudgetRequest(
+        pool,
+        req.params.id,
+        req
+      );
+      res.json(result);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/workforce/budget-requests/:id", userGuard, async (req, res) => {
     try {
       const bundle = await workforcePlanningService.getWorkforceBundle(pool);
       const request = bundle.config.approval_queue.find(
@@ -94,7 +124,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/budget-requests/:id/approve", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests/:id/approve", userGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.approveBudgetRequest(
         pool,
@@ -108,7 +138,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/budget-requests/:id/reject", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests/:id/reject", userGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.rejectBudgetRequest(
         pool,
@@ -122,7 +152,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/budget-requests/:id/send-back", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests/:id/send-back", userGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.sendBackBudgetRequest(
         pool,
@@ -136,7 +166,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/budget-requests/:id/request-clarification", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests/:id/request-clarification", userGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.requestBudgetClarification(
         pool,
@@ -150,7 +180,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/budget-requests/:id/submit-clarification", guard, async (req, res) => {
+  app.post("/api/v1/workforce/budget-requests/:id/submit-clarification", userGuard, async (req, res) => {
     try {
       const result = await workforcePlanningService.submitBudgetClarification(
         pool,
@@ -164,8 +194,22 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/workforce/approved-positions/:id/requisitions", guard, async (req, res) => {
+  app.get("/api/v1/workforce/budget-requests/:id/action-context", userGuard, async (req, res) => {
     try {
+      const result = await workforcePlanningService.getBudgetApprovalActionContext(
+        pool,
+        req.params.id,
+        req
+      );
+      res.json(result);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/workforce/approved-positions/:id/requisitions", userGuard, async (req, res) => {
+    try {
+      await assertCanCreateRequisition(pool, req);
       const result = await workforcePlanningService.createRequisition(
         pool,
         req.params.id,
@@ -177,7 +221,7 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/workforce/:id", guard, async (req, res) => {
+  app.get("/api/v1/workforce/:id", adminGuard, async (req, res) => {
     try {
       const bundle = await workforcePlanningService.getWorkforceBundle(pool);
       const request = bundle.config.approval_queue.find(
