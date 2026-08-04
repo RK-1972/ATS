@@ -4,6 +4,7 @@ const masterDataService = require("./masterDataService");
 const taskService = require("./taskService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled, isEnterpriseOperationalSor } = require("../config/operationalCutover");
+const { normalizeRating, formatRatingLabel } = require("./operationalMigrationService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "interviews.seed.json");
 
@@ -668,6 +669,13 @@ async function submitFeedback(pool, payload, req) {
     action: "submit_feedback"
   }, req);
 
+  // Enterprise persistence expects numeric overall_rating (im_feedback).
+  // API/UI continue to send business labels; normalize only at write time.
+  const normalizedOverallRating = normalizeRating(overallRating);
+  if (normalizedOverallRating == null) {
+    throw httpError("Invalid overall_rating.", 400);
+  }
+
   await pool.query(
     `INSERT INTO im_feedback (
       interview_id, schedule_id, interview_level, area_of_interview, overall_rating,
@@ -679,7 +687,7 @@ async function submitFeedback(pool, payload, req) {
       interview.scheduleId || scheduleId,
       interviewLevel,
       areaOfInterview,
-      overallRating,
+      normalizedOverallRating,
       strengths,
       improvementAreas,
       overallComments,
@@ -759,6 +767,116 @@ async function submitFeedback(pool, payload, req) {
   return {
     interview: await getInterview(pool, interview.interviewId),
     toastMessage: "Feedback submitted successfully."
+  };
+}
+
+/**
+ * Enterprise SoR read for View Feedback.
+ * Returns the legacy-compatible ViewFeedback response shape from im_feedback.
+ */
+async function getFeedbackBySchedule(pool, scheduleId) {
+  if (scheduleId == null || scheduleId === "") {
+    throw httpError("schedule_id is required.", 400);
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      f.feedback_id,
+      f.schedule_id,
+      f.interview_id,
+      f.interview_level,
+      f.area_of_interview,
+      f.overall_rating,
+      f.strengths,
+      f.improvement_areas,
+      f.overall_comments,
+      f.final_outcome,
+      f.skills,
+      i.round_type,
+      TO_CHAR(i.interview_date, 'DD-MM-YYYY') AS interview_date,
+      TO_CHAR(i.interview_time, 'HH24:MI') AS interview_time,
+      cm.candidate_code,
+      CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+      COALESCE(rm.req_code, i.requisition_code) AS req_code,
+      rm.job_title,
+      (
+        SELECT p.interviewer_name
+        FROM im_panel_assignments p
+        WHERE p.interview_id = i.interview_id
+        ORDER BY p.assigned_on DESC NULLS LAST, p.assignment_id DESC
+        LIMIT 1
+      ) AS interviewer_name
+    FROM im_feedback f
+    LEFT JOIN im_interviews i
+      ON i.interview_id = f.interview_id
+    LEFT JOIN cand_mstr cm
+      ON cm.candidate_id = i.candidate_id
+    LEFT JOIN req_mstr rm
+      ON rm.req_id = i.req_id
+    WHERE f.schedule_id = $1
+    ORDER BY f.feedback_id DESC
+    LIMIT 1
+    `,
+    [scheduleId]
+  );
+
+  if (!result.rows.length) {
+    return {
+      success: true,
+      feedbackExists: false
+    };
+  }
+
+  const row = result.rows[0];
+  let skills = row.skills;
+
+  if (typeof skills === "string") {
+    try {
+      skills = JSON.parse(skills);
+    } catch (_error) {
+      skills = [];
+    }
+  }
+
+  if (!Array.isArray(skills)) {
+    skills = [];
+  }
+
+  const details = skills
+    .filter((skill) => skill && String(skill.skill_name || "").trim())
+    .map((skill, index) => ({
+      detail_id: index + 1,
+      feedback_id: row.feedback_id,
+      skill_name: skill.skill_name,
+      rating: Number(skill.rating) || 0,
+      comments: skill.comments || ""
+    }));
+
+  return {
+    success: true,
+    feedbackExists: true,
+    header: {
+      feedback_id: row.feedback_id,
+      schedule_id: row.schedule_id,
+      interview_id: row.interview_id,
+      interview_level: row.interview_level,
+      area_of_interview: row.area_of_interview,
+      overall_rating: formatRatingLabel(row.overall_rating) ?? row.overall_rating,
+      strengths: row.strengths,
+      improvement_areas: row.improvement_areas,
+      overall_comments: row.overall_comments,
+      final_outcome: row.final_outcome,
+      candidate_code: row.candidate_code,
+      candidate_name: row.candidate_name,
+      req_code: row.req_code,
+      job_title: row.job_title,
+      interviewer_name: row.interviewer_name,
+      round_type: row.round_type,
+      interview_date: row.interview_date,
+      interview_time: row.interview_time
+    },
+    details
   };
 }
 
@@ -1054,6 +1172,7 @@ module.exports = {
   rescheduleInterview,
   completeInterview,
   submitFeedback,
+  getFeedbackBySchedule,
   reassignPanel,
   assignPanel,
   validateMasterDataReferences,

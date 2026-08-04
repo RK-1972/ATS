@@ -165,7 +165,25 @@ async function handleSubmitFeedback(pool, req, res) {
   }
 }
 
+async function handleGetFeedback(pool, req, res) {
+  try {
+    const result = await interviewService.getFeedbackBySchedule(
+      pool,
+      req.params.scheduleId
+    );
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error("Get feedback error:", error.message);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || "Error Fetching Feedback"
+    });
+  }
+}
+
 module.exports = {
   handleScheduleInterview,
-  handleSubmitFeedback
+  handleSubmitFeedback,
+  handleGetFeedback
 };

@@ -110,18 +110,50 @@ async function loadApprovedPosition(pool, positionId) {
   return result.rows[0] || null;
 }
 
-async function validateMasterDataReferences(pool, data) {
+const RECRUITMENT_MASTER_DATA_CHECKS = [
+  { field: "department", entityType: "departments" },
+  { field: "grade", entityType: "grades" },
+  // Geography masters use cities / work_locations — entity type "locations" does not exist.
+  { field: "location", entityType: "cities", alternateEntityTypes: ["work_locations"] },
+  { field: "primary_skill", entityType: "skills" },
+  { field: "employment_type", entityType: "employment_types" },
+  { field: "source_type", entityType: "candidate_sources" },
+  { field: "business_unit", entityType: "business_units" }
+];
+
+function normalizeMasterLookupKey(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function masterRecordMatchesValue(records, value) {
+  const key = normalizeMasterLookupKey(value);
+  if (!key) {
+    return true;
+  }
+
+  return records.some((row) => {
+    const nameKey = normalizeMasterLookupKey(row.name);
+    const codeKey = normalizeMasterLookupKey(row.code);
+
+    if (key === nameKey || key === codeKey) {
+      return true;
+    }
+
+    return (
+      nameKey.includes(key) ||
+      key.includes(nameKey) ||
+      codeKey.includes(key) ||
+      key.includes(codeKey)
+    );
+  });
+}
+
+async function validateMasterDataFields(pool, data, checks) {
   const errors = [];
-  const checks = [
-    { field: "department", entityType: "departments" },
-    { field: "grade", entityType: "grades" },
-    // Geography masters use cities / work_locations — entity type "locations" does not exist.
-    { field: "location", entityType: "cities", alternateEntityTypes: ["work_locations"] },
-    { field: "primary_skill", entityType: "skills" },
-    { field: "employment_type", entityType: "employment_types" },
-    { field: "source_type", entityType: "candidate_sources" },
-    { field: "business_unit", entityType: "business_units" }
-  ];
 
   for (const check of checks) {
     const value = data[check.field];
@@ -133,23 +165,11 @@ async function validateMasterDataReferences(pool, data) {
       check.entityType,
       ...(check.alternateEntityTypes || [])
     ];
-    const key = String(value).toLowerCase();
     let matched = false;
 
     for (const entityType of entityTypes) {
       const records = await masterDataService.listByEntityType(pool, entityType);
-      const names = new Set(records.map((row) => row.name.toLowerCase()));
-      const codes = new Set(records.map((row) => row.code.toLowerCase()));
-
-      if (names.has(key) || codes.has(key)) {
-        matched = true;
-        break;
-      }
-
-      const partial = records.find((row) =>
-        row.name.toLowerCase().includes(key) || row.code.toLowerCase().includes(key)
-      );
-      if (partial) {
+      if (masterRecordMatchesValue(records, value)) {
         matched = true;
         break;
       }
@@ -163,6 +183,10 @@ async function validateMasterDataReferences(pool, data) {
   }
 
   return { valid: errors.length === 0, errors };
+}
+
+async function validateMasterDataReferences(pool, data) {
+  return validateMasterDataFields(pool, data, RECRUITMENT_MASTER_DATA_CHECKS);
 }
 
 async function evaluateRecruitmentRules(pool, context, req) {
@@ -875,6 +899,57 @@ async function createFromApprovedPosition(
   );
   const reqId = legacyRow?.req_id || (await allocateReqId(queryable));
 
+  // Ensure rm_requisitions.req_id always has a parent in req_mstr before insert.
+  console.log("REQ_MSTR_CHECK_START");
+  console.log("reqId:", reqId);
+  const hasReqMstr = await tableExists(queryable, "req_mstr");
+  console.log("req_mstr table exists:", hasReqMstr);
+
+  if (hasReqMstr) {
+    const legacyParent = await queryable.query(
+      "SELECT req_id FROM req_mstr WHERE req_id = $1",
+      [reqId]
+    );
+    console.log("existing req_mstr row found:", legacyParent.rows.length > 0);
+
+    if (legacyParent.rows.length === 0) {
+      const legacyCode = requisitionCode.replace(/^REQ-/, "REQ");
+      console.log("before req_mstr INSERT");
+      await queryable.query(
+        `INSERT INTO req_mstr (
+          req_id, req_code, client_name, project_name, job_title, job_description,
+          primary_skill, secondary_skill, experience_min, experience_max,
+          openings_count, work_location, employment_type, priority_level,
+          req_status, recruiter_id, hiring_manager, target_date, created_by,
+          approval_route_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        [
+          reqId,
+          legacyCode,
+          position.business_unit || "Internal",
+          position.department,
+          position.position_title,
+          `Enterprise requisition from approved position ${position.position_id}`,
+          position.primary_skill || null,
+          null,
+          null,
+          null,
+          position.headcount || 1,
+          options.location || position.location || null,
+          resolvedEmploymentType,
+          "High",
+          REQUISITION_STATUS.OPEN,
+          null,
+          options.hiring_manager || position.hiring_manager || "Hiring Manager",
+          position.expiry_date || null,
+          user.name,
+          options.approval_route_id ?? null
+        ]
+      );
+      console.log("after req_mstr INSERT");
+    }
+  }
+
   const instance = await workflowService.startWorkflow(
     queryable,
     "REQUISITION",
@@ -1113,14 +1188,29 @@ async function assignRecruiter(pool, reqId, recruiterCode, req) {
     action: "assign_recruiter"
   }, req);
 
+  // Align with the live workflow instance: only advance when the instance
+  // payload actually defines recruiter_assigned (e.g. HCT-style payloads).
+  // Official REQUISITION definitions use draft/ta_review/open/... and do not
+  // include recruiter_assigned — assignment must still succeed for those.
   if (requisition?.workflow_instance_id) {
-    await workflowService.advanceWorkflow(
+    const instance = await workflowService.getInstanceById(
       pool,
-      requisition.workflow_instance_id,
-      "approve",
-      { stageKey: "recruiter_assigned", actor: user.name, comment: `Assigned ${recruiterCode}` },
-      req
+      requisition.workflow_instance_id
     );
+    const stages = instance?.payload?.stages || [];
+    const hasRecruiterAssignedStage = stages.some(
+      (item) => String(item.key || "").trim() === "recruiter_assigned"
+    );
+
+    if (hasRecruiterAssignedStage) {
+      await workflowService.advanceWorkflow(
+        pool,
+        requisition.workflow_instance_id,
+        "approve",
+        { stageKey: "recruiter_assigned", actor: user.name, comment: `Assigned ${recruiterCode}` },
+        req
+      );
+    }
   }
 
   let assignmentRow = null;
@@ -2736,6 +2826,8 @@ module.exports = {
   returnCandidateToTalentPool,
   updateCandidateStage,
   validateMasterDataReferences,
+  validateMasterDataFields,
+  RECRUITMENT_MASTER_DATA_CHECKS,
   evaluateRecruitmentRules,
   handleLegacyCreateRequisition,
   seedConfiguration,

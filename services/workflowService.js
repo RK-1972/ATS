@@ -736,6 +736,12 @@ async function getMyActiveApprovals(pool, req) {
        r.req_status,
        r.created_by AS document_requestor,
        r.created_on AS document_submitted_on,
+       o.offer_id,
+       o.candidate_name,
+       o.business_unit,
+       o.department AS offer_department,
+       o.offered_ctc,
+       o.hiring_manager AS offer_hiring_manager,
        d.priority_level,
        d.draft_id,
        d.draft_code
@@ -743,6 +749,10 @@ async function getMyActiveApprovals(pool, req) {
      INNER JOIN wf_tasks t ON t.task_id = a.task_id
      INNER JOIN wf_instances i ON i.instance_id = t.instance_id
      LEFT JOIN rm_requisitions r ON r.workflow_instance_id = i.instance_id
+     LEFT JOIN om_offers o ON (
+       o.workflow_instance_id = i.instance_id
+       OR o.offer_id = NULLIF(BTRIM(i.execution_context #>> '{meta,offer_id}'), '')
+     )
      LEFT JOIN td_draft_mstr d
        ON d.result_requisition_code = r.requisition_code
       AND d.is_deleted = FALSE
@@ -805,16 +815,24 @@ async function getMyActiveApprovals(pool, req) {
           : null)
       : null;
 
+    const isOfferDocument =
+      metaDocumentType === "OFFER" ||
+      String(row.workflow_code || "").toUpperCase() === "OFFER" ||
+      Boolean(row.offer_id);
+
     const isRequisitionDocument =
-      metaDocumentType === "REQUISITION" ||
-      instanceId.startsWith("WF-RM-") ||
-      Boolean(row.requisition_code);
+      !isOfferDocument &&
+      (metaDocumentType === "REQUISITION" ||
+        instanceId.startsWith("WF-RM-") ||
+        Boolean(row.requisition_code));
 
     const documentType = isBudgetDocument
       ? "BUDGET"
-      : isRequisitionDocument
-        ? "REQUISITION"
-        : metaDocumentType || null;
+      : isOfferDocument
+        ? "OFFER"
+        : isRequisitionDocument
+          ? "REQUISITION"
+          : metaDocumentType || null;
 
     return {
       assignment_id: row.assignment_id,
@@ -824,6 +842,7 @@ async function getMyActiveApprovals(pool, req) {
       document_number:
         row.requisition_code ||
         (isBudgetDocument ? budgetRequestId : null) ||
+        (isOfferDocument ? row.offer_id : null) ||
         row.instance_id,
       document_title:
         row.position_title ||
@@ -845,10 +864,37 @@ async function getMyActiveApprovals(pool, req) {
       requisition_code: row.requisition_code || null,
       draft_id: row.draft_id || null,
       draft_code: row.draft_code || null,
-      hiring_manager: row.hiring_manager || null,
+      hiring_manager: row.hiring_manager || row.offer_hiring_manager || null,
       req_status: row.req_status || null,
       document_type: documentType,
-      task_type: row.task_type || null
+      task_type: row.task_type || null,
+      candidateName:
+        row.candidate_name ||
+        meta.candidate_name ||
+        meta.candidateName ||
+        null,
+      businessUnit:
+        row.business_unit ||
+        meta.business_unit ||
+        meta.businessUnit ||
+        null,
+      department:
+        row.offer_department ||
+        meta.department ||
+        context.department ||
+        null,
+      offeredCtc: (() => {
+        if (row.offered_ctc != null && row.offered_ctc !== "") {
+          return Number(row.offered_ctc);
+        }
+        if (meta.offered_ctc != null && meta.offered_ctc !== "") {
+          return Number(meta.offered_ctc);
+        }
+        if (meta.offered_ctc_lpa != null && meta.offered_ctc_lpa !== "") {
+          return Number(meta.offered_ctc_lpa) * 100000;
+        }
+        return null;
+      })()
     };
   });
 }

@@ -4,10 +4,12 @@ const masterDataService = require("./masterDataService");
 const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const userPermissionRepository = require("../repositories/userPermissionRepository");
+const workAssignmentService = require("./workAssignmentService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "workforcePlanning.seed.json");
 const RAISE_BUDGET_REQUEST_CODE = "RAISE_BUDGET_REQUEST";
+const BUDGET_REQUESTOR_CODE = "BUDGET_REQUESTOR";
 const BUDGET_PENDING_LEVEL_1_STATUS = "Pending Level-1 Approval";
 const BUDGET_PENDING_LEVEL_2_STATUS = "Pending Level-2 Approval";
 
@@ -46,7 +48,7 @@ function httpError(message, status = 400) {
 
 /**
  * Admins may always raise Budget Requests.
- * Other users require RAISE_BUDGET_REQUEST via Enterprise User Permissions.
+ * Other users require an active BUDGET_REQUESTOR Work Assignment.
  */
 async function assertCanRaiseBudgetRequest(pool, req) {
   const roleName = String(req?.user?.role_name || "").trim();
@@ -64,11 +66,25 @@ async function assertCanRaiseBudgetRequest(pool, req) {
     );
   }
 
-  const allowed = await userPermissionRepository.hasPermission(
+  const assignments = await workAssignmentService.getEmployeeWorkAssignments(
     pool,
-    employeeCode,
-    RAISE_BUDGET_REQUEST_CODE
+    employeeCode
   );
+
+  const allowed = (assignments || []).some((row) => {
+    if (row.is_active !== true) {
+      return false;
+    }
+
+    if (row.master_is_active === false) {
+      return false;
+    }
+
+    return (
+      String(row.assignment_code || "").trim().toUpperCase() ===
+      BUDGET_REQUESTOR_CODE
+    );
+  });
 
   if (!allowed) {
     throw httpError(

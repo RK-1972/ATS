@@ -6,6 +6,7 @@
 
 const talentDemandWorkflowCompletionService = require("./talentDemandWorkflowCompletionService");
 const budgetWorkflowCompletionService = require("./budgetWorkflowCompletionService");
+const offerWorkflowCompletionService = require("./offerWorkflowCompletionService");
 
 function parseContext(raw) {
   if (raw && typeof raw === "object") {
@@ -25,6 +26,10 @@ function isBudgetEvent(event = {}) {
   return budgetWorkflowCompletionService.isBudgetWorkflowEvent(event);
 }
 
+function isOfferEvent(event = {}) {
+  return offerWorkflowCompletionService.isOfferWorkflowEvent(event);
+}
+
 /**
  * Intermediate approval step activated (Waiting → Pending).
  */
@@ -38,6 +43,14 @@ async function notifyApprovalStepActivated(queryable, event, req) {
   }
 
   const workflowCode = String(event.workflowCode || "").toUpperCase();
+  if (workflowCode === "OFFER" || isOfferEvent(event)) {
+    return offerWorkflowCompletionService.handleOfferStepActivated(
+      queryable,
+      event,
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionStepActivated(
       queryable,
@@ -57,6 +70,14 @@ async function notifyApprovalStepActivated(queryable, event, req) {
  */
 async function notifyWorkflowCompleted(queryable, event, req) {
   const workflowCode = String(event.workflowCode || "").toUpperCase();
+
+  if (workflowCode === "OFFER" || isOfferEvent(event)) {
+    return offerWorkflowCompletionService.handleOfferWorkflowCompleted(
+      queryable,
+      event,
+      req
+    );
+  }
 
   if (workflowCode === "REQUISITION" && isBudgetEvent(event)) {
     return budgetWorkflowCompletionService.handleBudgetWorkflowCompleted(
@@ -85,6 +106,14 @@ async function notifyWorkflowCompleted(queryable, event, req) {
  */
 async function notifyWorkflowRejected(queryable, event, req) {
   const workflowCode = String(event.workflowCode || "").toUpperCase();
+
+  if (workflowCode === "OFFER" || isOfferEvent(event)) {
+    return offerWorkflowCompletionService.handleOfferWorkflowRejected(
+      queryable,
+      event,
+      req
+    );
+  }
 
   if (workflowCode === "REQUISITION" && isBudgetEvent(event)) {
     return budgetWorkflowCompletionService.handleBudgetWorkflowRejected(

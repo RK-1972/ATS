@@ -6407,6 +6407,7 @@ app.get(
         `
         SELECT DISTINCT
           rcm.map_id,
+          cm.candidate_id,
           cm.candidate_code,
           CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name
         FROM rm_candidate_mappings rcm
@@ -6444,6 +6445,7 @@ app.get(
           `
           SELECT DISTINCT
             crm.map_id,
+            cm.candidate_id,
             cm.candidate_code,
             CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name
           FROM candidate_req_map crm
@@ -7530,166 +7532,9 @@ app.post(
 // =====================================================
 
 app.get(
-
   "/feedback/:scheduleId",
-
   verifyToken,
-
-  async (req, res) => {
-
-    try {
-
-      const scheduleId =
-        req.params.scheduleId;
-
-      // ==========================
-      // Feedback Header
-      // ==========================
-
-      const headerResult =
-  await pool.query(
-
-    `
-
-    SELECT
-
-      ifh.*,
-
-      cm.candidate_code,
-
-      CONCAT(
-        cm.first_name,
-        ' ',
-        cm.last_name
-      ) AS candidate_name,
-
-      rm.req_code,
-
-      rm.job_title,
-
-      ipm.interviewer_name,
-
-      ist.round_type,
-
-      TO_CHAR(
-        ist.interview_date,
-        'DD-MM-YYYY'
-      ) AS interview_date,
-
-      ist.interview_time
-
-    FROM interview_feedback_hdr ifh
-
-    INNER JOIN interview_schedule_trn ist
-      ON ist.schedule_id =
-         ifh.schedule_id
-
-    INNER JOIN candidate_req_map crm
-      ON crm.map_id =
-         ist.map_id
-
-    INNER JOIN cand_mstr cm
-      ON cm.candidate_id =
-         crm.candidate_id
-
-    LEFT JOIN req_mstr rm
-      ON rm.req_id =
-         ist.req_id
-
-    LEFT JOIN interview_panel_mstr ipm
-      ON ipm.panel_id =
-         ist.interviewer_id
-
-    WHERE ifh.schedule_id = $1
-
-    `,
-
-    [scheduleId]
-
-  );
-
-      if (
-        headerResult.rows.length === 0
-      ) {
-
-        return res.status(200).json({
-
-          success: true,
-
-          feedbackExists: false
-
-        });
-
-      }
-
-      const header =
-        headerResult.rows[0];
-
-      // ==========================
-      // Feedback Details
-      // ==========================
-
-      const detailResult =
-        await pool.query(
-
-          `
-
-          SELECT
-
-            detail_id,
-            feedback_id,
-            skill_name,
-            rating,
-            comments
-
-          FROM interview_feedback_dtl
-
-          WHERE feedback_id = $1
-
-          ORDER BY detail_id
-
-          `,
-
-          [header.feedback_id]
-
-        );
-
-      res.status(200).json({
-
-        success: true,
-
-        feedbackExists: true,
-
-        header,
-
-        details:
-          detailResult.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "❌ Get Feedback Error"
-      );
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Error Fetching Feedback"
-
-      });
-
-    }
-
-  }
-
+  (req, res) => interviewLegacyHandlers.handleGetFeedback(pool, req, res)
 );
 
 // =====================================================
@@ -7953,9 +7798,13 @@ app.post(
 
         );
 
+        const frontendBase = (
+          process.env.FRONTEND_URL || "http://localhost:5173"
+        ).replace(/\/$/, "");
+
         const resetLink =
 
-          `http://localhost:5173/reset-password/${resetToken}`;
+          `${frontendBase}/reset-password/${resetToken}`;
 
         await sendPasswordResetEmail(
 

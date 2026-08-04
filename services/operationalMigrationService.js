@@ -28,6 +28,20 @@ function checksumFromRows(rows, key) {
   return crypto.createHash("md5").update(payload).digest("hex");
 }
 
+const RATING_LABEL_TO_VALUE = {
+  poor: 2,
+  average: 3,
+  good: 4,
+  excellent: 5
+};
+
+const RATING_VALUE_TO_LABEL = {
+  2: "Poor",
+  3: "Average",
+  4: "Good",
+  5: "Excellent"
+};
+
 function normalizeRating(value) {
   if (value === null || value === undefined || value === "") {
     return null;
@@ -38,14 +52,29 @@ function normalizeRating(value) {
     return numeric;
   }
 
-  const map = {
-    poor: 2,
-    average: 3,
-    good: 4,
-    excellent: 5
-  };
+  return RATING_LABEL_TO_VALUE[String(value).trim().toLowerCase()] ?? null;
+}
 
-  return map[String(value).trim().toLowerCase()] ?? null;
+/**
+ * Map enterprise numeric overall_rating back to the UI business label.
+ * Inverse of normalizeRating — same rating contract, read path only.
+ */
+function formatRatingLabel(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  if (!Number.isNaN(numeric) && RATING_VALUE_TO_LABEL[numeric]) {
+    return RATING_VALUE_TO_LABEL[numeric];
+  }
+
+  const asLabel = String(value).trim();
+  if (RATING_LABEL_TO_VALUE[asLabel.toLowerCase()] != null) {
+    return asLabel.charAt(0).toUpperCase() + asLabel.slice(1).toLowerCase();
+  }
+
+  return asLabel;
 }
 
 async function tableExists(pool, tableName) {
@@ -686,6 +715,8 @@ module.exports = {
   STATE_PATH,
   requisitionCodeFromLegacy,
   interviewIdFromLegacy,
+  normalizeRating,
+  formatRatingLabel,
   runOperationalMigration,
   validateOperationalMigration,
   rollbackOperationalMigration,

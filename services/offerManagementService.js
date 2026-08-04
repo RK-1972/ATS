@@ -1,7 +1,9 @@
 const businessRulesService = require("./businessRulesService");
 const workflowService = require("./workflowService");
-const masterDataService = require("./masterDataService");
+const recruitmentService = require("./recruitmentService");
 const taskService = require("./taskService");
+const approvalRouteResolverService = require("./approvalRouteResolverService");
+const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "offers.seed.json");
@@ -46,40 +48,23 @@ async function assertOfferModuleEnabled(platformConfig) {
   }
 }
 
+// business_unit and department inherit from rm_requisitions (client_mstr / project_mstr
+// labels) and are not Enterprise Master fields — exclude from md_records validation.
+const OFFER_MASTER_DATA_CHECKS = [
+  { field: "grade", entityType: "grades" },
+  {
+    field: "location",
+    entityType: "cities",
+    alternateEntityTypes: ["work_locations"]
+  },
+  { field: "employment_type", entityType: "employment_types" },
+  { field: "currency", entityType: "currencies" },
+  { field: "template_code", entityType: "offer_templates" },
+  { field: "salary_band_code", entityType: "salary_bands" }
+];
+
 async function validateMasterDataReferences(pool, data) {
-  const errors = [];
-  const checks = [
-    { field: "grade", entityType: "grades" },
-    { field: "location", entityType: "locations" },
-    { field: "employment_type", entityType: "employment_types" },
-    { field: "currency", entityType: "currencies" },
-    { field: "template_code", entityType: "offer_templates" },
-    { field: "business_unit", entityType: "business_units" },
-    { field: "salary_band_code", entityType: "salary_bands" }
-  ];
-
-  for (const check of checks) {
-    const value = data[check.field];
-    if (!value) {
-      continue;
-    }
-
-    const records = await masterDataService.listByEntityType(pool, check.entityType);
-    const names = new Set(records.map((row) => row.name.toLowerCase()));
-    const codes = new Set(records.map((row) => row.code.toLowerCase()));
-    const key = String(value).toLowerCase();
-
-    if (!names.has(key) && !codes.has(key)) {
-      const partial = records.find((row) =>
-        row.name.toLowerCase().includes(key) || row.code.toLowerCase().includes(key)
-      );
-      if (!partial) {
-        errors.push(`"${value}" not found in Master Data (${check.entityType}).`);
-      }
-    }
-  }
-
-  return { valid: errors.length === 0, errors };
+  return recruitmentService.validateMasterDataFields(pool, data, OFFER_MASTER_DATA_CHECKS);
 }
 
 async function evaluateOfferRules(pool, context, req) {
@@ -172,6 +157,7 @@ async function loadRecruitmentContext(pool, payload) {
       context.department = context.department || req.department;
       context.location = context.location || req.location;
       context.business_unit = context.business_unit || req.business_unit;
+      context.employment_type = context.employment_type || req.employment_type;
       context.approved_budget = context.approved_budget ?? Number(req.budget_approved);
       context.hiring_manager = context.hiring_manager || req.hiring_manager;
     }
@@ -248,8 +234,7 @@ async function createOffer(pool, payload, req) {
     grade: context.grade,
     location: context.location,
     employment_type: context.employment_type || "Full-time",
-    currency: context.currency || "INR",
-    business_unit: context.business_unit
+    currency: context.currency || "INR"
   });
 
   if (!mdValidation.valid) {
@@ -384,6 +369,108 @@ async function createOffer(pool, payload, req) {
   };
 }
 
+/**
+ * Mirror Budget submit: stamp workflow execution_context then expand approval route
+ * into wf_tasks + wf_assignments via the shared Workflow Engine helper.
+ */
+async function publishOfferWorkflowAssignments(pool, offer, req, approvalRouteId) {
+  if (!offer.workflowInstanceId) {
+    throw httpError("Offer workflow instance is missing.", 400);
+  }
+
+  const instance = await workflowService.getInstanceById(pool, offer.workflowInstanceId);
+  if (!instance) {
+    throw httpError(`Workflow instance not found: ${offer.workflowInstanceId}`, 404);
+  }
+
+  const rawContext = instance.executionContext;
+  const context =
+    rawContext && typeof rawContext === "object"
+      ? rawContext
+      : typeof rawContext === "string"
+        ? (() => {
+            try {
+              return JSON.parse(rawContext);
+            } catch {
+              return {};
+            }
+          })()
+        : {};
+  const meta = context.meta && typeof context.meta === "object" ? context.meta : {};
+
+  const nextContext = {
+    ...context,
+    meta: {
+      ...meta,
+      process_id: offer.workflowInstanceId,
+      document_type: "OFFER",
+      offer_id: offer.offerId,
+      requisition_id: offer.requisitionCode || offer.offerId,
+      department: offer.department,
+      position_title: offer.positionTitle,
+      grade: offer.grade,
+      approval_route_id: approvalRouteId
+    },
+    department: offer.department,
+    grade: offer.grade,
+    approval_route_id: approvalRouteId
+  };
+
+  await pool.query(
+    `UPDATE wf_instances
+     SET execution_context = $1, modified_on = NOW()
+     WHERE instance_id = $2`,
+    [JSON.stringify(nextContext), offer.workflowInstanceId]
+  );
+
+  const assignedBy = req.user?.employee_code || userContext(req).name;
+
+  return workflowService.createApprovalRouteWorkflowTasks(
+    pool,
+    offer.workflowInstanceId,
+    approvalRouteId,
+    {
+      stageKey: "approval",
+      assignedBy,
+      requisitionCode: offer.offerId
+    }
+  );
+}
+
+/** Replace Offer workspace approval rows with route-expanded step titles. */
+async function syncOfferApprovalsFromRoute(pool, offerId, approvalRouteId) {
+  await pool.query("DELETE FROM om_offer_approvals WHERE offer_id = $1", [offerId]);
+
+  const steps = await approvalRouteRepository.getApprovalRouteSteps(
+    pool,
+    approvalRouteId
+  );
+
+  if (!steps.length) {
+    throw httpError("Approval route has no steps to publish.", 400);
+  }
+
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    const sequence = step.sequence_no ?? step.step_no ?? index + 1;
+    const stepTitle = `Approval Step ${sequence} — ${offerId}`;
+
+    await pool.query(
+      `INSERT INTO om_offer_approvals (
+        offer_id, approval_step, approver_role, approval_status, sequence_order, effective_from
+      ) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        offerId,
+        stepTitle,
+        step.approval_type || "Approver",
+        index === 0 ? "Pending" : "Waiting",
+        sequence,
+        new Date()
+      ]
+    );
+  }
+}
+
 async function submitOffer(pool, offerId, comment, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
@@ -392,6 +479,10 @@ async function submitOffer(pool, offerId, comment, req) {
   const offer = await getOffer(pool, offerId);
   if (offer.offerStatus !== "Draft") {
     throw httpError("Only draft offers can be submitted.", 400);
+  }
+
+  if (!offer.workflowInstanceId) {
+    throw httpError("Offer workflow instance is missing.", 400);
   }
 
   const ruleEval = await evaluateOfferRules(pool, {
@@ -403,89 +494,119 @@ async function submitOffer(pool, offerId, comment, req) {
     action: "submit_offer"
   }, req);
 
-  const requiresFinance = ruleEval.approvers.some((item) => /finance/i.test(item))
-    || ruleEval.triggered_rules.some((item) => /budget|finance/i.test(item));
-  const requiresLeadership = ruleEval.approvers.some((item) => /leadership|ta lead/i.test(item))
-    || ruleEval.triggered_rules.some((item) => /grade|leadership/i.test(item));
+  const approvalRouteId = await approvalRouteResolverService.resolveApprovalRoute(
+    pool,
+    "OFFER",
+    {
+      department: offer.department,
+      designation: offer.positionTitle,
+      grade: offer.grade,
+      amount: offer.offeredCtc
+    }
+  );
 
-  if (offer.workflowInstanceId) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
     await workflowService.advanceWorkflow(
-      pool,
+      client,
       offer.workflowInstanceId,
       "approve",
       { stageKey: "draft", actor: user.name, comment },
       req
     );
-  }
 
-  const threshold = platformConfig?.budget?.max_budget_variance_pct ?? 10;
-  if (offer.variancePct > threshold) {
-    await writeEnterpriseAudit(pool, {
-      eventType: "BudgetExceptionTriggered",
+    const threshold = platformConfig?.budget?.max_budget_variance_pct ?? 10;
+    if (offer.variancePct > threshold) {
+      await writeEnterpriseAudit(client, {
+        eventType: "BudgetExceptionTriggered",
+        module: "Offer Management",
+        entity: "Offer",
+        entityId: offerId,
+        action: `Budget variance ${offer.variancePct}% exceeds ${threshold}%`,
+        userName: user.name,
+        userRole: user.role,
+        metadata: { ruleEvaluation: ruleEval }
+      });
+    }
+
+    const approvalTasks = await publishOfferWorkflowAssignments(
+      client,
+      offer,
+      req,
+      approvalRouteId
+    );
+
+    if (!Array.isArray(approvalTasks) || approvalTasks.length === 0) {
+      throw httpError(
+        "Offer approval route did not publish any workflow assignments.",
+        500
+      );
+    }
+
+    const assignmentCheck = await client.query(
+      `SELECT COUNT(*) AS count
+       FROM wf_assignments a
+       INNER JOIN wf_tasks t ON t.task_id = a.task_id
+       WHERE t.instance_id = $1
+         AND t.task_type = 'approval'
+         AND t.title LIKE 'Approval Step %'
+         AND a.active = TRUE`,
+      [offer.workflowInstanceId]
+    );
+
+    if (Number(assignmentCheck.rows[0]?.count || 0) === 0) {
+      throw httpError(
+        "Offer submit did not create an active workflow assignment for Approver 1.",
+        500
+      );
+    }
+
+    await syncOfferApprovalsFromRoute(client, offerId, approvalRouteId);
+
+    await client.query(
+      `UPDATE om_offers SET offer_status = 'Pending Approval', modified_by = $1, modified_on = NOW()
+       WHERE offer_id = $2`,
+      [user.name, offerId]
+    );
+
+    await recordOfferHistory(
+      client,
+      offerId,
+      "OfferSubmitted",
+      user.name,
+      user.role,
+      "Draft",
+      "Pending Approval",
+      comment
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "OfferSubmitted",
       module: "Offer Management",
       entity: "Offer",
       entityId: offerId,
-      action: `Budget variance ${offer.variancePct}% exceeds ${threshold}%`,
+      action: "Offer submitted for approval",
       userName: user.name,
       userRole: user.role,
-      metadata: { ruleEvaluation: ruleEval }
+      metadata: { ruleEvaluation: ruleEval, approvalRouteId, approvalTasks }
     });
+
+    await client.query("COMMIT");
+
+    return {
+      offer: await getOffer(pool, offerId),
+      ruleEvaluation: ruleEval,
+      toastMessage: "Offer submitted for approval."
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
-
-  const approvalSteps = [
-    { step: "HM Review", role: "Hiring Manager", order: 1 }
-  ];
-  if (requiresFinance) {
-    approvalSteps.push({ step: "Finance Approval", role: "Finance Director", order: 2 });
-  }
-  if (requiresLeadership) {
-    approvalSteps.push({ step: "Leadership Approval", role: "TA Leader", order: 3 });
-  }
-
-  for (const step of approvalSteps) {
-    await pool.query(
-      `INSERT INTO om_offer_approvals (
-        offer_id, approval_step, approver_role, approval_status, sequence_order, effective_from
-      ) VALUES ($1,$2,$3,'Pending',$4,$5)`,
-      [offerId, step.step, step.role, step.order, new Date()]
-    );
-
-    await taskService.createTask(pool, {
-      module: "Offer Management",
-      taskType: step.step,
-      title: `${step.step} for offer ${offerId}`,
-      assigneeRole: step.role,
-      priority: /finance|leadership/i.test(step.role) ? "High" : "Normal",
-      workflowInstanceId: offer.workflowInstanceId,
-      stageKey: step.step.toLowerCase().replace(/\s+/g, "_"),
-      businessObjectType: "Offer",
-      businessObjectId: offerId
-    }, req);
-  }
-
-  await pool.query(
-    `UPDATE om_offers SET offer_status = 'Pending Approval', modified_by = $1, modified_on = NOW()
-     WHERE offer_id = $2`,
-    [user.name, offerId]
-  );
-
-  await recordOfferHistory(pool, offerId, "OfferSubmitted", user.name, user.role, "Draft", "Pending Approval", comment);
-  await writeEnterpriseAudit(pool, {
-    eventType: "OfferSubmitted",
-    module: "Offer Management",
-    entity: "Offer",
-    entityId: offerId,
-    action: "Offer submitted for approval",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { ruleEvaluation: ruleEval, approvalSteps }
-  });
-
-  return {
-    offer: await getOffer(pool, offerId),
-    ruleEvaluation: ruleEval,
-    toastMessage: "Offer submitted for approval."
-  };
 }
 
 async function approveOffer(pool, offerId, approvalStep, comment, req) {
