@@ -301,6 +301,9 @@ async function handleOfferWorkflowCompleted(queryable, event, req) {
     }
   });
 
+  const offerLetterService = require("./offerLetterService");
+  await offerLetterService.ensureAwaitingLetterForOffer(queryable, offerId);
+
   return {
     businessActionCompleted: true,
     offer_id: offerId,

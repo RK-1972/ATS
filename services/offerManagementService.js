@@ -4,6 +4,7 @@ const recruitmentService = require("./recruitmentService");
 const taskService = require("./taskService");
 const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
+const offerLetterService = require("./offerLetterService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "offers.seed.json");
@@ -24,6 +25,77 @@ function getDefaultSeedPayload() {
 
 function generateOfferId() {
   return `OFF-${new Date().getFullYear()}-${String(Date.now()).slice(-5)}`;
+}
+
+const PAY_FREQUENCY_VALUES = [
+  "One Time",
+  "Monthly",
+  "Quarterly",
+  "Half Yearly",
+  "Yearly"
+];
+
+function normalizeCommercialFields(payload = {}) {
+  const variablePay = Number(payload.variable_pay ?? payload.variablePay ?? 0);
+  const joiningBonus = Number(payload.joining_bonus ?? payload.joiningBonus ?? 0);
+  const expectedJoiningDate =
+    payload.expected_joining_date || payload.expectedJoiningDate || null;
+
+  return {
+    expected_joining_date: expectedJoiningDate,
+    variable_pay: Number.isFinite(variablePay) ? variablePay : 0,
+    variable_pay_frequency:
+      variablePay > 0
+        ? payload.variable_pay_frequency || payload.variablePayFrequency || null
+        : null,
+    joining_bonus: Number.isFinite(joiningBonus) ? joiningBonus : 0,
+    joining_bonus_frequency:
+      joiningBonus > 0
+        ? payload.joining_bonus_frequency || payload.joiningBonusFrequency || null
+        : null
+  };
+}
+
+function validateCommercialOfferFields(payload = {}) {
+  const commercial = normalizeCommercialFields(payload);
+  const errors = [];
+
+  if (!commercial.expected_joining_date) {
+    errors.push("Expected joining date is required.");
+  } else {
+    const selected = new Date(commercial.expected_joining_date);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    selected.setHours(0, 0, 0, 0);
+
+    if (Number.isNaN(selected.getTime())) {
+      errors.push("Expected joining date is invalid.");
+    } else if (selected < today) {
+      errors.push("Expected joining date cannot be earlier than today.");
+    }
+  }
+
+  if (commercial.variable_pay < 0) {
+    errors.push("Variable pay cannot be negative.");
+  } else if (commercial.variable_pay > 0) {
+    if (!commercial.variable_pay_frequency) {
+      errors.push("Variable pay frequency is required when variable pay is greater than 0.");
+    } else if (!PAY_FREQUENCY_VALUES.includes(commercial.variable_pay_frequency)) {
+      errors.push("Variable pay frequency is invalid.");
+    }
+  }
+
+  if (commercial.joining_bonus < 0) {
+    errors.push("Joining bonus cannot be negative.");
+  } else if (commercial.joining_bonus > 0) {
+    if (!commercial.joining_bonus_frequency) {
+      errors.push("Joining bonus frequency is required when joining bonus is greater than 0.");
+    } else if (!PAY_FREQUENCY_VALUES.includes(commercial.joining_bonus_frequency)) {
+      errors.push("Joining bonus frequency is invalid.");
+    }
+  }
+
+  return errors;
 }
 
 function computeVariance(approvedBudget, offeredCtc) {
@@ -129,7 +201,12 @@ function mapOfferRow(row) {
     workflowInstanceId: row.workflow_instance_id,
     validityDays: row.validity_days,
     validUntil: row.valid_until,
-    version: Number(row.version)
+    version: Number(row.version),
+    expectedJoiningDate: row.expected_joining_date,
+    variablePay: Number(row.variable_pay ?? 0),
+    variablePayFrequency: row.variable_pay_frequency || null,
+    joiningBonus: Number(row.joining_bonus ?? 0),
+    joiningBonusFrequency: row.joining_bonus_frequency || null
   };
 }
 
@@ -230,6 +307,13 @@ async function createOffer(pool, payload, req) {
     throw httpError("Offered CTC is required.", 400);
   }
 
+  const commercialErrors = validateCommercialOfferFields(context);
+  if (commercialErrors.length) {
+    throw httpError(commercialErrors.join(" "), 400);
+  }
+
+  const commercial = normalizeCommercialFields(context);
+
   const mdValidation = await validateMasterDataReferences(pool, {
     grade: context.grade,
     location: context.location,
@@ -282,8 +366,9 @@ async function createOffer(pool, payload, req) {
       recruiter_id, hiring_manager, candidate_name, position_title, grade, department, location,
       business_unit, employment_type, approved_budget, offered_ctc, variance_amount, variance_pct,
       currency, offer_status, workflow_instance_id, validity_days, valid_until,
+      expected_joining_date, variable_pay, variable_pay_frequency, joining_bonus, joining_bonus_frequency,
       created_by, modified_by, effective_from
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
     [
       offerId,
       context.approved_position_id || null,
@@ -309,6 +394,11 @@ async function createOffer(pool, payload, req) {
       instance.instanceId,
       validityDays,
       validUntil,
+      commercial.expected_joining_date,
+      commercial.variable_pay,
+      commercial.variable_pay_frequency,
+      commercial.joining_bonus,
+      commercial.joining_bonus_frequency,
       user.name,
       user.name,
       new Date()
@@ -321,9 +411,9 @@ async function createOffer(pool, payload, req) {
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
     [
       offerId,
-      Number(context.base_salary || offeredCtc * 0.8),
-      Number(context.variable_pay || offeredCtc * 0.15),
-      Number(context.bonus || offeredCtc * 0.05),
+      Number(context.base_salary || context.compensation?.base_salary || offeredCtc * 0.8),
+      Number(context.compensation?.variable_pay || offeredCtc * 0.15),
+      Number(context.compensation?.bonus || context.bonus || offeredCtc * 0.05),
       Number(context.benefits || 0),
       offeredCtc,
       context.currency || "INR",
@@ -659,6 +749,8 @@ async function approveOffer(pool, offerId, approvalStep, comment, req) {
        WHERE offer_id = $2`,
       [user.name, offerId]
     );
+
+    await offerLetterService.ensureAwaitingLetterForOffer(pool, offerId);
 
     if (offer.workflowInstanceId) {
       await workflowService.advanceWorkflow(

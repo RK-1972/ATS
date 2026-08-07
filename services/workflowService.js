@@ -741,6 +741,11 @@ async function getMyActiveApprovals(pool, req) {
        o.business_unit,
        o.department AS offer_department,
        o.offered_ctc,
+       o.expected_joining_date,
+       o.variable_pay,
+       o.variable_pay_frequency,
+       o.joining_bonus,
+       o.joining_bonus_frequency,
        o.hiring_manager AS offer_hiring_manager,
        d.priority_level,
        d.draft_id,
@@ -894,7 +899,15 @@ async function getMyActiveApprovals(pool, req) {
           return Number(meta.offered_ctc_lpa) * 100000;
         }
         return null;
-      })()
+      })(),
+      expectedJoiningDate:
+        row.expected_joining_date?.toISOString?.()?.slice(0, 10) ||
+        row.expected_joining_date ||
+        null,
+      variablePay: Number(row.variable_pay ?? 0),
+      variablePayFrequency: row.variable_pay_frequency || null,
+      joiningBonus: Number(row.joining_bonus ?? 0),
+      joiningBonusFrequency: row.joining_bonus_frequency || null
     };
   });
 }

@@ -8139,6 +8139,11 @@ const { registerRecruitmentRoutes } = require("./routes/recruitmentRoutes");
 const { registerTaskRoutes } = require("./routes/taskRoutes");
 const { registerInterviewRoutes } = require("./routes/interviewRoutes");
 const { registerOfferRoutes } = require("./routes/offerRoutes");
+const { registerOfferLetterRoutes } = require("./routes/offerLetterRoutes");
+const { registerCompensationRoutes } = require("./routes/compensationRoutes");
+const { registerDocumentTemplateRoutes } = require("./routes/documentTemplateRoutes");
+const { registerPlaceholderRoutes } = require("./routes/placeholderRoutes");
+const { registerDocumentRoutes } = require("./routes/documentRoutes");
 const { registerUserPermissionRoutes } = require("./routes/userPermissionRoutes");
 const {
   registerTalentDemandDraftRoutes
@@ -8156,6 +8161,11 @@ registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerTaskRoutes(app, pool, verifyToken);
 registerInterviewRoutes(app, pool, verifyToken);
 registerOfferRoutes(app, pool, verifyToken);
+registerOfferLetterRoutes(app, pool, verifyToken);
+registerCompensationRoutes(app, pool, verifyToken);
+registerDocumentTemplateRoutes(app, pool, verifyToken, verifyAdmin);
+registerPlaceholderRoutes(app, verifyToken);
+registerDocumentRoutes(app, pool, verifyToken);
 registerUserPermissionRoutes(app, pool, verifyToken, verifyAdmin);
 registerTalentDemandDraftRoutes(app, pool, verifyToken);
 registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin);
