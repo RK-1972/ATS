@@ -326,6 +326,30 @@ async function handleRequisitionStepActivated(queryable, event, req) {
   };
 }
 
+async function resolveRequestorEmployeeCode(queryable, createdBy) {
+  const key = String(createdBy || "").trim();
+
+  if (!key) {
+    return null;
+  }
+
+  const result = await queryable.query(
+    `SELECT employee_code
+     FROM user_mstr
+     WHERE employee_code = $1
+        OR email_id = $1
+        OR full_name = $1
+     LIMIT 1`,
+    [key]
+  );
+
+  if (result.rows[0]?.employee_code) {
+    return result.rows[0].employee_code;
+  }
+
+  return key.includes("@") ? null : key;
+}
+
 /**
  * Clarification requested — mirrors handleBudgetClarificationRequested.
  */
@@ -369,13 +393,19 @@ async function handleRequisitionClarificationRequested(queryable, event, req) {
     }
   });
 
+  const requestorEmployeeCode = await resolveRequestorEmployeeCode(
+    queryable,
+    requisition.created_by
+  );
+
   return {
     businessActionCompleted: true,
     requisition_code: requisition.requisition_code,
     req_id: requisition.req_id || null,
     previous_status: previousStatus,
     req_status: nextStatus,
-    resume_status: resumeStatus
+    resume_status: resumeStatus,
+    requestor_employee_code: requestorEmployeeCode
   };
 }
 

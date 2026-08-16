@@ -1,0 +1,202 @@
+{
+  "namespace": "DEMO_E2E",
+  "marker": "[DEMO_E2E]",
+  "version": "1.0.0",
+  "scenario": {
+    "title": "Senior Software Engineer — End-to-End Recruiting Demo",
+    "department": "IT Infrastructure",
+    "departmentId": "md-departments-itf",
+    "departmentCode": "ITF",
+    "location": "Bengaluru",
+    "positionTitle": "[DEMO_E2E] Senior Software Engineer",
+    "grade": "L5",
+    "headcount": 1,
+    "proposedBudgetInr": 2400000,
+    "employmentType": "Full Time",
+    "priority": "High",
+    "primarySkill": "Java",
+    "secondarySkill": "Spring Boot",
+    "offeredCtcInr": 1800000
+  },
+  "candidate": {
+    "firstName": "Aarav",
+    "lastName": "Sharma",
+    "fullName": "Aarav Sharma",
+    "email": "demo.candidate@optalynx.demo",
+    "mobile": "9876543210",
+    "pan": "DEMOP1234A",
+    "sourceHint": "Employee Referral",
+    "sourceId": "md-candidate_sources-ref",
+    "registrationDestination": "PIPELINE",
+    "experienceYears": "6",
+    "currentCompany": "Demo Technologies Pvt Ltd",
+    "designation": "Senior Software Engineer",
+    "skills": ["Java", "Spring Boot", "PostgreSQL", "React"]
+  },
+  "interview": {
+    "rounds": [
+      {
+        "roundNo": 1,
+        "roundType": "L1 Interview",
+        "roundTypeId": "md-interview_types-l1",
+        "roundTypeCode": "L1"
+      },
+      {
+        "roundNo": 2,
+        "roundType": "L2 Interview",
+        "roundTypeId": "md-interview_types-l2",
+        "roundTypeCode": "L2"
+      }
+    ],
+    "optionalRound": {
+      "roundType": "HR Round",
+      "roundTypeId": "md-interview_types-hr",
+      "roundTypeCode": "HR"
+    },
+    "outcome": "Selected",
+    "scheduleDaysAhead": 7,
+    "scheduleTime": "10:30"
+  },
+  "users": {
+    "passwordEnvVar": "E2E_DEMO_PASSWORD",
+    "defaultPassword": "Demo@Optalynx2026",
+    "accounts": [
+      {
+        "key": "requestor",
+        "employeeCode": "DEMO_E2E_REQ",
+        "fullName": "[DEMO_E2E] Requestor",
+        "email": "demo.requestor@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["BUDGET_REQUESTOR", "REQUISITION_REQUESTOR"]
+      },
+      {
+        "key": "approverL1",
+        "employeeCode": "DEMO_E2E_APP1",
+        "fullName": "[DEMO_E2E] Approver L1",
+        "email": "demo.approver1@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["REQUISITION_APPROVER"]
+      },
+      {
+        "key": "approverL2",
+        "employeeCode": "DEMO_E2E_APP2",
+        "fullName": "[DEMO_E2E] Approver L2",
+        "email": "demo.approver2@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["REQUISITION_APPROVER"]
+      },
+      {
+        "key": "admin",
+        "employeeCode": "DEMO_E2E_ADM",
+        "fullName": "[DEMO_E2E] Admin",
+        "email": "demo.admin@optalynx.demo",
+        "roleName": "Admin",
+        "workAssignments": ["REQUISITION_ASSIGNER"]
+      },
+      {
+        "key": "recruiter",
+        "employeeCode": "DEMO_E2E_REC",
+        "fullName": "[DEMO_E2E] Recruiter",
+        "email": "demo.recruiter@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["RECRUITER", "OFFER_RECRUITER"]
+      },
+      {
+        "key": "interviewer",
+        "employeeCode": "DEMO_E2E_INT",
+        "fullName": "[DEMO_E2E] Interviewer",
+        "email": "demo.interviewer@optalynx.demo",
+        "roleName": "Interviewer",
+        "workAssignments": ["INTERVIEWER"]
+      },
+      {
+        "key": "offerApproverL1",
+        "employeeCode": "DEMO_E2E_OFR1",
+        "fullName": "Offer Approver 1",
+        "email": "offer.approver1@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["REQUISITION_APPROVER"]
+      },
+      {
+        "key": "offerApproverL2",
+        "employeeCode": "DEMO_E2E_OFR2",
+        "fullName": "Offer Approver 2",
+        "email": "offer.approver2@optalynx.demo",
+        "roleName": "Recruiter",
+        "workAssignments": ["REQUISITION_APPROVER"]
+      }
+    ]
+  },
+  "approvalRoutes": [
+    {
+      "key": "budget",
+      "routeName": "[DEMO_E2E] Budget Approval",
+      "description": "Isolated demo budget approval route — 2 steps",
+      "appliesTo": "Budget",
+      "department": "IT Infrastructure",
+      "steps": [
+        { "sequenceNo": 1, "approverKey": "approverL1" },
+        { "sequenceNo": 2, "approverKey": "approverL2" }
+      ]
+    },
+    {
+      "key": "requisition",
+      "routeName": "[DEMO_E2E] Requisition Approval",
+      "description": "Isolated demo requisition approval route — 2 steps",
+      "appliesTo": "Requisition",
+      "department": "IT Infrastructure",
+      "steps": [
+        { "sequenceNo": 1, "approverKey": "approverL1" },
+        { "sequenceNo": 2, "approverKey": "approverL2" }
+      ]
+    },
+    {
+      "key": "offer",
+      "routeName": "[DEMO_E2E] Offer Approval",
+      "description": "Isolated demo offer approval route — 2 steps",
+      "appliesTo": "Offer",
+      "department": "IT Infrastructure",
+      "steps": [
+        { "sequenceNo": 1, "approverKey": "offerApproverL1" },
+        { "sequenceNo": 2, "approverKey": "offerApproverL2" }
+      ]
+    }
+  ],
+  "offerApproval": {
+    "note": "Offer approval uses the isolated [DEMO_E2E] Offer Approval route with dedicated demo approvers. System route policies are suspended during demo setup to avoid resolver overlap.",
+    "systemRouteId": "2",
+    "routeName": "[DEMO_E2E] Offer Approval",
+    "resolverDocumentType": "OFFER",
+    "approvers": [
+      {
+        "sequenceNo": 1,
+        "employeeCode": "DEMO_E2E_OFR1",
+        "fullName": "Offer Approver 1",
+        "email": "offer.approver1@optalynx.demo"
+      },
+      {
+        "sequenceNo": 2,
+        "employeeCode": "DEMO_E2E_OFR2",
+        "fullName": "Offer Approver 2",
+        "email": "offer.approver2@optalynx.demo"
+      }
+    ]
+  },
+  "interviewPanel": {
+    "interviewerKey": "interviewer",
+    "interviewerType": "Internal",
+    "remarks": "[DEMO_E2E] Dedicated demo interviewer panel member"
+  },
+  "identification": {
+    "userEmployeeCodePrefix": "DEMO_E2E_",
+    "userEmailDomain": "@optalynx.demo",
+    "approvalRouteNamePrefix": "[DEMO_E2E]",
+    "candidateEmail": "demo.candidate@optalynx.demo",
+    "positionMarker": "[DEMO_E2E]"
+  },
+  "uiRecordingHints": {
+    "budgetJustification": "Demo budget for [DEMO_E2E] Senior Software Engineer hiring.",
+    "requisitionJobTitle": "[DEMO_E2E] Senior Software Engineer",
+    "offerComment": "[DEMO_E2E] Offer submitted for demo recording."
+  }
+}

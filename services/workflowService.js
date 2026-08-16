@@ -1371,10 +1371,16 @@ async function requestClarificationMyActiveApproval(pool, taskId, comments, req)
       domainClarification?.businessActionCompleted
       && domainClarification.requestor_employee_code
     ) {
+      const clarificationTitle = domainClarification.budget_request_id
+        ? `Clarify Budget — ${domainClarification.budget_request_id}`
+        : domainClarification.requisition_code
+          ? `Clarify Requisition — ${domainClarification.requisition_code}`
+          : `Clarify — ${task.instance_id}`;
+
       requestorTaskId = await createTask(client, task.instance_id, {
         stageKey: stageKey || "clarification",
         taskType: "clarification",
-        title: `Clarify Budget — ${domainClarification.budget_request_id || task.instance_id}`,
+        title: clarificationTitle,
         status: TASK_STATUS.PENDING,
         assignee: domainClarification.requestor_employee_code,
         assigneeRole: "Requestor",
@@ -2329,6 +2335,24 @@ async function submitClarification(pool, instanceId, comments, req) {
       `SELECT assignee FROM wf_assignments WHERE assignment_id = $1`,
       [reactivatedAssignmentId]
     );
+
+    const reactivatedAssigneeName =
+      assigneeResult.rows[0]?.assignee || task.assignee || null;
+
+    await appendHistory(client, instanceId, {
+      eventType: "ClarificationResumed",
+      stageKey,
+      actor: reactivatedAssigneeName || user.name,
+      actorRole: task.assignee_role || "Approver",
+      action: "Approval returned to current approver",
+      comments: null,
+      metadata: {
+        taskId: heldTaskId,
+        assignmentId: reactivatedAssignmentId,
+        taskStatus: TASK_STATUS.PENDING,
+        instanceStatus: INSTANCE_STATUS.RUNNING
+      }
+    });
 
     const domainResume = await workflowDomainHooks.notifyClarificationSubmitted(
       client,

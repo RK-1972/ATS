@@ -18,6 +18,19 @@ function registerInterviewRoutes(app, pool, verifyToken) {
     }
   });
 
+  app.get("/api/v1/interviews/progress/:mapId", verifyToken, async (req, res) => {
+    try {
+      const data = await interviewService.getInterviewProgressByMapId(pool, req.params.mapId);
+      res.json({
+        success: true,
+        message: "Interview progress loaded.",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
   app.get("/api/v1/interviews/:id", verifyToken, async (req, res) => {
     try {
       const interview = await interviewService.getInterview(pool, req.params.id);

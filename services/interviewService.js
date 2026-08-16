@@ -1162,9 +1162,139 @@ async function seedConfiguration(pool, payload, user = { name: "System Seed", ro
   }
 }
 
+async function getInterviewProgressByMapId(pool, mapId) {
+  const normalizedMapId = String(mapId || "").trim();
+
+  if (!normalizedMapId) {
+    throw httpError("map_id is required.", 400);
+  }
+
+  let mapping = null;
+
+  const enterpriseMapping = await pool.query(
+    `SELECT rcm.map_id, rcm.stage_name, rcm.candidate_id, rcm.requisition_code,
+            cm.candidate_code,
+            CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name
+     FROM rm_candidate_mappings rcm
+     LEFT JOIN cand_mstr cm ON cm.candidate_id = rcm.candidate_id
+     WHERE rcm.map_id = $1
+     LIMIT 1`,
+    [normalizedMapId]
+  );
+
+  mapping = enterpriseMapping.rows[0] || null;
+
+  if (!mapping && await tableExists(pool, "candidate_req_map")) {
+    const legacyMapping = await pool.query(
+      `SELECT crm.map_id, crm.stage_name, crm.candidate_id,
+              cm.candidate_code,
+              CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+              rm.req_code AS requisition_code
+       FROM candidate_req_map crm
+       LEFT JOIN cand_mstr cm ON cm.candidate_id = crm.candidate_id
+       LEFT JOIN req_mstr rm ON rm.req_id = crm.req_id
+       WHERE crm.map_id = $1
+       LIMIT 1`,
+      [normalizedMapId]
+    );
+    mapping = legacyMapping.rows[0] || null;
+  }
+
+  let interviewRows = [];
+
+  const enterpriseInterviews = await pool.query(
+    `SELECT
+        i.interview_id,
+        i.schedule_id,
+        i.map_id,
+        i.round_no,
+        i.round_type,
+        i.interview_date,
+        i.interview_time,
+        i.interview_status,
+        i.feedback_submitted,
+        i.final_outcome,
+        i.remarks,
+        i.modified_on,
+        COALESCE(ipm.interviewer_name, ipm2.interviewer_name) AS interviewer_name,
+        ipa.assignment_status
+     FROM im_interviews i
+     LEFT JOIN LATERAL (
+       SELECT panel_id, assignment_status
+       FROM im_panel_assignments
+       WHERE interview_id = i.interview_id
+       ORDER BY assigned_on DESC NULLS LAST
+       LIMIT 1
+     ) ipa ON true
+     LEFT JOIN interview_panel_mstr ipm ON ipm.panel_id = ipa.panel_id
+     LEFT JOIN interview_schedule_trn ist ON ist.schedule_id = i.schedule_id
+     LEFT JOIN interview_panel_mstr ipm2 ON ipm2.panel_id = ist.interviewer_id
+     WHERE i.map_id = $1
+     ORDER BY COALESCE(i.round_no, 0) ASC,
+              i.interview_date ASC NULLS LAST,
+              i.interview_time ASC NULLS LAST`,
+    [normalizedMapId]
+  );
+
+  interviewRows = enterpriseInterviews.rows;
+
+  if (interviewRows.length === 0 && await tableExists(pool, "interview_schedule_trn")) {
+    const legacyInterviews = await pool.query(
+      `SELECT
+          ist.schedule_id,
+          ist.map_id,
+          ist.round_no,
+          ist.round_type,
+          ist.interview_date,
+          ist.interview_time,
+          ist.interview_status,
+          ist.feedback_submitted,
+          ist.remarks,
+          ist.updated_on AS modified_on,
+          ipm.interviewer_name,
+          NULL::varchar AS final_outcome,
+          NULL::varchar AS assignment_status
+       FROM interview_schedule_trn ist
+       LEFT JOIN interview_panel_mstr ipm ON ipm.panel_id = ist.interviewer_id
+       WHERE ist.map_id = $1
+       ORDER BY COALESCE(ist.round_no, 0) ASC,
+                ist.interview_date ASC NULLS LAST,
+                ist.interview_time ASC NULLS LAST`,
+      [normalizedMapId]
+    );
+    interviewRows = legacyInterviews.rows;
+  }
+
+  const rounds = interviewRows.map((row) => ({
+    interviewId: row.interview_id || null,
+    scheduleId: row.schedule_id,
+    roundNo: row.round_no,
+    roundType: row.round_type,
+    interviewDate: row.interview_date,
+    interviewTime: row.interview_time,
+    interviewStatus: row.interview_status,
+    feedbackSubmitted: Boolean(row.feedback_submitted),
+    finalOutcome: row.final_outcome || null,
+    interviewerName: row.interviewer_name || null,
+    assignmentStatus: row.assignment_status || null,
+    remarks: row.remarks || null,
+    actionOn: row.modified_on || null
+  }));
+
+  return {
+    mapId: normalizedMapId,
+    candidateCode: mapping?.candidate_code || null,
+    candidateName: mapping?.candidate_name || null,
+    requisitionCode: mapping?.requisition_code || null,
+    currentStage: mapping?.stage_name || null,
+    rounds
+  };
+}
+
 module.exports = {
   getDefaultSeedPayload,
   getInterviewBundle,
+  getInterviewProgressByMapId,
   scheduleInterview,
   linkLegacySchedule,
   getInterview,

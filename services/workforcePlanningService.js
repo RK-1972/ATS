@@ -1,6 +1,8 @@
 const businessRulesService = require("./businessRulesService");
 const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
+const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
+const { assertCanCreateRequisition } = require("./requisitionCapabilityAuth");
 const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const userPermissionRepository = require("../repositories/userPermissionRepository");
@@ -153,6 +155,8 @@ async function buildApprovalPolicySnapshot(pool, documentType, criteria) {
     route_name: policy.route_name,
     route_applies_to: policy.route_applies_to,
     department: policy.department,
+    designations: resolvePolicyDesignationsFromPolicy(policy),
+    grades: resolvePolicyGradesFromPolicy(policy),
     designation: policy.designation,
     grade: policy.grade,
     min_amount:
@@ -168,6 +172,22 @@ async function buildApprovalPolicySnapshot(pool, documentType, criteria) {
     effective_to: policy.effective_to,
     frozen_on: new Date().toISOString()
   };
+}
+
+function resolvePolicyDesignationsFromPolicy(policy) {
+  if (Array.isArray(policy?.designations) && policy.designations.length) {
+    return policy.designations;
+  }
+
+  return policy?.designation ? [policy.designation] : null;
+}
+
+function resolvePolicyGradesFromPolicy(policy) {
+  if (Array.isArray(policy?.grades) && policy.grades.length) {
+    return policy.grades;
+  }
+
+  return policy?.grade ? [policy.grade] : null;
 }
 
 /**
@@ -241,9 +261,773 @@ function buildBundle(row) {
   };
 }
 
-async function getWorkforceBundle(pool) {
+const WORKFORCE_REQUISITION_QUEUE = {
+  approved: REQUISITION_STATUS.APPROVED,
+  clarification: REQUISITION_STATUS.CLARIFICATION_REQUESTED,
+  rejected: REQUISITION_STATUS.REJECTED
+};
+
+function resolveWorkforceRequisitionQueue(queueKey) {
+  const key = String(queueKey || "").trim().toLowerCase();
+  const status = WORKFORCE_REQUISITION_QUEUE[key];
+
+  if (!status) {
+    throw httpError(
+      "Invalid requisition queue. Use approved, clarification, or rejected.",
+      400
+    );
+  }
+
+  return { key, status };
+}
+
+/**
+ * rm_requisitions.created_by stores userContext(req).name at creation time
+ * (full_name, else email_id). JWT carries employee_code + email_id only.
+ * Match all known requestor identifiers — same pattern as interview-candidates.
+ */
+async function resolveRequisitionRequestorCreatedByKeys(pool, req) {
+  const employeeCode = String(req?.user?.employee_code || "").trim();
+  const emailId = String(req?.user?.email_id || "").trim();
+  const keys = new Set();
+
+  if (employeeCode) {
+    keys.add(employeeCode);
+  }
+
+  if (emailId) {
+    keys.add(emailId);
+  }
+
+  const contextName = String(userContext(req).name || "").trim();
+  if (contextName && contextName !== "System User") {
+    keys.add(contextName);
+  }
+
+  if (employeeCode) {
+    const nameLookup = await pool.query(
+      `SELECT full_name
+       FROM user_mstr
+       WHERE employee_code = $1
+       LIMIT 1`,
+      [employeeCode]
+    );
+    const fullName = String(nameLookup.rows[0]?.full_name || "").trim();
+    if (fullName) {
+      keys.add(fullName);
+    }
+  }
+
+  return [...keys].filter(Boolean);
+}
+
+function mapWorkforceRequisitionQueueRow(row) {
+  return {
+    requisition_code: row.requisition_code,
+    approved_position_id: row.approved_position_id,
+    position_title: row.position_title,
+    department: row.department,
+    project: row.business_unit || row.department || null,
+    client: row.business_unit || null,
+    grade: row.grade,
+    req_status: row.req_status,
+    created_by: row.created_by,
+    created_on: row.created_on?.toISOString?.() || row.created_on || null,
+    modified_on: row.modified_on?.toISOString?.() || row.modified_on || null,
+    hiring_manager: row.hiring_manager || null,
+    workflow_comment: row.workflow_comment || null
+  };
+}
+
+/**
+ * Keep only approved positions still available for requisition creation.
+ * Consumed positions are excluded using rm_requisitions.approved_position_id.
+ */
+async function enrichApprovedPositionsCatalogue(pool, draft) {
+  const next = clonePayload(draft);
+  const positions = Array.isArray(next.approved_positions)
+    ? next.approved_positions
+    : [];
+
+  if (!positions.length) {
+    return next;
+  }
+
+  const positionIds = positions.map((item) => item.id).filter(Boolean);
+
+  const result = await pool.query(
+    `SELECT approved_position_id
+     FROM rm_requisitions
+     WHERE approved_position_id = ANY($1::text[])`,
+    [positionIds]
+  );
+
+  const consumedIds = new Set(
+    result.rows.map((row) => String(row.approved_position_id || "").trim())
+  );
+
+  next.approved_positions = positions.filter(
+    (position) => !consumedIds.has(String(position.id || "").trim())
+  );
+
+  return next;
+}
+
+async function getRequisitionQueueCounts(pool, req) {
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+
+  if (!ownerKeys.length) {
+    return {
+      approved: 0,
+      clarification: 0,
+      rejected: 0
+    };
+  }
+
+  const result = await pool.query(
+    `SELECT req_status, COUNT(*)::int AS total
+     FROM rm_requisitions
+     WHERE created_by = ANY($1::text[])
+       AND req_status = ANY($2::text[])
+     GROUP BY req_status`,
+    [
+      ownerKeys,
+      [
+        REQUISITION_STATUS.APPROVED,
+        REQUISITION_STATUS.CLARIFICATION_REQUESTED,
+        REQUISITION_STATUS.REJECTED
+      ]
+    ]
+  );
+
+  const counts = {
+    approved: 0,
+    clarification: 0,
+    rejected: 0
+  };
+
+  for (const row of result.rows) {
+    if (row.req_status === REQUISITION_STATUS.APPROVED) {
+      counts.approved = row.total;
+    } else if (row.req_status === REQUISITION_STATUS.CLARIFICATION_REQUESTED) {
+      counts.clarification = row.total;
+    } else if (row.req_status === REQUISITION_STATUS.REJECTED) {
+      counts.rejected = row.total;
+    }
+  }
+
+  return counts;
+}
+
+async function listWorkforceRequisitionQueue(pool, queueKey, req) {
+  await assertCanCreateRequisition(pool, req);
+
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+
+  if (!ownerKeys.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view requisitions.",
+      403
+    );
+  }
+
+  const { key, status } = resolveWorkforceRequisitionQueue(queueKey);
+
+  const result = await pool.query(
+    `SELECT
+       r.requisition_code,
+       r.approved_position_id,
+       r.position_title,
+       r.department,
+       r.business_unit,
+       r.grade,
+       r.req_status,
+       r.created_by,
+       r.created_on,
+       r.modified_on,
+       r.hiring_manager,
+       r.workflow_instance_id,
+       (
+         SELECT h.comments
+         FROM wf_history h
+         WHERE h.instance_id = r.workflow_instance_id
+           AND (
+             ($3 = $4 AND h.event_type = 'ClarificationRequested')
+             OR ($3 = $5 AND h.event_type = 'WorkflowRejected')
+           )
+         ORDER BY h.recorded_on DESC
+         LIMIT 1
+       ) AS workflow_comment
+     FROM rm_requisitions r
+     WHERE r.created_by = ANY($1::text[])
+       AND r.req_status = $2
+     ORDER BY COALESCE(r.modified_on, r.created_on) DESC,
+              r.requisition_code DESC`,
+    [
+      ownerKeys,
+      status,
+      status,
+      REQUISITION_STATUS.CLARIFICATION_REQUESTED,
+      REQUISITION_STATUS.REJECTED
+    ]
+  );
+
+  return {
+    queue: key,
+    status,
+    rows: result.rows.map(mapWorkforceRequisitionQueueRow)
+  };
+}
+
+function formatInspectorDate(value) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed.toISOString();
+}
+
+function mapHistoryEventLabel(row) {
+  const action = String(row.action || "").trim();
+  if (action) {
+    return action;
+  }
+
+  const labels = {
+    WorkflowStarted: "Requisition Raised",
+    TaskCompleted: "Approval Step Completed",
+    TaskActivated: "Submitted for Next Approval",
+    ClarificationRequested: "Clarification Requested",
+    WorkflowRejected: "Rejected",
+    WorkflowCompleted: "Approved",
+    RequisitionCreated: "Requisition Created",
+    TaskRejected: "Approval Rejected",
+    StageChanged: "Workflow Updated"
+  };
+
+  return labels[row.event_type] || row.event_type || "Workflow Event";
+}
+
+function mapApprovalTaskStepStatus(taskStatus, requisitionStatus) {
+  const normalized = String(taskStatus || "").trim().toLowerCase();
+
+  if (normalized === "completed") {
+    return "Approved";
+  }
+
+  if (normalized === "cancelled") {
+    return "Cancelled";
+  }
+
+  if (String(requisitionStatus || "").trim() === REQUISITION_STATUS.REJECTED) {
+    return normalized === "pending" ? "Skipped" : "Pending";
+  }
+
+  if (normalized === "pending" || normalized === "waiting") {
+    return "Pending";
+  }
+
+  return taskStatus || "Pending";
+}
+
+async function resolveRequestorProfile(pool, createdBy) {
+  const key = String(createdBy || "").trim();
+
+  if (!key) {
+    return {
+      name: null,
+      employee_code: null,
+      email_id: null
+    };
+  }
+
+  const result = await pool.query(
+    `SELECT employee_code, full_name, email_id
+     FROM user_mstr
+     WHERE employee_code = $1
+        OR email_id = $1
+        OR full_name = $1
+     LIMIT 1`,
+    [key]
+  );
+
+  if (result.rows[0]) {
+    return {
+      name: result.rows[0].full_name || key,
+      employee_code: result.rows[0].employee_code || null,
+      email_id: result.rows[0].email_id || null
+    };
+  }
+
+  return {
+    name: key,
+    employee_code: key.includes("@") ? null : key,
+    email_id: key.includes("@") ? key : null
+  };
+}
+
+async function resolveEmployeeDisplayName(pool, employeeCode) {
+  const code = String(employeeCode || "").trim();
+
+  if (!code) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `SELECT full_name, email_id
+     FROM user_mstr
+     WHERE employee_code = $1
+     LIMIT 1`,
+    [code]
+  );
+
+  if (result.rows[0]?.full_name) {
+    return result.rows[0].full_name;
+  }
+
+  return code;
+}
+
+function mapRequisitionInspectorDetails(row) {
+  return {
+    requisition_code: row.requisition_code,
+    approved_position_id: row.approved_position_id || null,
+    position_title: row.position_title || null,
+    department: row.department || null,
+    business_unit: row.business_unit || null,
+    location: row.location || null,
+    employment_type: row.employment_type || null,
+    headcount: row.headcount ?? null,
+    grade: row.grade || null,
+    primary_skill: row.primary_skill || null,
+    job_description: row.job_description || null,
+    budget_approved: row.budget_approved ?? null,
+    hiring_manager: row.hiring_manager || null,
+    priority_level: row.priority_level || null,
+    target_date: formatInspectorDate(row.target_date),
+    req_status: row.req_status || null,
+    created_on: formatInspectorDate(row.created_on),
+    modified_on: formatInspectorDate(row.modified_on),
+    workflow_instance_id: row.workflow_instance_id || null,
+    experience_min: row.experience_min ?? null,
+    experience_max: row.experience_max ?? null
+  };
+}
+
+async function getRequisitionInspectorDetail(pool, code, req) {
+  await assertCanCreateRequisition(pool, req);
+
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+
+  if (!ownerKeys.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view requisitions.",
+      403
+    );
+  }
+
+  const requisitionCode = String(code || "").trim();
+
+  if (!requisitionCode) {
+    throw httpError("Requisition code is required.", 400);
+  }
+
+  const recruitmentService = require("./recruitmentService");
+  const row = await recruitmentService.loadRequisitionByCode(pool, requisitionCode);
+
+  if (!row) {
+    throw httpError("Requisition not found.", 404);
+  }
+
+  const createdByKey = String(row.created_by || "").trim();
+
+  if (!createdByKey || !ownerKeys.includes(createdByKey)) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view this requisition.",
+      403
+    );
+  }
+
+  const requestor = await resolveRequestorProfile(pool, row.created_by);
+  const details = mapRequisitionInspectorDetails(row);
+
+  let approval_steps = [];
+  let timeline = [];
+
+  if (row.workflow_instance_id) {
+    const inspector = await loadBudgetWorkflowInspectorData(
+      pool,
+      {
+        clarification_resume_status: row.req_status,
+        status: row.req_status
+      },
+      row.workflow_instance_id
+    );
+
+    approval_steps = inspector.approval_steps;
+    timeline = inspector.workflow_timeline.map((event) => ({
+      event: event.event,
+      event_type: event.event_type,
+      actor: event.actor || null,
+      actor_role: event.actor_role || null,
+      recorded_on: event.recorded_on,
+      comment: event.comment || null,
+      turnaround: event.turnaround || null
+    }));
+
+    const canResubmit =
+      row.req_status === REQUISITION_STATUS.CLARIFICATION_REQUESTED
+      && Boolean(createdByKey)
+      && ownerKeys.includes(createdByKey);
+
+    return {
+      requisition: details,
+      requestor,
+      approval_steps,
+      timeline,
+      clarification_rounds: inspector.clarification_rounds,
+      clarification_pending: inspector.clarification_pending,
+      can_resubmit: canResubmit,
+      workflow_instance_id: row.workflow_instance_id
+    };
+  }
+
+  return {
+    requisition: details,
+    requestor,
+    approval_steps,
+    timeline: timeline.length
+      ? timeline
+      : row.created_on
+        ? [{
+            event: "Requisition Raised",
+            event_type: "RequisitionRaised",
+            actor: requestor.name || row.created_by || null,
+            actor_role: "Requisition Requestor",
+            recorded_on: formatInspectorDate(row.created_on),
+            comment: null
+          }]
+        : [],
+    clarification_rounds: [],
+    clarification_pending: null,
+    can_resubmit: false,
+    workflow_instance_id: row.workflow_instance_id || null
+  };
+}
+
+function resolveRequisitionWorkflowInstanceId(requisition) {
+  return (
+    requisition?.workflow_instance_id
+    || `WF-RM-${requisition?.requisition_code || ""}`
+  );
+}
+
+async function findActiveRequisitionApprovalTask(pool, requisitionCode, instanceId) {
+  const candidateIds = Array.from(
+    new Set(
+      [instanceId, `WF-RM-${requisitionCode}`, requisitionCode]
+        .filter(Boolean)
+        .map((value) => String(value))
+    )
+  );
+
+  const result = await pool.query(
+    `SELECT
+       t.task_id,
+       t.instance_id,
+       t.title,
+       t.status AS task_status,
+       t.assignee,
+       a.assignment_id,
+       a.assignee AS assignment_assignee,
+       a.active
+     FROM wf_tasks t
+     INNER JOIN wf_assignments a
+       ON a.task_id = t.task_id
+      AND a.active IS TRUE
+     WHERE t.instance_id = ANY($1::text[])
+       AND LOWER(TRIM(t.status)) = 'pending'
+       AND LOWER(TRIM(COALESCE(t.task_type, 'approval'))) IN ('approval', 'approve')
+     ORDER BY t.task_id ASC
+     LIMIT 1`,
+    [candidateIds]
+  );
+
+  if (!result.rows[0]) {
+    throw httpError(
+      `No active approval task found for requisition ${requisitionCode}.`,
+      409
+    );
+  }
+
+  return result.rows[0];
+}
+
+async function getRequisitionApprovalActionContext(pool, requisitionCode, req) {
+  const code = String(requisitionCode || "").trim();
+
+  if (!code) {
+    throw httpError("Requisition code is required.", 400);
+  }
+
+  const recruitmentService = require("./recruitmentService");
+  const requisition = await recruitmentService.loadRequisitionByCode(pool, code);
+
+  if (!requisition) {
+    throw httpError("Requisition not found.", 404);
+  }
+
+  const instanceId = resolveRequisitionWorkflowInstanceId(requisition);
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+  const isRequestor = ownerKeys.includes(String(requisition.created_by || "").trim());
+  const isAdmin = String(req.user?.role_name || "").toLowerCase() === "admin";
+
+  let activeTask = null;
+  try {
+    activeTask = await findActiveRequisitionApprovalTask(pool, code, instanceId);
+  } catch (_error) {
+    activeTask = null;
+  }
+
+  const assignee = String(
+    activeTask?.assignment_assignee || activeTask?.assignee || ""
+  ).trim();
+  const canAct =
+    Boolean(activeTask)
+    && Boolean(employeeCode)
+    && employeeCode === assignee
+    && [
+      REQUISITION_STATUS.PENDING_LEVEL_1,
+      REQUISITION_STATUS.PENDING_LEVEL_2
+    ].includes(requisition.req_status);
+
+  const canResubmit =
+    requisition.req_status === REQUISITION_STATUS.CLARIFICATION_REQUESTED
+    && (isRequestor || isAdmin);
+
+  const inspector = await loadBudgetWorkflowInspectorData(
+    pool,
+    {
+      clarification_resume_status: requisition.req_status,
+      status: requisition.req_status
+    },
+    instanceId
+  );
+  const requestor = await resolveRequestorProfile(pool, requisition.created_by);
+
+  return {
+    requisition_code: code,
+    status: requisition.req_status,
+    workflow_instance_id: instanceId,
+    task_id: activeTask?.task_id || null,
+    assignee: assignee || null,
+    can_act: canAct,
+    can_resubmit: canResubmit,
+    is_read_only:
+      requisition.req_status !== REQUISITION_STATUS.CLARIFICATION_REQUESTED,
+    clarification_pending: inspector.clarification_pending,
+    clarification_rounds: inspector.clarification_rounds,
+    workflow_timeline: inspector.workflow_timeline,
+    approval_steps: inspector.approval_steps,
+    submitted_on: inspector.submitted_on,
+    requestor_name: requestor.name || null
+  };
+}
+
+async function submitRequisitionClarification(pool, requisitionCode, comments, req) {
+  const clarificationComments = String(comments || "").trim();
+  if (!clarificationComments) {
+    throw httpError("Clarification response is required.", 400);
+  }
+
+  const code = String(requisitionCode || "").trim();
+  if (!code) {
+    throw httpError("Requisition code is required.", 400);
+  }
+
+  const recruitmentService = require("./recruitmentService");
+  const requisition = await recruitmentService.loadRequisitionByCode(pool, code);
+
+  if (!requisition) {
+    throw httpError("Requisition not found.", 404);
+  }
+
+  if (requisition.req_status !== REQUISITION_STATUS.CLARIFICATION_REQUESTED) {
+    throw httpError(
+      `Requisition ${code} is not awaiting clarification.`,
+      409
+    );
+  }
+
+  const requestor = await resolveRequestorProfile(pool, requisition.created_by);
+  const requestorCode = String(requestor.employee_code || "").trim();
+  const actorCode = String(req.user?.employee_code || "").trim();
+  const isAdmin = String(req.user?.role_name || "").toLowerCase() === "admin";
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+  const createdByKey = String(requisition.created_by || "").trim();
+  const isOwner = Boolean(createdByKey) && ownerKeys.includes(createdByKey);
+
+  if (
+    !isAdmin
+    && !isOwner
+    && requestorCode
+    && actorCode
+    && requestorCode !== actorCode
+  ) {
+    throw httpError(
+      "Only the original requestor may resubmit clarification.",
+      403
+    );
+  }
+
+  if (!requisition.workflow_instance_id) {
+    throw httpError("No workflow instance linked to this requisition.", 400);
+  }
+
+  const result = await workflowService.submitClarification(
+    pool,
+    requisition.workflow_instance_id,
+    clarificationComments,
+    req
+  );
+
+  const updated = await recruitmentService.loadRequisitionByCode(pool, code);
+
+  return {
+    requisition: updated,
+    workflowResult: result,
+    toastMessage:
+      result.toastMessage || "Clarification submitted. Workflow resumed."
+  };
+}
+
+function resolveLatestActivityFromDraftItem(item) {
+  const timestamps = [];
+
+  (item.history || []).forEach((entry) => {
+    if (entry?.date) {
+      const parsed = new Date(entry.date).getTime();
+      if (!Number.isNaN(parsed)) {
+        timestamps.push(parsed);
+      }
+    }
+  });
+
+  (item.timeline || []).forEach((entry) => {
+    if (entry?.date) {
+      const parsed = new Date(entry.date).getTime();
+      if (!Number.isNaN(parsed)) {
+        timestamps.push(parsed);
+      }
+    }
+  });
+
+  if (item.submitted_on) {
+    const parsed = new Date(item.submitted_on).getTime();
+    if (!Number.isNaN(parsed)) {
+      timestamps.push(parsed);
+    }
+  }
+
+  return timestamps.length ? Math.max(...timestamps) : 0;
+}
+
+async function enrichApprovalQueueWithLatestActivity(pool, config) {
+  const queue = config.approval_queue || [];
+  if (!queue.length) {
+    return config;
+  }
+
+  const instanceIds = Array.from(
+    new Set(
+      queue
+        .map((item) => item.workflow_instance_id || (item.id ? `WF-BR-${item.id}` : null))
+        .filter(Boolean)
+        .map(String)
+    )
+  );
+
+  const activityMap = new Map();
+
+  if (instanceIds.length) {
+    const result = await pool.query(
+      `SELECT instance_id, MAX(recorded_on) AS latest_activity_at
+       FROM wf_history
+       WHERE instance_id = ANY($1::text[])
+       GROUP BY instance_id`,
+      [instanceIds]
+    );
+
+    result.rows.forEach((row) => {
+      activityMap.set(String(row.instance_id), row.latest_activity_at);
+    });
+  }
+
+  const enrichedQueue = queue.map((item) => {
+    const instanceId = String(item.workflow_instance_id || `WF-BR-${item.id}`);
+    const wfLatest = activityMap.get(instanceId);
+    const wfTime = wfLatest ? new Date(wfLatest).getTime() : 0;
+    const draftTime = resolveLatestActivityFromDraftItem(item);
+    const latestMs = wfTime || draftTime;
+
+    return {
+      ...item,
+      latest_activity_at: latestMs
+        ? new Date(latestMs).toISOString()
+        : item.latest_activity_at || null
+    };
+  });
+
+  enrichedQueue.sort((left, right) => {
+    const leftTime = left.latest_activity_at
+      ? new Date(left.latest_activity_at).getTime()
+      : resolveLatestActivityFromDraftItem(left);
+    const rightTime = right.latest_activity_at
+      ? new Date(right.latest_activity_at).getTime()
+      : resolveLatestActivityFromDraftItem(right);
+
+    if (rightTime !== leftTime) {
+      return rightTime - leftTime;
+    }
+
+    return String(right.id || "").localeCompare(String(left.id || ""));
+  });
+
+  return {
+    ...config,
+    approval_queue: enrichedQueue
+  };
+}
+
+async function getWorkforceBundle(pool, req = null) {
   const row = await ensureConfigState(pool);
-  return buildBundle(row);
+  const bundle = buildBundle(row);
+  bundle.config = await enrichApprovedPositionsCatalogue(pool, bundle.config);
+  bundle.config = await enrichApprovalQueueWithLatestActivity(pool, bundle.config);
+
+  if (req?.user?.employee_code) {
+    try {
+      await assertCanCreateRequisition(pool, req);
+      bundle.config.requisition_queue_counts = await getRequisitionQueueCounts(
+        pool,
+        req
+      );
+    } catch (_error) {
+      bundle.config.requisition_queue_counts = {
+        approved: 0,
+        clarification: 0,
+        rejected: 0
+      };
+    }
+  }
+
+  return bundle;
 }
 
 async function persistDraft(pool, draft, userName) {
@@ -923,9 +1707,14 @@ async function submitBudgetRequest(pool, requestId, req) {
 
     await client.query("COMMIT");
 
+    const bundle = await getWorkforceBundle(pool);
+    const updated =
+      bundle.config.approval_queue.find((item) => item.id === requestId)
+      || bundle.config.budget_requests.find((item) => item.id === requestId);
+
     return {
-      workforce: draft,
-      request: queueItem,
+      workforce: bundle.config,
+      request: updated || queueItem,
       toastMessage: `Budget request ${requestId} submitted for Level-1 approval.`
     };
   } catch (error) {
@@ -1163,6 +1952,241 @@ async function submitBudgetClarification(pool, requestId, comments, req) {
   };
 }
 
+function parseExecutionContext(raw) {
+  if (raw && typeof raw === "object") {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function formatTurnaroundLabel(startIso, endIso) {
+  if (!startIso || !endIso) {
+    return null;
+  }
+
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return null;
+  }
+
+  const ms = end.getTime() - start.getTime();
+  if (ms < 0) {
+    return null;
+  }
+
+  const totalMinutes = Math.floor(ms / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m`;
+  }
+
+  return "< 1m";
+}
+
+function mapBudgetWorkflowEventLabel(row) {
+  const action = String(row.action || "").trim();
+  if (action) {
+    return action;
+  }
+
+  const labels = {
+    WorkflowStarted: "Budget Submitted",
+    TaskActivated: "Approval Pending",
+    ClarificationRequested: "Clarification Requested",
+    ClarificationSubmitted: "Clarification Response Submitted",
+    ClarificationResumed: "Approval Returned to Current Approver",
+    TaskCompleted: "Approved",
+    TaskRejected: "Rejected",
+    WorkflowCompleted: "Final Approval",
+    WorkflowRejected: "Rejected"
+  };
+
+  return labels[row.event_type] || row.event_type || "Workflow Event";
+}
+
+function mapBudgetApprovalStepStatus(taskStatus) {
+  const normalized = String(taskStatus || "").trim().toLowerCase();
+
+  if (normalized === "completed") {
+    return "Completed";
+  }
+
+  if (normalized === "cancelled") {
+    return "Cancelled";
+  }
+
+  if (normalized === "waiting for clarification") {
+    return "Waiting for Clarification";
+  }
+
+  if (normalized === "pending") {
+    return "Pending";
+  }
+
+  if (normalized === "waiting") {
+    return "Waiting";
+  }
+
+  return taskStatus || "Pending";
+}
+
+function buildClarificationRounds(executionContext) {
+  const rounds = [];
+  const completed = Array.isArray(executionContext.clarification_history)
+    ? executionContext.clarification_history
+    : [];
+
+  completed.forEach((entry, index) => {
+    rounds.push({
+      round: index + 1,
+      requested_by: entry.requested_by || null,
+      requested_by_role: entry.requested_by_role || null,
+      requested_on: formatInspectorDate(entry.requested_on),
+      request_comments: entry.comments || null,
+      responded_by: entry.submitted_by || null,
+      responded_by_role: entry.submitted_by_role || null,
+      responded_on: formatInspectorDate(entry.submitted_on),
+      response_comments: entry.response_comments || null,
+      turnaround: formatTurnaroundLabel(entry.requested_on, entry.submitted_on),
+      pending: false
+    });
+  });
+
+  const current = executionContext.clarification;
+  if (current && String(current.status || "").toLowerCase() === "requested") {
+    rounds.push({
+      round: rounds.length + 1,
+      requested_by: current.requested_by || null,
+      requested_by_role: current.requested_by_role || null,
+      requested_on: formatInspectorDate(current.requested_on),
+      request_comments: current.comments || null,
+      responded_by: null,
+      responded_on: null,
+      response_comments: null,
+      turnaround: null,
+      pending: true
+    });
+  }
+
+  return rounds;
+}
+
+async function loadBudgetWorkflowInspectorData(pool, request, instanceId) {
+  const result = {
+    workflow_timeline: [],
+    clarification_rounds: [],
+    clarification_pending: null,
+    approval_steps: [],
+    submitted_on: null
+  };
+
+  if (!instanceId) {
+    return result;
+  }
+
+  const instanceResult = await pool.query(
+    `SELECT status, execution_context, started_on
+     FROM wf_instances
+     WHERE instance_id = $1`,
+    [instanceId]
+  );
+  const instance = instanceResult.rows[0];
+
+  if (!instance) {
+    return result;
+  }
+
+  result.submitted_on = formatInspectorDate(instance.started_on);
+  const executionContext = parseExecutionContext(instance.execution_context);
+  result.clarification_rounds = buildClarificationRounds(executionContext);
+
+  const pendingRound = result.clarification_rounds.find((item) => item.pending);
+  if (pendingRound) {
+    result.clarification_pending = {
+      ...pendingRound,
+      resume_status: request.clarification_resume_status || request.status
+    };
+  }
+
+  const tasksResult = await pool.query(
+    `SELECT task_id, title, status, assignee, assignee_role, completed_on, created_on
+     FROM wf_tasks
+     WHERE instance_id = $1
+       AND LOWER(TRIM(COALESCE(task_type, 'approval'))) IN ('approval', 'approve')
+     ORDER BY created_on ASC, task_id ASC`,
+    [instanceId]
+  );
+
+  result.approval_steps = await Promise.all(
+    tasksResult.rows.map(async (task, index) => {
+      const stepMatch = String(task.title || "").match(/Approval Step\s+(\d+)/i);
+      const approverName = await resolveEmployeeDisplayName(pool, task.assignee);
+
+      return {
+        step: Number(stepMatch?.[1]) || index + 1,
+        title: task.title,
+        approver_name: approverName,
+        approver_employee_code: task.assignee || null,
+        approver_role: task.assignee_role || null,
+        status: mapBudgetApprovalStepStatus(task.status),
+        action_on: formatInspectorDate(task.completed_on || null)
+      };
+    })
+  );
+
+  const historyResult = await pool.query(
+    `SELECT history_id, event_type, stage_key, actor, actor_role, action, comments, recorded_on
+     FROM wf_history
+     WHERE instance_id = $1
+     ORDER BY recorded_on ASC, history_id ASC`,
+    [instanceId]
+  );
+
+  let lastClarificationRequestedOn = null;
+  result.workflow_timeline = historyResult.rows.map((event) => {
+    let turnaround = null;
+
+    if (event.event_type === "ClarificationRequested") {
+      lastClarificationRequestedOn = event.recorded_on;
+    } else if (
+      event.event_type === "ClarificationSubmitted" &&
+      lastClarificationRequestedOn
+    ) {
+      turnaround = formatTurnaroundLabel(
+        lastClarificationRequestedOn,
+        event.recorded_on
+      );
+      lastClarificationRequestedOn = null;
+    }
+
+    return {
+      history_id: event.history_id,
+      event: mapBudgetWorkflowEventLabel(event),
+      event_type: event.event_type,
+      actor: event.actor || null,
+      actor_role: event.actor_role || null,
+      recorded_on: formatInspectorDate(event.recorded_on),
+      comment: event.comments || null,
+      turnaround
+    };
+  });
+
+  return result;
+}
+
 async function getBudgetApprovalActionContext(pool, requestId, req) {
   const { request } = await loadBudgetQueueRequest(pool, requestId);
   const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
@@ -1194,6 +2218,8 @@ async function getBudgetApprovalActionContext(pool, requestId, req) {
       || String(req.user?.role_name || "").toLowerCase() === "admin"
     );
 
+  const inspector = await loadBudgetWorkflowInspectorData(pool, request, instanceId);
+
   return {
     request_id: requestId,
     status: request.status,
@@ -1202,7 +2228,13 @@ async function getBudgetApprovalActionContext(pool, requestId, req) {
     assignee: assignee || request.current_approver || null,
     can_act: canAct,
     can_resubmit: canResubmit,
-    is_read_only: !["Draft", "Clarification Requested"].includes(request.status)
+    is_read_only: !["Draft", "Clarification Requested"].includes(request.status),
+    clarification_pending: inspector.clarification_pending,
+    clarification_rounds: inspector.clarification_rounds,
+    workflow_timeline: inspector.workflow_timeline,
+    approval_steps: inspector.approval_steps,
+    submitted_on: inspector.submitted_on,
+    requestor_name: request.submitted_by || null
   };
 }
 
@@ -1227,6 +2259,8 @@ async function createRequisition(pool, positionId, req) {
   draft.meta.last_updated = nowIso();
   await persistDraft(pool, draft, user.name);
 
+  const enrichedDraft = await enrichApprovedPositionsCatalogue(pool, draft);
+
   await pool.query(
     `INSERT INTO wp_position_lifecycle (position_id, event_type, from_status, to_status, actor, metadata)
      VALUES ($1,'RequisitionCreated',$2,'Requisition Raised',$3,$4)`,
@@ -1239,7 +2273,7 @@ async function createRequisition(pool, positionId, req) {
   );
 
   return {
-    workforce: draft,
+    workforce: enrichedDraft,
     position: result.requisition,
     requisitionId: result.requisitionId,
     approvedPosition: {
@@ -1385,6 +2419,11 @@ async function seedConfiguration(pool, payload, user = { name: "System Seed", ro
 module.exports = {
   getDefaultSeedPayload,
   getWorkforceBundle,
+  listWorkforceRequisitionQueue,
+  getRequisitionQueueCounts,
+  getRequisitionInspectorDetail,
+  getRequisitionApprovalActionContext,
+  submitRequisitionClarification,
   createBudgetRequest,
   submitBudgetRequest,
   approveBudgetRequest,

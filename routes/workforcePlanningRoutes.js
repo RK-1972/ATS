@@ -16,8 +16,78 @@ function registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin) {
 
   app.get("/api/v1/workforce", userGuard, async (req, res) => {
     try {
-      const bundle = await workforcePlanningService.getWorkforceBundle(pool);
+      const bundle = await workforcePlanningService.getWorkforceBundle(pool, req);
       res.json(bundle);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/workforce/requisitions/detail/:code", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.getRequisitionInspectorDetail(
+        pool,
+        req.params.code,
+        req
+      );
+      res.json({
+        success: true,
+        message: "Requisition inspector detail retrieved successfully.",
+        data: result
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/workforce/requisitions/:code/action-context", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.getRequisitionApprovalActionContext(
+        pool,
+        req.params.code,
+        req
+      );
+      res.json(result);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/workforce/requisitions/:code/submit-clarification", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.submitRequisitionClarification(
+        pool,
+        req.params.code,
+        req.body?.comments || req.body?.comment || "",
+        req
+      );
+      res.json({
+        success: true,
+        message: result.toastMessage,
+        data: result
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/workforce/requisitions/:queue", userGuard, async (req, res) => {
+    try {
+      const result = await workforcePlanningService.listWorkforceRequisitionQueue(
+        pool,
+        req.params.queue,
+        req
+      );
+      res.json({
+        success: true,
+        message: "Workforce requisition queue retrieved successfully.",
+        data: result.rows,
+        meta: {
+          queue: result.queue,
+          status: result.status,
+          count: result.rows.length
+        }
+      });
     } catch (error) {
       handleError(res, error);
     }

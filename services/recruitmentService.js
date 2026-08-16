@@ -415,19 +415,26 @@ function toDateOnly(value) {
   if (!value) return null;
   if (typeof value === "string") return value.slice(0, 10);
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString().slice(0, 10);
+    return formatLocalDateOnly(value);
   }
   return null;
+}
+
+function formatLocalDateOnly(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function resolveDashboardDateRange(req) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const toDefault = today.toISOString().slice(0, 10);
+  const toDefault = formatLocalDateOnly(today);
   const fromDefaultDate = new Date(today);
   fromDefaultDate.setDate(fromDefaultDate.getDate() - 29);
 
-  const fromDate = toDateOnly(req.query?.fromDate) || fromDefaultDate.toISOString().slice(0, 10);
+  const fromDate = toDateOnly(req.query?.fromDate) || formatLocalDateOnly(fromDefaultDate);
   const toDate = toDateOnly(req.query?.toDate) || toDefault;
 
   if (fromDate > toDate) {
@@ -766,7 +773,7 @@ async function getMyRecruiterDashboard(pool, req) {
     joinedAllTime: joinedAllTimeByReq[row.requisition_code] || 0
   }));
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = formatLocalDateOnly(new Date());
   const todayInRange = today >= fromDate && today <= toDate;
 
   const openRequisitions = requisitionRows.filter((row) =>
@@ -2341,17 +2348,22 @@ async function returnCandidateToTalentPool(pool, candidateId, req) {
 async function listApprovedPositions(pool) {
   const result = await pool.query(
     `SELECT
-       position_id,
-       position_title,
-       department,
-       grade,
-       headcount,
-       status,
-       remaining_budget,
-       expiry_date
-     FROM wp_approved_positions
-     WHERE LOWER(COALESCE(status, 'active')) = 'active'
-     ORDER BY position_title ASC, position_id ASC`
+       p.position_id,
+       p.position_title,
+       p.department,
+       p.grade,
+       p.headcount,
+       p.status,
+       p.remaining_budget,
+       p.expiry_date
+     FROM wp_approved_positions p
+     WHERE LOWER(COALESCE(p.status, 'active')) = 'active'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM rm_requisitions r
+         WHERE r.approved_position_id = p.position_id
+       )
+     ORDER BY p.position_title ASC, p.position_id ASC`
   );
 
   return result.rows.map((row) => ({
@@ -2472,7 +2484,13 @@ function buildRequisitionUpdateFields(payload = {}) {
         : undefined,
     department:
       payload.project_name !== undefined
-        ? blankToNull(payload.project_name)
+        ? (() => {
+            const normalized = blankToNull(payload.project_name);
+            // rm_requisitions.department is the approved-position org department.
+            // Legacy editor round-trips it via project_name; an empty optional
+            // project selection must not null out the existing department.
+            return normalized === null ? undefined : normalized;
+          })()
         : undefined,
     position_title:
       payload.job_title !== undefined

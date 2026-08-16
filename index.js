@@ -44,11 +44,16 @@ const isLocalDevelopment = !isProduction;
 if (process.env.FRONTEND_URL) {
   app.use(
     cors({
-      origin: process.env.FRONTEND_URL
+      origin: process.env.FRONTEND_URL,
+      exposedHeaders: ["Content-Disposition"]
     })
   );
 } else {
-  app.use(cors());
+  app.use(
+    cors({
+      exposedHeaders: ["Content-Disposition"]
+    })
+  );
 }
 
 app.use(express.json());
@@ -1429,6 +1434,17 @@ const verifyToken = (req, res, next) => {
 
     );
 
+    if (verifiedUser.account_type === "candidate") {
+
+      return res.status(403).json({
+
+        success: false,
+        message: "Access Denied - Employee authentication required"
+
+      });
+
+    }
+
     req.user = verifiedUser;
 
     next();
@@ -1467,6 +1483,83 @@ const verifyAdmin = (req, res, next) => {
   }
 
   next();
+
+};
+
+
+// =====================================================
+// CANDIDATE PORTAL JWT VERIFICATION
+// =====================================================
+
+const verifyCandidateToken = (req, res, next) => {
+
+  try {
+
+    const authHeader =
+      req.headers.authorization;
+
+    if (!authHeader) {
+
+      return res.status(401).json({
+
+        success: false,
+        message: "Access Denied - No Token"
+
+      });
+
+    }
+
+    const token =
+      authHeader.split(" ")[1];
+
+    const verifiedCandidate = jwt.verify(
+
+      token,
+      process.env.JWT_SECRET
+
+    );
+
+    if (verifiedCandidate.account_type !== "candidate") {
+
+      return res.status(403).json({
+
+        success: false,
+        message: "Access Denied - Candidate authentication required"
+
+      });
+
+    }
+
+    if (
+      !verifiedCandidate.candidate_id ||
+      !verifiedCandidate.portal_account_id
+    ) {
+
+      return res.status(401).json({
+
+        success: false,
+        message: "Invalid Token"
+
+      });
+
+    }
+
+    req.candidate = verifiedCandidate;
+
+    next();
+
+  }
+
+  catch (error) {
+
+    return res.status(401).json({
+
+      success: false,
+      message: "Invalid Token"
+
+    });
+
+  }
 
 };
 
@@ -7673,6 +7766,128 @@ async function sendPasswordResetEmail(
 
 }
 
+
+// =====================================================
+// Send Candidate Welcome Email
+// =====================================================
+
+async function sendCandidateWelcomeEmail(
+
+  candidateEmail,
+  candidateName
+
+) {
+
+  try {
+
+    const token =
+      await getGraphToken();
+
+    await axios.post(
+
+      `https://graph.microsoft.com/v1.0/users/${process.env.EMAIL_USER}/sendMail`,
+
+      {
+
+        message: {
+
+          subject:
+            "Welcome to Optalynx",
+
+          body: {
+
+            contentType: "HTML",
+
+            content: `
+
+              <p>Hello ${candidateName},</p>
+
+              <p>
+                Welcome to Optalynx.
+              </p>
+
+              <p>
+                Your candidate account has been successfully created.
+              </p>
+
+              <p>
+                You can now sign in and complete your professional profile.
+              </p>
+
+              <br/>
+
+              <p>
+                Regards,<br/>
+                Optalynx
+              </p>
+
+            `
+
+          },
+
+          toRecipients: [
+
+            {
+
+              emailAddress: {
+
+                address:
+                  candidateEmail
+
+              }
+
+            }
+
+          ]
+
+        },
+
+        saveToSentItems: true
+
+      },
+
+      {
+
+        headers: {
+
+          Authorization:
+            `Bearer ${token}`,
+
+          "Content-Type":
+            "application/json"
+
+        }
+
+      }
+
+    );
+
+    console.log(
+      `Candidate welcome email sent to ${candidateEmail}`
+    );
+
+  }
+
+  catch (error) {
+
+    console.log(
+      "Candidate Welcome Email Error"
+    );
+
+    console.log(
+
+      error?.response?.data ||
+
+      error.message
+
+    );
+
+    throw error;
+
+  }
+
+}
+
 // =====================================================
 // API 53 - Forgot Password
 // =====================================================
@@ -8151,6 +8366,18 @@ const {
 const {
   registerWorkAssignmentRoutes
 } = require("./routes/workAssignmentRoutes");
+const {
+  registerCandidatePortalRoutes
+} = require("./routes/candidatePortalRoutes");
+const {
+  registerHiringControlTowerRoutes
+} = require("./routes/hiringControlTowerRoutes");
+const {
+  registerAdminCommandCenterRoutes
+} = require("./routes/adminCommandCenterRoutes");
+const {
+  registerReportBuilderRoutes
+} = require("./routes/reportBuilderRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -8169,6 +8396,26 @@ registerDocumentRoutes(app, pool, verifyToken);
 registerUserPermissionRoutes(app, pool, verifyToken, verifyAdmin);
 registerTalentDemandDraftRoutes(app, pool, verifyToken);
 registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin);
+registerHiringControlTowerRoutes(app, pool, verifyToken, verifyAdmin);
+registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
+registerReportBuilderRoutes(app, pool, verifyToken);
+registerCandidatePortalRoutes(
+  app,
+  pool,
+  verifyCandidateToken,
+  verifyToken,
+  sendCandidateWelcomeEmail,
+  upload,
+  {
+    uploadResumeToStorage,
+    downloadResumeFromStorage,
+    extractPdfText,
+    parseBasicCandidateInfo,
+    splitCandidateName,
+    normalizeExperience,
+    markIntakeParsingFailed
+  }
+);
 
 // =====================================================
 // Approval Route Management APIs
@@ -10121,6 +10368,10 @@ app.post(
 // API 67 - Candidate Intake Dashboard Summary
 // =====================================================
 
+const {
+  listIntakeReviewQueue
+} = require("./services/candidatePortalProfileService");
+
 app.get(
 
   "/candidate-intake/dashboard",
@@ -10145,6 +10396,8 @@ app.get(
           )::int AS parsed,
           COUNT(*) FILTER (
             WHERE review_status = 'PENDING'
+              AND parsing_status = 'COMPLETED'
+              AND created_draft_id IS NOT NULL
           )::int AS pending_review,
           COUNT(*) FILTER (
             WHERE created_draft_id IS NOT NULL
@@ -10155,6 +10408,7 @@ app.get(
 
       );
 
+      const reviewQueue = await listIntakeReviewQueue(pool);
       const dashboard = result.rows[0];
 
       res.status(200).json({
@@ -10165,8 +10419,9 @@ app.get(
           total_intakes: dashboard.total_intakes,
           uploaded: dashboard.uploaded,
           parsed: dashboard.parsed,
-          pending_review: dashboard.pending_review,
-          candidate_created: dashboard.candidate_created
+          pending_review: reviewQueue.length,
+          candidate_created: dashboard.candidate_created,
+          review_queue: reviewQueue
         }
 
       });

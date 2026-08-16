@@ -12,6 +12,222 @@ function normalizeOptionalText(value) {
   return text ? text : null;
 }
 
+function normalizeOptionalTextArray(values, legacySingle = undefined) {
+  if (Array.isArray(values)) {
+    const cleaned = [
+      ...new Set(
+        values
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+      )
+    ];
+    return cleaned.length ? cleaned : null;
+  }
+
+  if (legacySingle !== undefined && legacySingle !== null) {
+    const text = normalizeOptionalText(legacySingle);
+    return text ? [text] : null;
+  }
+
+  return null;
+}
+
+function resolvePolicyDesignations(row) {
+  if (Array.isArray(row?.designations) && row.designations.length) {
+    return row.designations
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+  }
+
+  const legacy = normalizeOptionalText(row?.designation);
+  return legacy ? [legacy] : null;
+}
+
+function resolvePolicyGrades(row) {
+  if (Array.isArray(row?.grades) && row.grades.length) {
+    return row.grades
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+  }
+
+  const legacy = normalizeOptionalText(row?.grade);
+  return legacy ? [legacy] : null;
+}
+
+function criteriaSetsIntersect(setA, setB) {
+  if (!setA || !setA.length || !setB || !setB.length) {
+    return true;
+  }
+
+  const lowerA = new Set(setA.map((item) => item.toLowerCase()));
+  return setB.some((item) => lowerA.has(item.toLowerCase()));
+}
+
+function departmentsOverlap(departmentA, departmentB) {
+  if (!departmentA || !departmentB) {
+    return true;
+  }
+
+  return departmentA.toLowerCase() === departmentB.toLowerCase();
+}
+
+function amountRangesOverlap(minA, maxA, minB, maxB) {
+  const leftMin = minA ?? Number.NEGATIVE_INFINITY;
+  const leftMax = maxA ?? Number.POSITIVE_INFINITY;
+  const rightMin = minB ?? Number.NEGATIVE_INFINITY;
+  const rightMax = maxB ?? Number.POSITIVE_INFINITY;
+  return leftMax >= rightMin && rightMax >= leftMin;
+}
+
+function normalizeDateOnly(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  return String(value).slice(0, 10);
+}
+
+function dateRangesOverlap(fromA, toA, fromB, toB) {
+  const leftFrom = normalizeDateOnly(fromA) || "1970-01-01";
+  const leftTo = normalizeDateOnly(toA) || "9999-12-31";
+  const rightFrom = normalizeDateOnly(fromB) || "1970-01-01";
+  const rightTo = normalizeDateOnly(toB) || "9999-12-31";
+  return leftTo >= rightFrom && rightTo >= leftFrom;
+}
+
+function normalizeAppliesToToken(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_");
+}
+
+function appliesToScopesOverlap(leftScope, rightScope) {
+  const left = normalizeAppliesToToken(leftScope);
+  const right = normalizeAppliesToToken(rightScope);
+
+  if (!left || !right) {
+    return true;
+  }
+
+  if (left === right) {
+    return true;
+  }
+
+  const leftFirst = left.split("_")[0];
+  const rightFirst = right.split("_")[0];
+  return leftFirst === rightFirst;
+}
+
+function policiesCriteriaOverlap(candidate, existing) {
+  if (!candidate.is_active || !existing.is_active) {
+    return false;
+  }
+
+  if (
+    candidate.route_applies_to
+    && existing.route_applies_to
+    && !appliesToScopesOverlap(
+      candidate.route_applies_to,
+      existing.route_applies_to
+    )
+  ) {
+    return false;
+  }
+
+  if (!dateRangesOverlap(
+    candidate.effective_from,
+    candidate.effective_to,
+    existing.effective_from,
+    existing.effective_to
+  )) {
+    return false;
+  }
+
+  if (!departmentsOverlap(candidate.department, existing.department)) {
+    return false;
+  }
+
+  if (!criteriaSetsIntersect(candidate.designations, existing.designations)) {
+    return false;
+  }
+
+  if (!criteriaSetsIntersect(candidate.grades, existing.grades)) {
+    return false;
+  }
+
+  if (!amountRangesOverlap(
+    candidate.min_amount,
+    candidate.max_amount,
+    existing.min_amount,
+    existing.max_amount
+  )) {
+    return false;
+  }
+
+  return true;
+}
+
+const POLICY_MATCHING_CRITERIA_SQL = `
+       AND (
+         p.department IS NULL
+         OR (
+           $2::text IS NOT NULL
+           AND LOWER(TRIM(p.department)) = LOWER(TRIM($2))
+         )
+       )
+       AND (
+         (
+           COALESCE(cardinality(p.designations), 0) = 0
+           AND p.designation IS NULL
+         )
+         OR (
+           $3::text IS NOT NULL
+           AND EXISTS (
+             SELECT 1
+             FROM unnest(
+               COALESCE(
+                 NULLIF(p.designations, ARRAY[]::text[]),
+                 CASE
+                   WHEN p.designation IS NOT NULL AND TRIM(p.designation) <> ''
+                     THEN ARRAY[TRIM(p.designation)]
+                   ELSE ARRAY[]::text[]
+                 END
+               )
+             ) AS designation_value(value)
+             WHERE LOWER(TRIM(designation_value.value)) = LOWER(TRIM($3))
+           )
+         )
+       )
+       AND (
+         (
+           COALESCE(cardinality(p.grades), 0) = 0
+           AND p.grade IS NULL
+         )
+         OR (
+           $4::text IS NOT NULL
+           AND EXISTS (
+             SELECT 1
+             FROM unnest(
+               COALESCE(
+                 NULLIF(p.grades, ARRAY[]::text[]),
+                 CASE
+                   WHEN p.grade IS NOT NULL AND TRIM(p.grade) <> ''
+                     THEN ARRAY[TRIM(p.grade)]
+                   ELSE ARRAY[]::text[]
+                 END
+               )
+             ) AS grade_value(value)
+             WHERE LOWER(TRIM(grade_value.value)) = LOWER(TRIM($4))
+           )
+         )
+       )
+`;
+
 function normalizeOptionalAmount(value) {
   if (value === null || value === undefined || value === "") {
     return null;
@@ -32,6 +248,9 @@ function mapPolicyRow(row) {
     return null;
   }
 
+  const designations = resolvePolicyDesignations(row);
+  const grades = resolvePolicyGrades(row);
+
   return {
     policy_id: row.policy_id,
     route_id: row.route_id,
@@ -39,8 +258,10 @@ function mapPolicyRow(row) {
     route_status: row.route_status ?? null,
     route_applies_to: row.route_applies_to ?? null,
     department: row.department,
-    designation: row.designation,
-    grade: row.grade,
+    designations,
+    grades,
+    designation: designations?.[0] ?? null,
+    grade: grades?.[0] ?? null,
     min_amount: row.min_amount !== null && row.min_amount !== undefined
       ? Number(row.min_amount)
       : null,
@@ -158,27 +379,7 @@ async function findMatchingActiveRoutes(pool, documentType, criteria = {}) {
        AND (r.effective_from IS NULL OR r.effective_from <= CURRENT_DATE)
        AND p.effective_from <= CURRENT_DATE
        AND (p.effective_to IS NULL OR p.effective_to >= CURRENT_DATE)
-       AND (
-         p.department IS NULL
-         OR (
-           $2::text IS NOT NULL
-           AND LOWER(TRIM(p.department)) = LOWER(TRIM($2))
-         )
-       )
-       AND (
-         p.designation IS NULL
-         OR (
-           $3::text IS NOT NULL
-           AND LOWER(TRIM(p.designation)) = LOWER(TRIM($3))
-         )
-       )
-       AND (
-         p.grade IS NULL
-         OR (
-           $4::text IS NOT NULL
-           AND LOWER(TRIM(p.grade)) = LOWER(TRIM($4))
-         )
-       )
+${POLICY_MATCHING_CRITERIA_SQL}
        AND (
          (
            $5::numeric IS NULL
@@ -216,6 +417,8 @@ async function findMatchingActivePolicies(pool, documentType, criteria = {}) {
        r.route_name,
        r.applies_to AS route_applies_to,
        p.department,
+       p.designations,
+       p.grades,
        p.designation,
        p.grade,
        p.min_amount,
@@ -238,27 +441,7 @@ async function findMatchingActivePolicies(pool, documentType, criteria = {}) {
        AND (r.effective_from IS NULL OR r.effective_from <= CURRENT_DATE)
        AND p.effective_from <= CURRENT_DATE
        AND (p.effective_to IS NULL OR p.effective_to >= CURRENT_DATE)
-       AND (
-         p.department IS NULL
-         OR (
-           $2::text IS NOT NULL
-           AND LOWER(TRIM(p.department)) = LOWER(TRIM($2))
-         )
-       )
-       AND (
-         p.designation IS NULL
-         OR (
-           $3::text IS NOT NULL
-           AND LOWER(TRIM(p.designation)) = LOWER(TRIM($3))
-         )
-       )
-       AND (
-         p.grade IS NULL
-         OR (
-           $4::text IS NOT NULL
-           AND LOWER(TRIM(p.grade)) = LOWER(TRIM($4))
-         )
-       )
+${POLICY_MATCHING_CRITERIA_SQL}
        AND (
          (
            $5::numeric IS NULL
@@ -415,6 +598,8 @@ async function getApprovalRoutePolicies(pool) {
        r.status AS route_status,
        r.applies_to AS route_applies_to,
        p.department,
+       p.designations,
+       p.grades,
        p.designation,
        p.grade,
        p.min_amount,
@@ -444,6 +629,8 @@ async function getApprovalRoutePolicy(pool, policyId) {
        r.status AS route_status,
        r.applies_to AS route_applies_to,
        p.department,
+       p.designations,
+       p.grades,
        p.designation,
        p.grade,
        p.min_amount,
@@ -500,8 +687,14 @@ function buildPolicyWriteValues(policyData, actor) {
   return {
     route_id: policyData.route_id,
     department: normalizeOptionalText(policyData.department),
-    designation: normalizeOptionalText(policyData.designation),
-    grade: normalizeOptionalText(policyData.grade),
+    designations: normalizeOptionalTextArray(
+      policyData.designations,
+      policyData.designation
+    ),
+    grades: normalizeOptionalTextArray(
+      policyData.grades,
+      policyData.grade
+    ),
     min_amount: minAmount,
     max_amount: maxAmount,
     is_active:
@@ -512,6 +705,38 @@ function buildPolicyWriteValues(policyData, actor) {
     effective_to: effectiveTo,
     actor: actor || null
   };
+}
+
+async function validatePolicyOverlap(pool, candidateValues, excludePolicyId = null) {
+  if (!candidateValues.is_active) {
+    return;
+  }
+
+  const existingPolicies = await getApprovalRoutePolicies(pool);
+
+  for (const existing of existingPolicies) {
+    if (
+      excludePolicyId !== null
+      && String(existing.policy_id) === String(excludePolicyId)
+    ) {
+      continue;
+    }
+
+    if (String(existing.route_id) === String(candidateValues.route_id)) {
+      continue;
+    }
+
+    if (!policiesCriteriaOverlap(candidateValues, existing)) {
+      continue;
+    }
+
+    const error = new Error(
+      `Policy criteria overlap with Policy #${existing.policy_id} (${existing.route_name || `Route ${existing.route_id}`}). `
+      + "Active policies that can match the same request must map to the same Approval Route."
+    );
+    error.status = 400;
+    throw error;
+  }
 }
 
 async function createApprovalRoutePolicy(pool, policyData) {
@@ -533,11 +758,17 @@ async function createApprovalRoutePolicy(pool, policyData) {
   }
 
   const values = buildPolicyWriteValues(policyData, policyData.created_by);
+  await validatePolicyOverlap(pool, {
+    ...values,
+    route_applies_to: route.applies_to
+  });
 
   const result = await pool.query(
     `INSERT INTO approval_route_policy (
        route_id,
        department,
+       designations,
+       grades,
        designation,
        grade,
        min_amount,
@@ -549,13 +780,15 @@ async function createApprovalRoutePolicy(pool, policyData) {
        created_on,
        updated_by,
        updated_on
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $10, NOW())
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $12, NOW())
      RETURNING policy_id`,
     [
       values.route_id,
       values.department,
-      values.designation,
-      values.grade,
+      values.designations,
+      values.grades,
+      values.designations?.[0] ?? null,
+      values.grades?.[0] ?? null,
       values.min_amount,
       values.max_amount,
       values.is_active,
@@ -592,6 +825,12 @@ async function updateApprovalRoutePolicy(pool, policyId, policyData) {
       policyData.department !== undefined
         ? policyData.department
         : existing.department,
+    designations:
+      policyData.designations !== undefined
+        ? policyData.designations
+        : existing.designations,
+    grades:
+      policyData.grades !== undefined ? policyData.grades : existing.grades,
     designation:
       policyData.designation !== undefined
         ? policyData.designation
@@ -622,28 +861,36 @@ async function updateApprovalRoutePolicy(pool, policyId, policyData) {
   };
 
   const values = buildPolicyWriteValues(merged, policyData.updated_by);
+  await validatePolicyOverlap(pool, {
+    ...values,
+    route_applies_to: route.applies_to
+  }, policyId);
 
   await pool.query(
     `UPDATE approval_route_policy
      SET
        route_id = $2,
        department = $3,
-       designation = $4,
-       grade = $5,
-       min_amount = $6,
-       max_amount = $7,
-       is_active = $8,
-       effective_from = $9,
-       effective_to = $10,
-       updated_by = $11,
+       designations = $4,
+       grades = $5,
+       designation = $6,
+       grade = $7,
+       min_amount = $8,
+       max_amount = $9,
+       is_active = $10,
+       effective_from = $11,
+       effective_to = $12,
+       updated_by = $13,
        updated_on = NOW()
      WHERE policy_id = $1`,
     [
       policyId,
       values.route_id,
       values.department,
-      values.designation,
-      values.grade,
+      values.designations,
+      values.grades,
+      values.designations?.[0] ?? null,
+      values.grades?.[0] ?? null,
       values.min_amount,
       values.max_amount,
       values.is_active,
