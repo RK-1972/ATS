@@ -1905,6 +1905,121 @@ async function requestClarification(pool, instanceId, comments, req) {
   };
 }
 
+function isAdminUser(req) {
+  return String(req.user?.role_name || "").trim().toLowerCase() === "admin";
+}
+
+async function resolveWorkflowActorKeys(pool, req) {
+  const employeeCode = String(req?.user?.employee_code || "").trim();
+  const emailId = String(req?.user?.email_id || "").trim();
+  const keys = new Set();
+
+  if (employeeCode) {
+    keys.add(employeeCode);
+  }
+
+  if (emailId) {
+    keys.add(emailId);
+  }
+
+  const contextName = String(userContext(req).name || "").trim();
+  if (contextName && contextName !== "System User") {
+    keys.add(contextName);
+  }
+
+  if (employeeCode) {
+    const nameLookup = await pool.query(
+      `SELECT full_name
+       FROM user_mstr
+       WHERE employee_code = $1
+       LIMIT 1`,
+      [employeeCode]
+    );
+    const fullName = String(nameLookup.rows[0]?.full_name || "").trim();
+    if (fullName) {
+      keys.add(fullName);
+    }
+  }
+
+  return [...keys].filter(Boolean);
+}
+
+async function resolveStartedByProfile(pool, startedBy) {
+  const key = String(startedBy || "").trim();
+
+  if (!key) {
+    return {
+      name: null,
+      employee_code: null,
+      email_id: null
+    };
+  }
+
+  const result = await pool.query(
+    `SELECT employee_code, full_name, email_id
+     FROM user_mstr
+     WHERE employee_code = $1
+        OR email_id = $1
+        OR full_name = $1
+     LIMIT 1`,
+    [key]
+  );
+
+  if (result.rows[0]) {
+    return {
+      name: result.rows[0].full_name || key,
+      employee_code: result.rows[0].employee_code || null,
+      email_id: result.rows[0].email_id || null
+    };
+  }
+
+  return {
+    name: key,
+    employee_code: key.includes("@") ? null : key,
+    email_id: key.includes("@") ? key : null
+  };
+}
+
+/**
+ * Mirrors workforce submitRequisitionClarification / submitBudgetClarification:
+ * Admin, workflow starter (owner keys), or original requestor may submit clarification.
+ */
+async function assertClarificationSubmitAuthorized(pool, req, instance, options = {}) {
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const clarificationHold = options.clarificationHold || null;
+  const actorCode = String(req.user?.employee_code || "").trim();
+  const ownerKeys = await resolveWorkflowActorKeys(pool, req);
+  const startedByKey = String(instance.started_by || "").trim();
+  const isOwner = Boolean(startedByKey) && ownerKeys.includes(startedByKey);
+
+  if (isOwner) {
+    return;
+  }
+
+  const requestor = await resolveStartedByProfile(pool, startedByKey);
+  const requestorCode = String(requestor.employee_code || "").trim();
+
+  if (requestorCode && actorCode && requestorCode === actorCode) {
+    return;
+  }
+
+  const holdRequestorCode = String(
+    clarificationHold?.requestor_employee_code || ""
+  ).trim();
+
+  if (holdRequestorCode && actorCode && holdRequestorCode === actorCode) {
+    return;
+  }
+
+  throw httpError(
+    "Only the original requestor may resubmit clarification.",
+    403
+  );
+}
+
 async function submitClarification(pool, instanceId, comments, req) {
   const user = userContext(req);
   const clarificationComments = String(comments || "").trim();
@@ -1996,6 +2111,8 @@ async function submitClarification(pool, instanceId, comments, req) {
 
     // Legacy instance-only clarification (offers / workforce without task hold)
     if (!hasTaskHold) {
+      await assertClarificationSubmitAuthorized(pool, req, instance);
+
       const stageKey = instance.current_stage_key;
       const payload = clonePayload(instance.instance_payload || {});
       const stage = (payload.stages || []).find((item) => item.key === stageKey);
@@ -2118,6 +2235,10 @@ async function submitClarification(pool, instanceId, comments, req) {
         400
       );
     }
+
+    await assertClarificationSubmitAuthorized(pool, req, instance, {
+      clarificationHold
+    });
 
     // 5. Task returns to Pending
     await client.query(
@@ -2998,6 +3119,7 @@ module.exports = {
   advanceWorkflow,
   requestClarification,
   submitClarification,
+  assertClarificationSubmitAuthorized,
   completeTask,
   reassignTask,
   publishBundle,

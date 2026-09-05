@@ -4,6 +4,13 @@ const {
   SORT_DIRECTIONS,
   isAllowedOperator
 } = require("./reportBuilderQueryConstants");
+const { RESULT_MODES } = require("./reportBuilderSemanticConstants");
+const {
+  detectResultMode,
+  validateSemanticDimensions,
+  validateSemanticMeasures,
+  validateAggregateSort
+} = require("./reportBuilderSemanticValidator");
 
 function httpError(message, status = 400) {
   const error = new Error(message);
@@ -138,17 +145,44 @@ function buildFieldMap(queryFields) {
   return fieldMap;
 }
 
-function validateReportQueryRequest(body, queryFields, datasetCode) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw httpError("Report query request is invalid.", 400);
+function validateDetailFilters(rawFilters, fieldMap) {
+  if (!Array.isArray(rawFilters)) {
+    return [];
   }
 
-  const requestedDataset = String(body.dataset || "").trim();
-
-  if (!requestedDataset || requestedDataset !== datasetCode) {
-    throw httpError("Report dataset is invalid.", 400);
+  if (rawFilters.length > QUERY_LIMITS.max_filters) {
+    throw httpError("Too many report filters requested.", 400);
   }
 
+  return rawFilters.map((filter) => {
+    if (!filter || typeof filter !== "object" || Array.isArray(filter)) {
+      throw httpError("Report filter value is invalid.", 400);
+    }
+
+    const fieldCode = assertFieldCode(filter.field, "Report field");
+    const fieldMeta = fieldMap.get(fieldCode);
+
+    if (!fieldMeta || !fieldMeta.filterable) {
+      throw httpError("Report field is invalid.", 400);
+    }
+
+    const operator = assertOperator(filter.operator);
+
+    if (!isAllowedOperator(fieldMeta.data_type, operator)) {
+      throw httpError("Report operator is not supported for this field.", 400);
+    }
+
+    const value = validateFilterValue(fieldMeta, operator, filter.value);
+
+    return {
+      field: fieldMeta,
+      operator,
+      value
+    };
+  });
+}
+
+function validateDetailReportQueryRequest(body, queryFields, datasetCode) {
   const fieldMap = buildFieldMap(queryFields);
   const pagination = normalizePagination(body);
 
@@ -180,38 +214,7 @@ function validateReportQueryRequest(body, queryFields, datasetCode) {
     selectedFields.push(fieldMeta);
   }
 
-  const rawFilters = Array.isArray(body.filters) ? body.filters : [];
-
-  if (rawFilters.length > QUERY_LIMITS.max_filters) {
-    throw httpError("Too many report filters requested.", 400);
-  }
-
-  const filters = rawFilters.map((filter, index) => {
-    if (!filter || typeof filter !== "object" || Array.isArray(filter)) {
-      throw httpError("Report filter value is invalid.", 400);
-    }
-
-    const fieldCode = assertFieldCode(filter.field, "Report field");
-    const fieldMeta = fieldMap.get(fieldCode);
-
-    if (!fieldMeta || !fieldMeta.filterable) {
-      throw httpError("Report field is invalid.", 400);
-    }
-
-    const operator = assertOperator(filter.operator);
-
-    if (!isAllowedOperator(fieldMeta.data_type, operator)) {
-      throw httpError("Report operator is not supported for this field.", 400);
-    }
-
-    const value = validateFilterValue(fieldMeta, operator, filter.value);
-
-    return {
-      field: fieldMeta,
-      operator,
-      value
-    };
-  });
+  const filters = validateDetailFilters(body.filters, fieldMap);
 
   const rawSort = Array.isArray(body.sort) ? body.sort : [];
 
@@ -280,6 +283,7 @@ function validateReportQueryRequest(body, queryFields, datasetCode) {
   }
 
   return {
+    resultMode: RESULT_MODES.DETAIL,
     selectedFields,
     filters,
     sort,
@@ -288,8 +292,60 @@ function validateReportQueryRequest(body, queryFields, datasetCode) {
   };
 }
 
+function validateAggregateReportQueryRequest(body, queryFields, datasetCode) {
+  const fieldMap = buildFieldMap(queryFields);
+  const pagination = normalizePagination(body);
+  const dimensions = validateSemanticDimensions(body.dimensions, fieldMap);
+  const measures = validateSemanticMeasures(body.measures, fieldMap);
+  const filters = validateDetailFilters(body.filters, fieldMap);
+  const sort = validateAggregateSort(body.sort, dimensions, measures);
+
+  return {
+    resultMode: RESULT_MODES.AGGREGATE,
+    dimensions,
+    measures,
+    filters,
+    sort,
+    pagination
+  };
+}
+
+function validateReportQueryRequest(body, queryFields, datasetCode) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw httpError("Report query request is invalid.", 400);
+  }
+
+  const requestedDataset = String(body.dataset || "").trim();
+
+  if (!requestedDataset || requestedDataset !== datasetCode) {
+    throw httpError("Report dataset is invalid.", 400);
+  }
+
+  const resultMode = detectResultMode(body);
+
+  if (resultMode === RESULT_MODES.AGGREGATE) {
+    return validateAggregateReportQueryRequest(body, queryFields, datasetCode);
+  }
+
+  return validateDetailReportQueryRequest(body, queryFields, datasetCode);
+}
+
 function validateReportExportRequest(body, queryFields, datasetCode) {
-  const validated = validateReportQueryRequest(
+  const resultMode = detectResultMode(body);
+
+  if (resultMode === RESULT_MODES.AGGREGATE) {
+    const validated = validateAggregateReportQueryRequest(body, queryFields, datasetCode);
+
+    return {
+      resultMode: validated.resultMode,
+      dimensions: validated.dimensions,
+      measures: validated.measures,
+      filters: validated.filters,
+      sort: validated.sort
+    };
+  }
+
+  const validated = validateDetailReportQueryRequest(
     {
       ...body,
       page: 1,
@@ -300,6 +356,7 @@ function validateReportExportRequest(body, queryFields, datasetCode) {
   );
 
   return {
+    resultMode: validated.resultMode,
     selectedFields: validated.selectedFields,
     filters: validated.filters,
     sort: validated.sort,

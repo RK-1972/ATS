@@ -4,6 +4,7 @@ const masterDataService = require("./masterDataService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled } = require("../config/operationalCutover");
 const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
+const { assertCanCreateRequisition, assertRequisitionRequestorOwnerAccess } = require("./requisitionCapabilityAuth");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "recruitment.seed.json");
 
@@ -60,6 +61,38 @@ async function assertCanAssignRecruiter(pool, req) {
   if (!hasAssignerCapacity) {
     throw httpError(
       "Only Admin, TA Lead, or users with Requisition Assigner work assignment can assign recruiters.",
+      403
+    );
+  }
+}
+
+/**
+ * Enterprise map gate: caller must have an active recruiter assignment on the
+ * target requisition (same rule as GET /my-requisitions / recruiter workspace).
+ */
+async function assertRecruiterAssignedToRequisition(pool, req, requisition) {
+  const employeeCode = recruiterEmployeeCode(req);
+
+  const assignment = await pool.query(
+    `SELECT assignment_id
+     FROM rm_recruiter_assignments
+     WHERE recruiter_code = $1
+       AND is_active = true
+       AND (
+         requisition_code = $2
+         OR ($3::int IS NOT NULL AND req_id = $3)
+       )
+     LIMIT 1`,
+    [
+      employeeCode,
+      requisition.requisition_code,
+      requisition.req_id || null
+    ]
+  );
+
+  if (!assignment.rows.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not assigned to this requisition.",
       403
     );
   }
@@ -1310,6 +1343,8 @@ async function mapCandidate(pool, payload, req) {
     throw httpError("Enterprise requisition not found. Requisitions must originate from Workforce Planning.", 400);
   }
 
+  await assertRecruiterAssignedToRequisition(pool, req, requisition);
+
   const mdValidation = await validateMasterDataReferences(pool, {
     source_type: sourceType
   });
@@ -1721,6 +1756,8 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
  * @param {object} queryable - pg Pool or Client (shared TX handle)
  */
 async function handleLegacyCreateRequisition(queryable, body, req) {
+  await assertCanCreateRequisition(queryable, req);
+
   const approvedPositionId = body.approved_position_id;
 
   if (!approvedPositionId) {
@@ -2401,6 +2438,18 @@ async function loadRequisitionByCode(queryable, code) {
   return result.rows[0] || null;
 }
 
+async function getRequisitionForRequestor(pool, code, req) {
+  const requisition = await loadRequisitionByCode(pool, code);
+
+  if (!requisition) {
+    throw httpError(`Requisition not found: ${code}`, 404);
+  }
+
+  await assertRequisitionRequestorOwnerAccess(pool, req, requisition);
+
+  return requisition;
+}
+
 function blankToNull(value) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
@@ -2583,6 +2632,8 @@ async function updateRequisition(pool, code, payload, req) {
   if (!existing) {
     throw httpError(`Requisition not found: ${code}`, 404);
   }
+
+  await assertRequisitionRequestorOwnerAccess(pool, req, existing);
 
   assertExistingRequisitionEditable(existing);
 
@@ -2860,5 +2911,6 @@ module.exports = {
   listApprovedPositions,
   updateRequisition,
   submitRequisition,
-  loadRequisitionByCode
+  loadRequisitionByCode,
+  getRequisitionForRequestor
 };

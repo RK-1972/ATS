@@ -1,10 +1,12 @@
 const reportBuilderQueryRepository = require("../repositories/reportBuilderQueryRepository");
 const { buildReportQueryPlan } = require("./reportBuilderQueryEngine");
+const { buildAggregateReportQueryPlan } = require("./reportBuilderAggregateQueryEngine");
 const {
   validateReportExportRequest,
   httpError
 } = require("./reportBuilderQueryValidator");
 const { QUERY_LIMITS, EXPORT_FORMATS } = require("./reportBuilderQueryConstants");
+const { RESULT_MODES } = require("./reportBuilderSemanticConstants");
 const { generateReportExportFile } = require("./reportBuilderExportGenerators");
 const { prepareAuthorizedReportContext } = require("./reportBuilderRequestContext");
 
@@ -39,10 +41,16 @@ async function exportReport(pool, req, body) {
   );
 
   const validatedRequest = validateReportExportRequest(body, queryFields, datasetCode);
-  const queryPlan = buildReportQueryPlan(datasetCode, validatedRequest, {
-    mode: "export",
-    exportLimit: QUERY_LIMITS.max_export_rows
-  });
+  const queryPlan =
+    validatedRequest.resultMode === RESULT_MODES.AGGREGATE
+      ? buildAggregateReportQueryPlan(datasetCode, validatedRequest, {
+          mode: "export",
+          exportLimit: QUERY_LIMITS.max_export_rows
+        })
+      : buildReportQueryPlan(datasetCode, validatedRequest, {
+          mode: "export",
+          exportLimit: QUERY_LIMITS.max_export_rows
+        });
 
   const executionResult = await reportBuilderQueryRepository.executeReportExportQuery(
     pool,
@@ -65,6 +73,7 @@ async function exportReport(pool, req, body) {
       code: dataset.code,
       name: dataset.name
     },
+    result_type: validatedRequest.resultMode,
     columns: queryPlan.columns,
     rows,
     filters: validatedRequest.filters,

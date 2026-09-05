@@ -136,14 +136,11 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
 
   app.get("/api/v1/recruitment/requisitions/:code", requestorGuard, async (req, res) => {
     try {
-      const requisition = await recruitmentService.loadRequisitionByCode(
+      const requisition = await recruitmentService.getRequisitionForRequestor(
         pool,
-        req.params.code
+        req.params.code,
+        req
       );
-
-      if (!requisition) {
-        return res.status(404).json({ success: false, message: "Requisition not found" });
-      }
 
       res.json({ success: true, data: requisition });
     } catch (error) {

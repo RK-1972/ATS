@@ -5,6 +5,7 @@
  */
 
 const workAssignmentService = require("./workAssignmentService");
+const { userContext } = require("./enterpriseAuditService");
 
 const REQUISITION_REQUESTOR_CODE = "REQUISITION_REQUESTOR";
 const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
@@ -101,6 +102,88 @@ async function assertCanManageRequisitionAssignments(pool, req) {
 }
 
 /**
+ * rm_requisitions.created_by stores userContext(req).name at creation time
+ * (full_name, else email_id). JWT carries employee_code + email_id only.
+ */
+async function resolveRequisitionRequestorCreatedByKeys(pool, req) {
+  const employeeCode = String(req?.user?.employee_code || "").trim();
+  const emailId = String(req?.user?.email_id || "").trim();
+  const keys = new Set();
+
+  if (employeeCode) {
+    keys.add(employeeCode);
+  }
+
+  if (emailId) {
+    keys.add(emailId);
+  }
+
+  const contextName = String(userContext(req).name || "").trim();
+  if (contextName && contextName !== "System User") {
+    keys.add(contextName);
+  }
+
+  if (employeeCode) {
+    const nameLookup = await pool.query(
+      `SELECT full_name
+       FROM user_mstr
+       WHERE employee_code = $1
+       LIMIT 1`,
+      [employeeCode]
+    );
+    const fullName = String(nameLookup.rows[0]?.full_name || "").trim();
+    if (fullName) {
+      keys.add(fullName);
+    }
+  }
+
+  return [...keys].filter(Boolean);
+}
+
+async function assertRequisitionRequestorOwnerAccess(pool, req, requisition) {
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+
+  if (!ownerKeys.length) {
+    throw authError(
+      "Enterprise Access Denied. You are not authorized to view this requisition."
+    );
+  }
+
+  const createdByKey = String(requisition?.created_by || "").trim();
+
+  if (!createdByKey || !ownerKeys.includes(createdByKey)) {
+    throw authError(
+      "Enterprise Access Denied. You are not authorized to view this requisition."
+    );
+  }
+}
+
+/**
+ * Approval action-context participants: Admin, assigned approver, or requestor owner.
+ */
+async function assertRequisitionApprovalParticipantAccess(
+  pool,
+  req,
+  requisition,
+  options = {}
+) {
+  const isAdmin = String(req.user?.role_name || "").trim().toLowerCase() === "admin";
+
+  if (isAdmin) {
+    return;
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const assignee = String(options.assigneeEmployeeCode || "").trim();
+
+  if (assignee && employeeCode && assignee === employeeCode) {
+    return;
+  }
+
+  await assertRequisitionRequestorOwnerAccess(pool, req, requisition);
+}
+
+/**
  * Express middleware factory: verifyToken must run first.
  */
 function requireRequisitionRequestor(pool) {
@@ -136,6 +219,9 @@ module.exports = {
   REQUISITION_ASSIGNER_CODE,
   assertCanCreateRequisition,
   assertCanManageRequisitionAssignments,
+  resolveRequisitionRequestorCreatedByKeys,
+  assertRequisitionRequestorOwnerAccess,
+  assertRequisitionApprovalParticipantAccess,
   requireRequisitionRequestor,
   requireRequisitionAssigner
 };

@@ -1,5 +1,7 @@
 const reportBuilderMetadataRepository = require("../repositories/reportBuilderMetadataRepository");
 const { OPERATOR_WHITELIST } = require("./reportBuilderQueryConstants");
+const { DATE_GRAINS } = require("./reportBuilderSemanticConstants");
+const { enrichPublicField } = require("./reportBuilderSemanticFieldRegistry");
 
 const SEMANTIC_OPERATORS = OPERATOR_WHITELIST;
 
@@ -32,7 +34,7 @@ function mapDatasetSummary(row) {
   };
 }
 
-function mapField(row) {
+function mapField(row, datasetCode) {
   const field = {
     code: row.code,
     label: row.label,
@@ -48,7 +50,16 @@ function mapField(row) {
     field.enum_values = row.enum_values;
   }
 
-  return field;
+  return enrichPublicField(datasetCode, {
+    ...field,
+    is_dimension: row.is_dimension,
+    is_measure: row.is_measure,
+    supported_aggregations: row.supported_aggregations,
+    default_aggregation: row.default_aggregation,
+    null_display_label: row.null_display_label,
+    supports_date_grain: row.supports_date_grain,
+    dimension_order: row.dimension_order
+  });
 }
 
 function mapFilter(row) {
@@ -75,6 +86,51 @@ async function listAuthorizedDatasets(pool, req) {
 
   return {
     datasets: rows.map(mapDatasetSummary)
+  };
+}
+
+async function listFilterRecruiters(pool, req) {
+  const roleName = resolveRoleName(req);
+
+  const canAccess = await reportBuilderMetadataRepository.hasRecruiterFilterPermission(
+    pool,
+    roleName
+  );
+
+  if (!canAccess) {
+    throw httpError("Report filter options not found.", 404);
+  }
+
+  const rows = await reportBuilderMetadataRepository.listActiveRecruiters(pool);
+
+  return {
+    recruiters: rows.map((row) => ({
+      employee_code: row.employee_code,
+      full_name: row.full_name
+    }))
+  };
+}
+
+async function listFilterHiringManagers(pool, req) {
+  const roleName = resolveRoleName(req);
+
+  const canAccess = await reportBuilderMetadataRepository.hasHiringManagerFilterPermission(
+    pool,
+    roleName
+  );
+
+  if (!canAccess) {
+    throw httpError("Report filter options not found.", 404);
+  }
+
+  const rows = await reportBuilderMetadataRepository.listActiveHiringManagers(pool);
+
+  return {
+    hiring_managers: rows.map((row) => ({
+      hiring_manager_id: row.hiring_manager_id,
+      hiring_manager_code: row.hiring_manager_code,
+      hiring_manager_name: row.hiring_manager_name
+    }))
   };
 }
 
@@ -120,13 +176,19 @@ async function getDatasetMetadata(pool, req, datasetCodeRaw) {
 
   return {
     dataset: mapDatasetSummary(dataset),
-    fields: fields.map(mapField),
-    filters: filters.map(mapFilter)
+    fields: fields.map((row) => mapField(row, datasetCode)),
+    filters: filters.map(mapFilter),
+    semantic: {
+      date_grains: DATE_GRAINS,
+      result_modes: ["detail", "aggregate"]
+    }
   };
 }
 
 module.exports = {
   listAuthorizedDatasets,
+  listFilterRecruiters,
+  listFilterHiringManagers,
   getDatasetMetadata,
   SEMANTIC_OPERATORS
 };

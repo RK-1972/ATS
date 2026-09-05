@@ -24,6 +24,7 @@ const recruitmentLegacyReadHandlers = require("./handlers/recruitmentLegacyReadH
 const interviewLegacyHandlers = require("./handlers/interviewLegacyHandlers");
 const interviewLegacyReadHandlers = require("./handlers/interviewLegacyReadHandlers");
 const candidateService = require("./services/candidateService");
+const candidateAccessService = require("./services/candidateAccessService");
 const recruitmentService = require("./services/recruitmentService");
 const workAssignmentService = require("./services/workAssignmentService");
 const workspaceResolverService = require("./services/workspaceResolverService");
@@ -1775,18 +1776,15 @@ app.get(
 
     try {
 
-      const result = await pool.query(`
-
-        SELECT *
-        FROM cand_mstr
-        ORDER BY candidate_id DESC
-
-      `);
+      const rows = await candidateAccessService.listAuthorizedCandidateMasters(
+        pool,
+        req
+      );
 
       res.status(200).json({
 
         success: true,
-        data: result.rows
+        data: rows
 
       });
 
@@ -1798,10 +1796,10 @@ app.get(
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
-        message: "Error Fetching Candidates"
+        message: error.message || "Error Fetching Candidates"
 
       });
 
@@ -1827,6 +1825,12 @@ app.get(
     try {
 
       const candidateId = req.params.id;
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const result = await pool.query(
 
@@ -1900,10 +1904,10 @@ app.get(
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
-        message: "Error Fetching Candidate"
+        message: error.message || "Error Fetching Candidate"
 
       });
 
@@ -4943,6 +4947,12 @@ app.get(
 
       const { candidateId } = req.params;
 
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
       const result =
         await pool.query(`
 
@@ -5012,12 +5022,12 @@ app.get(
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
 
         message:
-          "Error Fetching Candidate Details"
+          error.message || "Error Fetching Candidate Details"
 
       });
 
@@ -8421,7 +8431,7 @@ registerCandidatePortalRoutes(
 // Approval Route Management APIs
 // =====================================================
 
-app.get("/approval-routes", verifyToken, async (req, res) => {
+app.get("/approval-routes", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const appliesTo = req.query?.applies_to
       ? String(req.query.applies_to).trim()
@@ -8443,7 +8453,7 @@ app.get("/approval-routes", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/approval-routes/:routeId", verifyToken, async (req, res) => {
+app.get("/approval-routes/:routeId", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const routeId = req.params.routeId;
     const route = await approvalRouteRepository.getApprovalRoute(pool, routeId);

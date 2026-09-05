@@ -1,4 +1,5 @@
 const reportBuilderMetadataRepository = require("../repositories/reportBuilderMetadataRepository");
+const { enrichQueryFields } = require("./reportBuilderSemanticFieldRegistry");
 const { getDatasetDefinition, isSupportedDatasetCode } = require("./reportBuilderDatasetRegistry");
 const { httpError } = require("./reportBuilderQueryValidator");
 
@@ -49,10 +50,13 @@ async function prepareAuthorizedReportContext(pool, req, body) {
     throw httpError("Report dataset is invalid.", 400);
   }
 
-  const queryFields = await reportBuilderMetadataRepository.listAuthorizedQueryFields(
-    pool,
-    roleName,
-    dataset.dataset_id
+  const queryFields = enrichQueryFields(
+    datasetCode,
+    await reportBuilderMetadataRepository.listAuthorizedQueryFields(
+      pool,
+      roleName,
+      dataset.dataset_id
+    )
   );
 
   return {

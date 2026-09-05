@@ -2,7 +2,7 @@ const businessRulesService = require("./businessRulesService");
 const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
 const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
-const { assertCanCreateRequisition } = require("./requisitionCapabilityAuth");
+const { assertCanCreateRequisition, assertRequisitionApprovalParticipantAccess } = require("./requisitionCapabilityAuth");
 const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const userPermissionRepository = require("../repositories/userPermissionRepository");
@@ -810,6 +810,10 @@ async function getRequisitionApprovalActionContext(pool, requisitionCode, req) {
   const canResubmit =
     requisition.req_status === REQUISITION_STATUS.CLARIFICATION_REQUESTED
     && (isRequestor || isAdmin);
+
+  await assertRequisitionApprovalParticipantAccess(pool, req, requisition, {
+    assigneeEmployeeCode: assignee
+  });
 
   const inspector = await loadBudgetWorkflowInspectorData(
     pool,
@@ -2187,6 +2191,31 @@ async function loadBudgetWorkflowInspectorData(pool, request, instanceId) {
   return result;
 }
 
+function assertBudgetApprovalParticipantAccess(req, request, assigneeEmployeeCode) {
+  const isAdmin = String(req.user?.role_name || "").trim().toLowerCase() === "admin";
+
+  if (isAdmin) {
+    return;
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const assignee = String(assigneeEmployeeCode || "").trim();
+  const requestorCode = String(request.submitted_by_employee_code || "").trim();
+
+  if (assignee && employeeCode && assignee === employeeCode) {
+    return;
+  }
+
+  if (requestorCode && employeeCode && requestorCode === employeeCode) {
+    return;
+  }
+
+  throw httpError(
+    "Enterprise Access Denied. You are not authorized to view this budget request.",
+    403
+  );
+}
+
 async function getBudgetApprovalActionContext(pool, requestId, req) {
   const { request } = await loadBudgetQueueRequest(pool, requestId);
   const instanceId = resolveBudgetWorkflowInstanceId(request, requestId);
@@ -2217,6 +2246,8 @@ async function getBudgetApprovalActionContext(pool, requestId, req) {
       || String(request.submitted_by_employee_code) === employeeCode
       || String(req.user?.role_name || "").toLowerCase() === "admin"
     );
+
+  assertBudgetApprovalParticipantAccess(req, request, assignee);
 
   const inspector = await loadBudgetWorkflowInspectorData(pool, request, instanceId);
 

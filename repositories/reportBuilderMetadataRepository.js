@@ -106,6 +106,79 @@ async function listAuthorizedFilters(pool, roleName, datasetId) {
   return result.rows;
 }
 
+async function hasRecruiterFilterPermission(pool, roleName) {
+  const result = await pool.query(
+    `SELECT 1
+     FROM rb_field f
+     INNER JOIN rb_dataset d
+       ON d.dataset_id = f.dataset_id
+      AND d.is_active = TRUE
+     INNER JOIN rb_role_dataset_permission dp
+       ON dp.dataset_id = d.dataset_id
+      AND dp.role_name = $1
+      AND dp.can_view = TRUE
+     INNER JOIN rb_role_field_permission fp
+       ON fp.field_id = f.field_id
+      AND fp.role_name = $1
+      AND fp.can_view = TRUE
+      AND fp.can_filter = TRUE
+     WHERE f.code IN ('assigned_recruiter_code', 'mapping_recruiter_code')
+       AND f.is_filterable = TRUE
+     LIMIT 1`,
+    [roleName]
+  );
+
+  return result.rowCount > 0;
+}
+
+async function hasHiringManagerFilterPermission(pool, roleName) {
+  const result = await pool.query(
+    `SELECT 1
+     FROM rb_field f
+     INNER JOIN rb_dataset d
+       ON d.dataset_id = f.dataset_id
+      AND d.is_active = TRUE
+     INNER JOIN rb_role_dataset_permission dp
+       ON dp.dataset_id = d.dataset_id
+      AND dp.role_name = $1
+      AND dp.can_view = TRUE
+     INNER JOIN rb_role_field_permission fp
+       ON fp.field_id = f.field_id
+      AND fp.role_name = $1
+      AND fp.can_view = TRUE
+      AND fp.can_filter = TRUE
+     WHERE f.code = 'hiring_manager'
+       AND f.is_filterable = TRUE
+     LIMIT 1`,
+    [roleName]
+  );
+
+  return result.rowCount > 0;
+}
+
+async function listActiveRecruiters(pool) {
+  const result = await pool.query(
+    `SELECT employee_code, full_name
+     FROM user_mstr
+     WHERE role_name = 'Recruiter'
+       AND is_active = TRUE
+     ORDER BY full_name ASC`
+  );
+
+  return result.rows;
+}
+
+async function listActiveHiringManagers(pool) {
+  const result = await pool.query(
+    `SELECT hiring_manager_id, hiring_manager_code, hiring_manager_name
+     FROM hiring_manager_mstr
+     WHERE is_active = TRUE
+     ORDER BY hiring_manager_name ASC`
+  );
+
+  return result.rows;
+}
+
 async function listAuthorizedQueryFields(pool, roleName, datasetId) {
   const result = await pool.query(
     `SELECT
@@ -141,6 +214,10 @@ module.exports = {
   listAuthorizedDatasets,
   getActiveDatasetByCode,
   hasDatasetViewPermission,
+  hasRecruiterFilterPermission,
+  hasHiringManagerFilterPermission,
+  listActiveRecruiters,
+  listActiveHiringManagers,
   listAuthorizedFields,
   listAuthorizedFilters,
   listAuthorizedQueryFields

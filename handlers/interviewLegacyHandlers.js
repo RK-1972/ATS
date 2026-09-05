@@ -169,7 +169,8 @@ async function handleGetFeedback(pool, req, res) {
   try {
     const result = await interviewService.getFeedbackBySchedule(
       pool,
-      req.params.scheduleId
+      req.params.scheduleId,
+      req
     );
 
     res.status(200).json(result);

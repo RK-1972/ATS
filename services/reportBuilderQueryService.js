@@ -1,9 +1,11 @@
 const reportBuilderQueryRepository = require("../repositories/reportBuilderQueryRepository");
 const { buildReportQueryPlan } = require("./reportBuilderQueryEngine");
+const { buildAggregateReportQueryPlan } = require("./reportBuilderAggregateQueryEngine");
 const {
   validateReportQueryRequest
 } = require("./reportBuilderQueryValidator");
 const { QUERY_LIMITS } = require("./reportBuilderQueryConstants");
+const { RESULT_MODES } = require("./reportBuilderSemanticConstants");
 const { prepareAuthorizedReportContext } = require("./reportBuilderRequestContext");
 
 function mapRowToBusinessFields(row, columns) {
@@ -16,6 +18,26 @@ function mapRowToBusinessFields(row, columns) {
   return mappedRow;
 }
 
+function buildVisualizationHint(validatedRequest, queryPlan) {
+  if (validatedRequest.resultMode !== RESULT_MODES.AGGREGATE) {
+    return null;
+  }
+
+  const categoryField = validatedRequest.dimensions[0]?.outputCode || null;
+  const valueField = validatedRequest.measures[0]?.outputCode || null;
+
+  if (!valueField) {
+    return null;
+  }
+
+  return {
+    category_field: categoryField,
+    value_field: valueField,
+    secondary_category_field:
+      validatedRequest.dimensions[1]?.outputCode || null
+  };
+}
+
 async function executeReportQuery(pool, req, body) {
   const { dataset, datasetCode, queryFields } = await prepareAuthorizedReportContext(
     pool,
@@ -24,17 +46,23 @@ async function executeReportQuery(pool, req, body) {
   );
 
   const validatedRequest = validateReportQueryRequest(body, queryFields, datasetCode);
-  const queryPlan = buildReportQueryPlan(datasetCode, validatedRequest);
+
+  const queryPlan =
+    validatedRequest.resultMode === RESULT_MODES.AGGREGATE
+      ? buildAggregateReportQueryPlan(datasetCode, validatedRequest)
+      : buildReportQueryPlan(datasetCode, validatedRequest);
+
   const executionResult = await reportBuilderQueryRepository.executeReportQuery(
     pool,
     queryPlan
   );
 
-  return {
+  const response = {
     dataset: {
       code: dataset.code,
       name: dataset.name
     },
+    result_type: validatedRequest.resultMode,
     columns: queryPlan.columns,
     rows: executionResult.rows.map((row) =>
       mapRowToBusinessFields(row, queryPlan.columns)
@@ -58,6 +86,14 @@ async function executeReportQuery(pool, req, body) {
         "No dataset-specific row-level authorization rules are defined for V1.0. Access is governed by dataset and field permissions only."
     }
   };
+
+  if (validatedRequest.resultMode === RESULT_MODES.AGGREGATE) {
+    response.dimensions = queryPlan.dimensions;
+    response.measures = queryPlan.measures;
+    response.visualization = buildVisualizationHint(validatedRequest, queryPlan);
+  }
+
+  return response;
 }
 
 module.exports = {

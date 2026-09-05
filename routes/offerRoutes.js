@@ -1,4 +1,5 @@
 const offerManagementService = require("../services/offerManagementService");
+const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Offer API Error:", error.message);
@@ -9,7 +10,9 @@ function handleError(res, error) {
 }
 
 function registerOfferRoutes(app, pool, verifyToken) {
-  app.get("/api/v1/offers", verifyToken, async (req, res) => {
+  const offerGuard = [verifyToken, requireOfferWorkspace(pool)];
+
+  app.get("/api/v1/offers", offerGuard, async (req, res) => {
     try {
       const bundle = await offerManagementService.getOfferBundle(pool);
       res.json(bundle);
@@ -18,7 +21,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.get("/api/v1/offers/:offerId", verifyToken, async (req, res) => {
+  app.get("/api/v1/offers/:offerId", offerGuard, async (req, res) => {
     try {
       const offer = await offerManagementService.getOffer(pool, req.params.offerId);
       res.json({ success: true, data: offer });
@@ -27,7 +30,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.createOffer(pool, req.body, req);
       res.status(201).json({ success: true, ...result });
@@ -36,7 +39,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/submit", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/submit", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.submitOffer(
         pool,
@@ -50,7 +53,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/approve", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/approve", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.approveOffer(
         pool,
@@ -65,7 +68,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/negotiate", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/negotiate", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.negotiateOffer(
         pool,
@@ -79,7 +82,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/revise", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/revise", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.reviseOffer(
         pool,
@@ -93,7 +96,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/release", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/release", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.releaseOffer(
         pool,
@@ -107,7 +110,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/accept", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/accept", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.acceptOffer(pool, req.params.offerId, req);
       res.json({ success: true, ...result });
@@ -116,7 +119,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/reject", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/reject", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.rejectOffer(
         pool,
@@ -130,7 +133,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/withdraw", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/withdraw", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.withdrawOffer(
         pool,
@@ -144,7 +147,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/request-clarification", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/request-clarification", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.requestClarification(
         pool,
@@ -158,7 +161,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offers/:offerId/submit-clarification", verifyToken, async (req, res) => {
+  app.post("/api/v1/offers/:offerId/submit-clarification", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.submitClarification(
         pool,

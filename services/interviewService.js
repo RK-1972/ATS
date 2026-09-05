@@ -631,6 +631,164 @@ async function completeInterview(pool, interviewId, req, comments = "") {
   };
 }
 
+function isAdminUser(req) {
+  return String(req.user?.role_name || "").trim() === "Admin";
+}
+
+async function resolveCallerPanelIds(pool, req) {
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const userId = req.user?.user_id;
+
+  if (!employeeCode && !userId) {
+    return [];
+  }
+
+  const result = await pool.query(
+    `SELECT panel_id
+     FROM interview_panel_mstr
+     WHERE is_active = true
+       AND (
+         ($1 <> '' AND employee_code = $1)
+         OR ($2::int IS NOT NULL AND user_id = $2)
+       )`,
+    [employeeCode, userId || null]
+  );
+
+  return result.rows.map((row) => row.panel_id);
+}
+
+async function resolveInterviewScheduleContext(pool, { scheduleId, interviewId }) {
+  const lookupKey = scheduleId ?? interviewId;
+  if (lookupKey == null || lookupKey === "") {
+    throw httpError("schedule_id or interview_id is required.", 400);
+  }
+
+  const enterprise = await pool.query(
+    `SELECT interview_id, schedule_id
+     FROM im_interviews
+     WHERE schedule_id::text = $1::text OR interview_id = $1
+     LIMIT 1`,
+    [lookupKey]
+  );
+
+  if (enterprise.rows.length) {
+    return enterprise.rows[0];
+  }
+
+  if (scheduleId != null && scheduleId !== "" && (await tableExists(pool, "interview_schedule_trn"))) {
+    const legacy = await pool.query(
+      `SELECT schedule_id, NULL::varchar AS interview_id
+       FROM interview_schedule_trn
+       WHERE schedule_id = $1
+       LIMIT 1`,
+      [scheduleId]
+    );
+
+    if (legacy.rows.length) {
+      return legacy.rows[0];
+    }
+  }
+
+  return null;
+}
+
+async function isCallerAssignedToInterview(pool, panelIds, context) {
+  if (!panelIds.length) {
+    return false;
+  }
+
+  const scheduleId = context.schedule_id;
+  const interviewId = context.interview_id;
+
+  if (scheduleId && (await tableExists(pool, "interview_schedule_trn"))) {
+    const legacy = await pool.query(
+      `SELECT 1
+       FROM interview_schedule_trn
+       WHERE schedule_id = $1 AND interviewer_id = ANY($2::int[])
+       LIMIT 1`,
+      [scheduleId, panelIds]
+    );
+
+    if (legacy.rows.length) {
+      return true;
+    }
+  }
+
+  if (interviewId) {
+    const enterprise = await pool.query(
+      `SELECT 1
+       FROM im_panel_assignments
+       WHERE interview_id = $1
+         AND panel_id = ANY($2::int[])
+         AND assignment_status <> 'Reassigned'
+       LIMIT 1`,
+      [interviewId, panelIds]
+    );
+
+    if (enterprise.rows.length) {
+      return true;
+    }
+  }
+
+  if (scheduleId) {
+    const bySchedule = await pool.query(
+      `SELECT 1
+       FROM im_interviews i
+       INNER JOIN im_panel_assignments ipa ON ipa.interview_id = i.interview_id
+       WHERE i.schedule_id = $1
+         AND ipa.panel_id = ANY($2::int[])
+         AND ipa.assignment_status <> 'Reassigned'
+       LIMIT 1`,
+      [scheduleId, panelIds]
+    );
+
+    if (bySchedule.rows.length) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Mirrors /my-interviews panel rule: active interview_panel_mstr row for caller,
+ * assigned via interview_schedule_trn.interviewer_id or im_panel_assignments.panel_id.
+ * Admin retains unrestricted access.
+ */
+async function assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewId } = {}) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const context = await resolveInterviewScheduleContext(pool, { scheduleId, interviewId });
+
+  if (!context) {
+    throw httpError("Interview schedule not found.", 404);
+  }
+
+  const panelIds = await resolveCallerPanelIds(pool, req);
+
+  if (!panelIds.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
+      403
+    );
+  }
+
+  const assigned = await isCallerAssignedToInterview(pool, panelIds, context);
+
+  if (!assigned) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
+      403
+    );
+  }
+}
+
 async function submitFeedback(pool, payload, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
@@ -658,6 +816,11 @@ async function submitFeedback(pool, payload, req) {
   } else {
     throw httpError("schedule_id or interview_id is required.", 400);
   }
+
+  await assertInterviewFeedbackAccess(pool, req, {
+    scheduleId: interview.scheduleId || scheduleId,
+    interviewId: interview.interviewId
+  });
 
   if (interview.feedbackSubmitted) {
     throw httpError("Feedback already submitted for this interview.", 400);
@@ -774,10 +937,12 @@ async function submitFeedback(pool, payload, req) {
  * Enterprise SoR read for View Feedback.
  * Returns the legacy-compatible ViewFeedback response shape from im_feedback.
  */
-async function getFeedbackBySchedule(pool, scheduleId) {
+async function getFeedbackBySchedule(pool, scheduleId, req) {
   if (scheduleId == null || scheduleId === "") {
     throw httpError("schedule_id is required.", 400);
   }
+
+  await assertInterviewFeedbackAccess(pool, req, { scheduleId });
 
   const result = await pool.query(
     `
@@ -1303,6 +1468,7 @@ module.exports = {
   completeInterview,
   submitFeedback,
   getFeedbackBySchedule,
+  assertInterviewFeedbackAccess,
   reassignPanel,
   assignPanel,
   validateMasterDataReferences,
