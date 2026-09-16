@@ -7,6 +7,8 @@
 const talentDemandWorkflowCompletionService = require("./talentDemandWorkflowCompletionService");
 const budgetWorkflowCompletionService = require("./budgetWorkflowCompletionService");
 const offerWorkflowCompletionService = require("./offerWorkflowCompletionService");
+const requisitionHeadcountChangeService = require("./requisitionHeadcountChangeService");
+const requisitionBudgetChangeService = require("./requisitionBudgetChangeService");
 
 function parseContext(raw) {
   if (raw && typeof raw === "object") {
@@ -30,6 +32,14 @@ function isOfferEvent(event = {}) {
   return offerWorkflowCompletionService.isOfferWorkflowEvent(event);
 }
 
+function isHeadcountChangeEvent(event = {}) {
+  return requisitionHeadcountChangeService.isHeadcountChangeWorkflowEvent(event);
+}
+
+function isBudgetChangeEvent(event = {}) {
+  return requisitionBudgetChangeService.isBudgetChangeWorkflowEvent(event);
+}
+
 /**
  * Intermediate approval step activated (Waiting → Pending).
  */
@@ -45,6 +55,22 @@ async function notifyApprovalStepActivated(queryable, event, req) {
   const workflowCode = String(event.workflowCode || "").toUpperCase();
   if (workflowCode === "OFFER" || isOfferEvent(event)) {
     return offerWorkflowCompletionService.handleOfferStepActivated(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isHeadcountChangeEvent(event)) {
+    return requisitionHeadcountChangeService.handleHeadcountChangeStepActivated(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
+    return requisitionBudgetChangeService.handleBudgetChangeStepActivated(
       queryable,
       event,
       req
@@ -87,6 +113,22 @@ async function notifyWorkflowCompleted(queryable, event, req) {
     );
   }
 
+  if (workflowCode === "REQUISITION" && isHeadcountChangeEvent(event)) {
+    return requisitionHeadcountChangeService.handleHeadcountChangeWorkflowCompleted(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
+    return requisitionBudgetChangeService.handleBudgetChangeWorkflowCompleted(
+      queryable,
+      event,
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionWorkflowCompleted(
       queryable,
@@ -123,6 +165,22 @@ async function notifyWorkflowRejected(queryable, event, req) {
     );
   }
 
+  if (workflowCode === "REQUISITION" && isHeadcountChangeEvent(event)) {
+    return requisitionHeadcountChangeService.handleHeadcountChangeWorkflowRejected(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
+    return requisitionBudgetChangeService.handleBudgetChangeWorkflowRejected(
+      queryable,
+      event,
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionWorkflowRejected(
       queryable,
@@ -150,6 +208,22 @@ async function notifyClarificationRequested(queryable, event, req) {
   }
 
   const workflowCode = String(event.workflowCode || "").toUpperCase();
+  if (workflowCode === "REQUISITION" && isHeadcountChangeEvent(event)) {
+    return requisitionHeadcountChangeService.handleHeadcountChangeClarificationRequested(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
+    return requisitionBudgetChangeService.handleBudgetChangeClarificationRequested(
+      queryable,
+      event,
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionClarificationRequested(
       queryable,
@@ -177,6 +251,22 @@ async function notifyClarificationSubmitted(queryable, event, req) {
   }
 
   const workflowCode = String(event.workflowCode || "").toUpperCase();
+  if (workflowCode === "REQUISITION" && isHeadcountChangeEvent(event)) {
+    return requisitionHeadcountChangeService.handleHeadcountChangeClarificationSubmitted(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
+    return requisitionBudgetChangeService.handleBudgetChangeClarificationSubmitted(
+      queryable,
+      event,
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionClarificationSubmitted(
       queryable,

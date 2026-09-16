@@ -14,7 +14,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/offers", offerGuard, async (req, res) => {
     try {
-      const bundle = await offerManagementService.getOfferBundle(pool);
+      const bundle = await offerManagementService.getOfferBundle(pool, req);
       res.json(bundle);
     } catch (error) {
       handleError(res, error);
@@ -23,7 +23,7 @@ function registerOfferRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/offers/:offerId", offerGuard, async (req, res) => {
     try {
-      const offer = await offerManagementService.getOffer(pool, req.params.offerId);
+      const offer = await offerManagementService.getOffer(pool, req.params.offerId, req);
       res.json({ success: true, data: offer });
     } catch (error) {
       handleError(res, error);

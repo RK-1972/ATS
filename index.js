@@ -26,9 +26,21 @@ const interviewLegacyReadHandlers = require("./handlers/interviewLegacyReadHandl
 const candidateService = require("./services/candidateService");
 const candidateAccessService = require("./services/candidateAccessService");
 const recruitmentService = require("./services/recruitmentService");
+const legacyPipelineReadService = require("./services/legacyPipelineReadService");
 const workAssignmentService = require("./services/workAssignmentService");
 const workspaceResolverService = require("./services/workspaceResolverService");
+const hiringManagerIdentityService = require("./services/hiringManagerIdentityService");
 const approvalRouteRepository = require("./repositories/approvalRouteRepository");
+const { assertEmployeeAccountActive } = require("./middleware/activeEmployeeAuth");
+const {
+  allocateNextCandidateCode
+} = require("./utils/candidateCodeGenerator");
+const {
+  createDraftCandidateFromParsedIntake: createDraftCandidateFromParsedIntakeService
+} = require("./services/candidateDraftService");
+const {
+  respondClassicCandidateRouteDeprecated
+} = require("./utils/classicCandidateRouteDeprecation");
 
 const app = express();
 
@@ -307,6 +319,21 @@ async function createInterviewMeeting(
   }
 
 }
+
+// =====================================================
+// LIVE EMAIL ADAPTER BOUNDARY (Microsoft Graph — Phase 6C-0)
+// =====================================================
+// Production outbound email MUST go through the three functions below.
+// Do not add nodemailer, SMTP, or other direct send stacks for app mail.
+// Future notification orchestration (6C+) should call these adapters only.
+//
+// | Function                   | Sender mailbox                          |
+// | sendCandidateWelcomeEmail  | process.env.EMAIL_USER                  |
+// | sendPasswordResetEmail     | process.env.EMAIL_USER                  |
+// | sendInterviewEmail         | recruiterEmail (JWT user on schedule)   |
+//
+// Auth: getGraphToken() — CLIENT_ID, TENANT_ID, CLIENT_SECRET.
+// =====================================================
 
 // =====================================================
 // Send Interview Email To Candidate
@@ -1208,177 +1235,14 @@ async function createDraftCandidateFromParsedIntake({
   parsedCandidate,
   createdBy
 }) {
-
-  const {
-    first_name,
-    last_name
-  } = splitCandidateName(parsedCandidate.candidate_name);
-
-  const skillsList =
-    Array.isArray(parsedCandidate.skills)
-      ? parsedCandidate.skills
-      : [];
-
-  const primary_skill =
-    skillsList.length > 0
-      ? skillsList.join(", ")
-      : null;
-
-  const remarksParts = [];
-
-  if (parsedCandidate.education) {
-
-    remarksParts.push(
-      `Education: ${parsedCandidate.education}`
-    );
-
-  }
-
-  remarksParts.push(
-    `Intake ID: ${intake.intake_id}`
-  );
-
-  if (intake.original_file_name) {
-
-    remarksParts.push(
-      `Original File: ${intake.original_file_name}`
-    );
-
-  }
-
-  const emailId =
-    parsedCandidate.email
-      ? String(parsedCandidate.email).trim()
-      : null;
-
-  if (emailId) {
-
-    const existingByEmail = await pool.query(
-
-      `
-
-      SELECT
-        candidate_id,
-        candidate_code,
-        first_name,
-        last_name,
-        candidate_status,
-        email_id
-      FROM cand_mstr
-      WHERE email_id = $1
-      LIMIT 1
-
-      `,
-
-      [emailId]
-
-    );
-
-    if (existingByEmail.rows.length > 0) {
-
-      const existing = existingByEmail.rows[0];
-
-      return {
-        outcome: "DUPLICATE",
-        duplicate_candidate: {
-          candidate_id: existing.candidate_id,
-          candidate_code: existing.candidate_code,
-          first_name: existing.first_name,
-          last_name: existing.last_name,
-          candidate_status: existing.candidate_status,
-          email_id: existing.email_id
-        }
-      };
-
-    }
-
-  }
-
-  const today = new Date();
-
-  const day =
-    String(today.getDate()).padStart(2, "0");
-
-  const month =
-    String(today.getMonth() + 1).padStart(2, "0");
-
-  const year =
-    String(today.getFullYear()).slice(-2);
-
-  const datePrefix =
-    `${day}${month}${year}`;
-
-  const countResult = await pool.query(
-
-    `
-
-    SELECT COUNT(*) AS total
-    FROM cand_mstr
-    WHERE TO_CHAR(created_on, 'DDMMYY') = $1
-
-    `,
-
-    [datePrefix]
-
-  );
-
-  const runningNumber =
-    parseInt(countResult.rows[0].total, 10) + 1;
-
-  const candidateCode =
-    `${datePrefix}${runningNumber}`;
-
-  const result = await pool.query(
-
-    `
-
-    INSERT INTO cand_mstr (
-      candidate_code,
-      first_name,
-      last_name,
-      email_id,
-      mobile_number,
-      total_experience,
-      primary_skill,
-      resume_path,
-      source_channel,
-      candidate_status,
-      recruiter_id,
-      remarks,
-      created_by
-    )
-    VALUES (
-      $1, $2, $3, $4, $5,
-      $6, $7, $8, $9, $10,
-      $11, $12, $13
-    )
-    RETURNING candidate_id
-
-    `,
-
-    [
-      candidateCode,
-      first_name,
-      last_name,
-      emailId || null,
-      parsedCandidate.mobile || null,
-      normalizeExperience(parsedCandidate.experience),
-      primary_skill,
-      intake.resume_path || null,
-      intake.source_id || null,
-      "DRAFT",
-      createdBy || null,
-      remarksParts.join(" | "),
-      createdBy || null
-    ]
-
-  );
-
-  return {
-    outcome: "CREATED",
-    candidate_id: result.rows[0].candidate_id
-  };
-
+  return createDraftCandidateFromParsedIntakeService({
+    pool,
+    intake,
+    parsedCandidate,
+    createdBy,
+    splitCandidateName,
+    normalizeExperience
+  });
 }
 
 
@@ -1407,7 +1271,7 @@ async function markIntakeParsingFailed(intakeId, errorMessage) {
 // JWT TOKEN VERIFICATION MIDDLEWARE
 // =====================================================
 
-const verifyToken = (req, res, next) => {
+const verifyToken = async (req, res, next) => {
 
   try {
 
@@ -1441,6 +1305,20 @@ const verifyToken = (req, res, next) => {
 
         success: false,
         message: "Access Denied - Employee authentication required"
+
+      });
+
+    }
+
+    const isActive = await assertEmployeeAccountActive(pool, verifiedUser);
+
+    if (!isActive) {
+
+      return res.status(403).json({
+
+        success: false,
+        message:
+          "Account is inactive. Contact your administrator or sign in again after reactivation."
 
       });
 
@@ -1618,119 +1496,94 @@ app.post(
       }
 
 
-      const today = new Date();
+      const client = await pool.connect();
+      let result;
 
-      const day =
-        String(today.getDate()).padStart(2, "0");
+      try {
+        await client.query("BEGIN");
 
-      const month =
-        String(today.getMonth() + 1).padStart(2, "0");
+        const candidateCode = await allocateNextCandidateCode(client);
 
-      const year =
-        String(today.getFullYear()).slice(-2);
+        const query = `
 
-      const datePrefix =
-        `${day}${month}${year}`;
+          INSERT INTO cand_mstr (
 
+            candidate_code,
+            first_name,
+            last_name,
+            email_id,
+            pan_number,
+            mobile_number,
+            total_experience,
+            relevant_experience,
+            current_company,
+            current_ctc,
+            expected_ctc,
+            notice_period,
+            current_location,
+            preferred_location,
+            primary_skill,
+            secondary_skill,
+            linkedin_url,
+            resume_path,
+            source_channel,
+            candidate_status,
+            recruiter_id,
+            remarks,
+            created_by
 
-      const countResult = await pool.query(
+          )
 
-        `
+          VALUES (
 
-        SELECT COUNT(*) AS total
+            $1,$2,$3,$4,$5,
+            $6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,
+            $16,$17,$18,$19,$20,
+            $21,$22,$23
 
-        FROM cand_mstr
+          )
 
-        WHERE TO_CHAR(created_on, 'DDMMYY') = $1
+          RETURNING *
 
-        `,
+        `;
 
-        [datePrefix]
+        const values = [
 
-      );
-
-      const runningNumber =
-        parseInt(countResult.rows[0].total) + 1;
-
-
-      const candidateCode =
-        `${datePrefix}${runningNumber}`;
-
-
-      const query = `
-
-        INSERT INTO cand_mstr (
-
-          candidate_code,
+          candidateCode,
           first_name,
           last_name,
           email_id,
           pan_number,
           mobile_number,
-          total_experience,
-          relevant_experience,
+          total_experience || null,
+          relevant_experience || null,
           current_company,
-          current_ctc,
-          expected_ctc,
-          notice_period,
+          current_ctc || null,
+          expected_ctc || null,
+          notice_period || null,
           current_location,
           preferred_location,
           primary_skill,
           secondary_skill,
           linkedin_url,
-          resume_path,
+          resumePath,
           source_channel,
-          candidate_status,
-          recruiter_id,
+          candidate_status || "To be screened",
+          req.user.employee_code,
           remarks,
-          created_by
+          req.user.employee_code
 
-        )
+        ];
 
-        VALUES (
-
-          $1,$2,$3,$4,$5,
-          $6,$7,$8,$9,$10,
-          $11,$12,$13,$14,$15,
-          $16,$17,$18,$19,$20,
-          $21,$22,$23
-
-        )
-
-        RETURNING *
-
-      `;
-
-      const values = [
-
-        candidateCode,
-        first_name,
-        last_name,
-        email_id,
-        pan_number,
-        mobile_number,
-        total_experience || null,
-        relevant_experience || null,
-        current_company,
-        current_ctc || null,
-        expected_ctc || null,
-        notice_period || null,
-        current_location,
-        preferred_location,
-        primary_skill,
-        secondary_skill,
-        linkedin_url,
-        resumePath,
-        source_channel,
-        candidate_status || "To be screened",
-        req.user.employee_code,
-        remarks,
-        req.user.employee_code
-
-      ];
-
-      const result =
-        await pool.query(query, values);
+        result = await client.query(query, values);
+        await client.query("COMMIT");
+      } catch (insertError) {
+        await client.query("ROLLBACK");
+        throw insertError;
+      } finally {
+        client.release();
+      }
 
       res.status(201).json({
 
@@ -1973,6 +1826,12 @@ app.get(
 
       }
 
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
       if (!candidate.resume_path) {
 
         return res.status(404).json({
@@ -2047,10 +1906,10 @@ app.get(
 
       console.log(error);
 
-      return res.status(500).json({
+      return res.status(error.status || 500).json({
 
         success: false,
-        message: "Error retrieving resume."
+        message: error.message || "Error retrieving resume."
 
       });
 
@@ -2103,6 +1962,12 @@ app.put(
         });
 
       }
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const existing = existingCandidate.rows[0];
 
@@ -2466,10 +2331,10 @@ RETURNING *
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
-        message: "Error Updating Candidate"
+        message: error.message || "Error Updating Candidate"
 
       });
 
@@ -2645,6 +2510,12 @@ app.post(
       const candidateId = req.params.candidateId;
       const payload = pickEducationPayload(req.body);
 
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
       const data =
         await candidateService.insertChildRecord(
           pool,
@@ -2695,6 +2566,12 @@ app.put(
       const candidateId = req.params.candidateId;
       const educationId = req.params.educationId;
       const payload = pickEducationPayload(req.body);
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const master =
         await candidateService.getCandidateMaster(pool, candidateId);
@@ -2817,6 +2694,12 @@ app.delete(
 
       const candidateId = req.params.candidateId;
       const educationId = req.params.educationId;
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const master =
         await candidateService.getCandidateMaster(pool, candidateId);
@@ -3003,6 +2886,12 @@ app.post(
       const candidateId = req.params.candidateId;
       const payload = pickExperiencePayload(req.body);
 
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
       const data =
         await candidateService.insertChildRecord(
           pool,
@@ -3053,6 +2942,12 @@ app.put(
       const candidateId = req.params.candidateId;
       const experienceId = req.params.experienceId;
       const payload = pickExperiencePayload(req.body);
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const master =
         await candidateService.getCandidateMaster(pool, candidateId);
@@ -3175,6 +3070,12 @@ app.delete(
 
       const candidateId = req.params.candidateId;
       const experienceId = req.params.experienceId;
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
 
       const master =
         await candidateService.getCandidateMaster(pool, candidateId);
@@ -3389,66 +3290,8 @@ app.post(
 
 );
 // =====================================================
-// API 6 - Get All Users
+// API 6 - Get All Users (registered via userProvisioningRoutes)
 // =====================================================
-
-app.get(
-
-  "/users",
-
-  verifyToken,
-
-  verifyAdmin,
-
-  async (req, res) => {
-
-    try {
-
-      const result = await pool.query(`
-
-        SELECT
-
-          user_id,
-          employee_code,
-          full_name,
-          email_id,
-          role_name,
-          is_active,
-          created_on
-
-        FROM user_mstr
-
-        ORDER BY user_id DESC
-
-      `);
-
-      res.status(200).json({
-
-        success: true,
-        data: result.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log("❌ Fetch Users Error");
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-        message: "Error Fetching Users"
-
-      });
-
-    }
-
-  }
-
-);
 // =====================================================
 // API 7 - Create Requisition
 // =====================================================
@@ -3489,116 +3332,8 @@ app.put(
 
   verifyToken,
 
-  async (req, res) => {
-
-    try {
-
-      const reqId = req.params.id;
-
-      const {
-
-        client_name,
-        project_name,
-        job_title,
-        job_description,
-        primary_skill,
-        secondary_skill,
-        experience_min,
-        experience_max,
-        openings_count,
-        work_location,
-        employment_type,
-        priority_level,
-        req_status,
-        recruiter_id,
-        hiring_manager,
-        target_date
-
-      } = req.body;
-
-
-      const result = await pool.query(
-
-        `
-
-        UPDATE req_mstr
-
-        SET
-
-          client_name = $1,
-          project_name = $2,
-          job_title = $3,
-          job_description = $4,
-          primary_skill = $5,
-          secondary_skill = $6,
-          experience_min = $7,
-          experience_max = $8,
-          openings_count = $9,
-          work_location = $10,
-          employment_type = $11,
-          priority_level = $12,
-          req_status = $13,
-          recruiter_id = $14,
-          hiring_manager = $15,
-          target_date = $16,
-          updated_on = CURRENT_TIMESTAMP
-
-        WHERE req_id = $17
-
-        RETURNING *
-
-        `,
-
-        [
-
-          client_name,
-          project_name,
-          job_title,
-          job_description,
-          primary_skill,
-          secondary_skill,
-          experience_min,
-          experience_max,
-          openings_count,
-          work_location,
-          employment_type,
-          priority_level,
-          req_status,
-          recruiter_id,
-          hiring_manager,
-          target_date,
-          reqId
-
-        ]
-
-      );
-
-      res.status(200).json({
-
-        success: true,
-        message: "Requisition Updated Successfully",
-        data: result.rows[0]
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log("❌ Update Requisition Error");
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-        message: "Error Updating Requisition"
-
-      });
-
-    }
-
-  }
+  (req, res) =>
+    recruitmentLegacyHandlers.handleLegacyUpdateRequisition(pool, req, res)
 
 );
 // =====================================================
@@ -4088,11 +3823,12 @@ app.post(
             client_id,
             project_id,
             hiring_manager_name,
-            email_id
+            email_id,
+            employee_code
 
           )
 
-          VALUES ($1,$2,$3,$4)
+          VALUES ($1,$2,$3,$4,$5)
 
           RETURNING *
 
@@ -4103,7 +3839,10 @@ app.post(
             client_id,
             project_id,
             hiring_manager_name,
-            email_id
+            email_id,
+            req.body.employee_code
+              ? String(req.body.employee_code).trim() || null
+              : null
 
           ]
 
@@ -4468,6 +4207,17 @@ app.post("/login", async (req, res) => {
 
     }
 
+    if (user.is_active === false) {
+
+      return res.status(403).json({
+
+        success: false,
+        message: "Account is inactive. Contact your administrator."
+
+      });
+
+    }
+
     if (!process.env.JWT_SECRET) {
 
       console.error("[login] JWT_SECRET is not configured");
@@ -4552,6 +4302,28 @@ app.post("/login", async (req, res) => {
       workspace = {};
     }
 
+    try {
+      await hiringManagerIdentityService.resolveBoundHiringManager(pool, {
+        user: {
+          employee_code: user.employee_code,
+          email_id: user.email_id
+        }
+      });
+      workspace = {
+        ...workspace,
+        showHiringManagerWorkspace: true
+      };
+    } catch (_hmBindingError) {
+      // HM workspace visibility requires a bound hiring_manager_mstr profile.
+    }
+
+    if (user.role_name === "TA Lead" || user.role_name === "TA Leader") {
+      workspace = {
+        ...workspace,
+        showTaLeadWorkspace: true
+      };
+    }
+
     res.status(200).json({
 
       success: true,
@@ -4610,7 +4382,7 @@ app.post(
 
   verifyToken,
 
-  (req, res) => recruitmentLegacyHandlers.handleLegacyMapCandidate(pool, req, res)
+  (req, res) => respondClassicCandidateRouteDeprecated(res)
 
 );
 
@@ -4628,74 +4400,16 @@ app.get(
 
     try {
 
-      const reqId =
-        req.params.reqId;
-
-      const result =
-        await pool.query(
-
-          `
-
-          SELECT
-
-            crm.map_id,
-
-            crm.stage_name,
-
-            crm.source_type,
-
-            crm.applied_date,
-
-            crm.remarks,
-
-            crm.recruiter_id,
-
-            c.candidate_id,
-
-            c.candidate_code,
-
-            c.first_name,
-
-            c.last_name,
-
-            c.email_id,
-
-            c.mobile_number,
-
-            r.req_id,
-
-            r.req_code,
-
-            r.job_title
-
-          FROM candidate_req_map crm
-
-          LEFT JOIN cand_mstr c
-
-          ON crm.candidate_id =
-             c.candidate_id
-
-          LEFT JOIN req_mstr r
-
-          ON crm.req_id =
-             r.req_id
-
-          WHERE crm.req_id = $1
-          AND crm.is_active = true
-
-          ORDER BY crm.applied_date DESC
-
-          `,
-
-          [reqId]
-
-        );
+      const data = await legacyPipelineReadService.listCandidatesByReq(
+        pool,
+        req.params.reqId
+      );
 
       res.status(200).json({
 
         success: true,
 
-        data: result.rows
+        data
 
       });
 
@@ -4734,7 +4448,7 @@ app.put(
 
   verifyToken,
 
-  (req, res) => recruitmentLegacyHandlers.handleLegacyUpdateStage(pool, req, res)
+  (req, res) => respondClassicCandidateRouteDeprecated(res)
 
 );
 // =====================================================
@@ -4825,109 +4539,7 @@ app.get(
 
   verifyToken,
 
-  async (req, res) => {
-
-    try {
-
-      let query = `
-
-        SELECT
-
-          crm.map_id,
-
-          c.candidate_code,
-
-          c.first_name,
-          c.last_name,
-
-          r.req_code,
-          r.job_title,
-          r.client_name,
-          r.project_name,
-
-          crm.stage_name,
-          crm.source_type,
-
-          crm.recruiter_id,
-
-          crm.applied_date
-
-        FROM candidate_req_map crm
-
-        LEFT JOIN cand_mstr c
-        ON crm.candidate_id = c.candidate_id
-
-        LEFT JOIN req_mstr r
-        ON crm.req_id::TEXT = r.req_id::TEXT
-
-        WHERE crm.is_active = true
-
-      `;
-
-      const values = [];
-
-      // =====================================
-      // Recruiter Restriction
-      // =====================================
-
-      if (req.user.role_name === "Recruiter") {
-
-        query += `
-
-          AND crm.recruiter_id = $1
-
-        `;
-
-        values.push(
-          req.user.employee_code
-        );
-
-      }
-
-      query += `
-
-        ORDER BY crm.applied_date DESC
-
-      `;
-
-      const result =
-        await pool.query(
-          query,
-          values
-        );
-
-      console.log(result.rows);
-
-      res.status(200).json({
-
-        success: true,
-
-        data: result.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "❌ Pipeline Details Error"
-      );
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Error Fetching Pipeline Details"
-
-      });
-
-    }
-
-  }
+  (req, res) => respondClassicCandidateRouteDeprecated(res)
 
 );
 
@@ -5055,15 +4667,11 @@ app.get(
         req.query.period || "month";
 
       let candidateDateFilter = "";
-      let pipelineDateFilter = "";
 
       if (period === "today") {
 
         candidateDateFilter =
           "AND created_on::date = CURRENT_DATE";
-
-        pipelineDateFilter =
-          "AND applied_date::date = CURRENT_DATE";
 
       }
 
@@ -5072,18 +4680,12 @@ app.get(
         candidateDateFilter =
           "AND created_on >= date_trunc('week', CURRENT_DATE)";
 
-        pipelineDateFilter =
-          "AND applied_date >= date_trunc('week', CURRENT_DATE)";
-
       }
 
       else if (period === "month") {
 
         candidateDateFilter =
           "AND created_on >= date_trunc('month', CURRENT_DATE)";
-
-        pipelineDateFilter =
-          "AND applied_date >= date_trunc('month', CURRENT_DATE)";
 
       }
 
@@ -5092,18 +4694,12 @@ app.get(
         candidateDateFilter =
           "AND created_on >= date_trunc('quarter', CURRENT_DATE)";
 
-        pipelineDateFilter =
-          "AND applied_date >= date_trunc('quarter', CURRENT_DATE)";
-
       }
 
       else if (period === "year") {
 
         candidateDateFilter =
           "AND created_on >= date_trunc('year', CURRENT_DATE)";
-
-        pipelineDateFilter =
-          "AND applied_date >= date_trunc('year', CURRENT_DATE)";
 
       }
 
@@ -5138,20 +4734,11 @@ app.get(
 
         `);
 
-      const pipeline =
-        await pool.query(`
-
-          SELECT
-
-            COUNT(*) AS pipeline_records
-
-          FROM candidate_req_map
-
-          WHERE is_active = true
-
-          ${pipelineDateFilter}
-
-        `);
+      const pipelineRecords =
+        await legacyPipelineReadService.countPipelineRecords(
+          pool,
+          period
+        );
 
       res.status(200).json({
 
@@ -5162,7 +4749,7 @@ app.get(
           ...result.rows[0],
 
           pipeline_records:
-            pipeline.rows[0].pipeline_records,
+            pipelineRecords,
 
           selected_period:
             period
@@ -5426,173 +5013,7 @@ app.post(
 
   verifyToken,
 
-  async (req, res) => {
-
-    try {
-console.log("===== API 34 HIT =====");
-console.log("Logged In User:");
-console.log(req.user);
-        const {
-
-  candidate_id,
-  requisition_code,
-  stage_name,
-  source_type,
-  remarks
-
-} = req.body;
-const reqLookup = await pool.query(
-  `
-  SELECT req_id
-  FROM rm_requisitions
-  WHERE requisition_code = $1
-  `,
-  [requisition_code]
-);
-
-if (reqLookup.rows.length === 0) {
-  return res.status(404).json({
-    success: false,
-    message: "Requisition not found"
-  });
-}
-
-const req_id = reqLookup.rows[0].req_id;
-
-if (!req_id) {
-  return res.status(400).json({
-    success: false,
-    message: "Enterprise requisition is not linked to a legacy Req ID."
-  });
-}
-
-// ===============================================
-// DEBUG LOGS  ← ADD THEM HERE
-// ===============================================
-
-console.log("==================================");
-console.log("Candidate ID      :", candidate_id);
-console.log("Requisition Code  :", requisition_code);
-console.log("Resolved Req ID   :", req_id);
-console.log("==================================");
-
-// ===============================================
-// Existing Mapping Check
-// ===============================================
-
-      const existingMap =
-        await pool.query(
-
-          `
-
-          SELECT *
-
-          FROM candidate_req_map
-
-          WHERE candidate_id = $1
-          AND req_id = $2
-          AND is_active = true
-
-          `,
-
-          [
-
-            candidate_id,
-            req_id
-
-          ]
-
-        );
-
-      if (existingMap.rows.length > 0) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "Candidate Already Mapped"
-
-        });
-
-      }
-
-      const result =
-        await pool.query(
-
-          `
-
-          INSERT INTO candidate_req_map (
-
-            candidate_id,
-            req_id,
-            recruiter_id,
-            stage_name,
-            source_type,
-            remarks
-
-          )
-
-          VALUES (
-
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6
-
-          )
-
-          RETURNING *
-
-          `,
-
-          [
-  candidate_id,
-  req_id,
-  req.user.employee_code,
-  stage_name || "Applied",
-  source_type,
-  remarks
-]
-
-        );
-
-      res.status(201).json({
-
-        success: true,
-
-        message:
-          "Candidate Mapped Successfully",
-
-        data:
-          result.rows[0]
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "❌ Map Existing Candidate Error"
-      );
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Error Mapping Candidate"
-
-      });
-
-    }
-
-  }
+  (req, res) => respondClassicCandidateRouteDeprecated(res)
 
 );
 
@@ -5747,103 +5168,7 @@ app.get(
 
   verifyToken,
 
-  async (req, res) => {
-
-    try {
-
-      const result =
-        await pool.query(
-
-          `
-
-          SELECT
-
-            cm.candidate_id,
-            cm.candidate_code,
-
-            cm.first_name,
-            cm.last_name,
-
-            cm.email_id,
-            cm.mobile_number,
-
-            cm.primary_skill,
-            cm.total_experience,
-
-            crm.stage_name,
-            crm.source_type,
-            crm.applied_date,
-
-            rm.req_code,
-            rm.job_title
-
-          FROM cand_mstr cm
-
-          LEFT JOIN candidate_req_map crm
-
-            ON cm.candidate_id =
-               crm.candidate_id
-
-            AND crm.is_active = true
-
-          LEFT JOIN req_mstr rm
-
-            ON crm.req_id =
-               rm.req_id
-
-          WHERE
-
-            cm.candidate_container = 'PIPELINE'
-            AND cm.owner_employee_code = $1
-
-          ORDER BY
-
-            crm.applied_date DESC NULLS LAST
-
-          `,
-
-          [
-
-            req.user.employee_code
-
-          ]
-
-        );
-
-      res.status(200).json({
-
-        success: true,
-
-        count:
-          result.rows.length,
-
-        data:
-          result.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "❌ My Candidates List Error"
-      );
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Error Fetching Candidates"
-
-      });
-
-    }
-
-  }
+  (req, res) => respondClassicCandidateRouteDeprecated(res)
 
 );
 
@@ -5862,66 +5187,6 @@ app.get(
 );
 
 // =====================================================
-// API 40 - Test Email
-// =====================================================
-
-
-app.get(
-
-  "/test-email",
-
-  async (req, res) => {
-
-    try {
-
-      await sendEmail(
-
-        "raghavendra.karanik@igsglobal.com",
-
-        "ATS Test Email",
-
-        `
-        <h2>ATS Email Service Working</h2>
-
-        <p>
-          Congratulations!
-          Nodemailer has been configured successfully.
-        </p>
-        `
-
-      );
-
-      res.status(200).json({
-
-        success: true,
-
-        message:
-          "Email Sent Successfully"
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Email Sending Failed"
-
-      });
-
-    }
-
-  }
-
-);
-
-// =====================================================
 // API 41 - Add Interview Panel
 // =====================================================
 
@@ -5930,6 +5195,8 @@ app.post(
   "/interview-panel",
 
   verifyToken,
+
+  verifyAdmin,
 
   async (req, res) => {
 
@@ -6238,6 +5505,8 @@ app.put(
   "/interview-panel/:id",
 
   verifyToken,
+
+  verifyAdmin,
 
   async (req, res) => {
 
@@ -7125,168 +6394,7 @@ app.get(
 app.get(
   "/my-interviews",
   verifyToken,
-  async (req, res) => {
-
-    try {
-
-      const panelResult =
-        await pool.query(
-          `
-          SELECT panel_id
-          FROM interview_panel_mstr
-          WHERE employee_code = $1
-            AND is_active = true
-          `,
-          [
-            req.user.employee_code
-          ]
-        );
-
-      if (
-        panelResult.rows.length === 0
-      ) {
-
-        return res.status(404).json({
-
-          success: false,
-
-          message:
-            "Interviewer profile not found"
-
-        });
-
-      }
-
-      const panelId =
-        panelResult.rows[0].panel_id;
-
-      // Dual-read: enterprise mappings (rm_*) preferred, legacy candidate_req_map fallback.
-      // INNER JOIN on legacy map alone hid enterprise-scheduled interviews.
-      const result =
-        await pool.query(
-
-          `
-          SELECT
-
-            s.schedule_id,
-
-            s.round_type,
-            s.interview_date,
-            s.interview_time,
-            COALESCE(i.interview_status, s.interview_status) AS interview_status,
-            COALESCE(i.feedback_submitted, s.feedback_submitted, false) AS feedback_submitted,
-            COALESCE(i.final_outcome, fh.final_outcome) AS final_outcome,
-            COALESCE(i.meeting_link, s.meeting_link) AS meeting_link,
-
-            COALESCE(rcm.map_id, crm.map_id) AS map_id,
-            COALESCE(rcm.stage_name, crm.stage_name) AS stage_name,
-
-            c.candidate_id,
-            c.candidate_code,
-
-            CONCAT(
-              c.first_name,
-              ' ',
-              c.last_name
-            ) AS candidate_name,
-
-            c.email_id,
-            c.resume_path,
-
-            COALESCE(rr_by_id.req_id, rr_by_code.req_id, r.req_id, s.req_id) AS req_id,
-            COALESCE(rr_by_id.requisition_code, rr_by_code.requisition_code, r.req_code) AS req_code,
-            COALESCE(r.client_name, rr_by_id.department, rr_by_code.department) AS client_name,
-            COALESCE(rr_by_id.position_title, rr_by_code.position_title, r.job_title) AS job_title,
-
-            COALESCE(rr_by_id.primary_skill, rr_by_code.primary_skill, r.primary_skill, c.primary_skill) AS primary_skill,
-            COALESCE(r.secondary_skill, c.secondary_skill) AS secondary_skill,
-
-            r.experience_min,
-            r.experience_max,
-
-            ip.interviewer_name
-
-          FROM interview_schedule_trn s
-
-          LEFT JOIN im_interviews i
-            ON i.schedule_id = s.schedule_id
-
-          LEFT JOIN rm_candidate_mappings rcm
-            ON rcm.map_id = s.map_id
-           AND rcm.is_active = true
-
-          LEFT JOIN candidate_req_map crm
-            ON crm.map_id = s.map_id
-
-          INNER JOIN cand_mstr c
-            ON c.candidate_id =
-               COALESCE(rcm.candidate_id, crm.candidate_id)
-
-          LEFT JOIN rm_requisitions rr_by_id
-            ON rr_by_id.req_id = COALESCE(i.req_id, rcm.req_id, s.req_id)
-
-          LEFT JOIN rm_requisitions rr_by_code
-            ON rr_by_code.requisition_code =
-               COALESCE(i.requisition_code, rcm.requisition_code)
-
-          LEFT JOIN req_mstr r
-            ON r.req_id = COALESCE(crm.req_id, s.req_id)
-
-          INNER JOIN interview_panel_mstr ip
-            ON ip.panel_id =
-               s.interviewer_id
-
-          LEFT JOIN interview_feedback_hdr fh
-          ON fh.schedule_id = s.schedule_id
-
-          WHERE
-            s.interviewer_id = $1
-
-          ORDER BY
-
-            s.interview_date DESC,
-
-            s.interview_time DESC
-          `,
-
-          [panelId]
-
-        
-        );
-
-      res.status(200).json({
-
-        success: true,
-
-        count:
-          result.rows.length,
-
-        data:
-          result.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.error(
-        "API 47 Error:",
-        error
-      );
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Internal Server Error"
-
-      });
-
-    }
-
-  }
+  (req, res) => interviewLegacyReadHandlers.handleGetMyInterviews(pool, req, res)
 );
 
 // =====================================================
@@ -7374,114 +6482,6 @@ app.get(
 
 
 // =====================================================
-// API 49 - My Interviews
-// =====================================================
-
-app.get(
-
-  "/my-interviews",
-
-  verifyToken,
-
-  async (req, res) => {
-
-    try {
-
-      const userId =
-        req.user.user_id;
-
-      const result =
-        await pool.query(
-
-          `
-
-          SELECT
-
-            s.schedule_id,
-
-            c.candidate_id,
-
-            c.candidate_code,
-
-            c.first_name,
-            c.last_name,
-
-            r.req_id,
-            r.position_title,
-
-            s.round_type,
-            s.interview_date,
-            s.interview_time,
-
-            s.interview_status,
-
-            ip.panel_id,
-            ip.interviewer_name
-
-          FROM interview_schedule_trn s
-
-          INNER JOIN interview_panel_mstr ip
-            ON s.interviewer_id = ip.panel_id
-
-          INNER JOIN candidate_req_map crm
-            ON s.map_id = crm.map_id
-
-          INNER JOIN cand_mstr c
-            ON crm.candidate_id = c.candidate_id
-
-          INNER JOIN requisition_mstr r
-            ON crm.req_id = r.req_id
-
-          WHERE ip.user_id = $1
-
-          ORDER BY
-            s.interview_date,
-            s.interview_time
-
-          `,
-
-          [userId]
-
-        );
-
-      res.status(200).json({
-
-        success: true,
-
-        count:
-          result.rows.length,
-
-        data:
-          result.rows
-
-      });
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "❌ API 49 Error"
-      );
-
-      console.log(error);
-
-      res.status(500).json({
-
-        success: false,
-
-        message:
-          "Error Fetching Interviews"
-
-      });
-
-    }
-
-  }
-
-);
-
-// =====================================================
 // API 50 - Feedback Details
 // =====================================================
 
@@ -7495,103 +6495,18 @@ app.get(
 
     try {
 
-      const scheduleId =
-        req.params.scheduleId;
-
-      // Dual-read: enterprise mapping preferred; legacy map fallback (same SoR gap as /my-interviews).
-      const result =
-        await pool.query(
-
-          `
-
-          SELECT
-
-            ist.schedule_id,
-
-            ist.round_type
-              AS interview_level,
-
-            cm.candidate_code,
-
-            CONCAT(
-              cm.first_name,
-              ' ',
-              cm.last_name
-            ) AS candidate_name,
-
-            COALESCE(rr_by_id.req_id, rr_by_code.req_id, rm.req_id, ist.req_id) AS req_id,
-
-            COALESCE(rr_by_id.requisition_code, rr_by_code.requisition_code, rm.req_code) AS req_code,
-
-            COALESCE(rm.client_name, rr_by_id.department, rr_by_code.department) AS client_name,
-
-            COALESCE(rr_by_id.position_title, rr_by_code.position_title, rm.job_title) AS job_title,
-
-            ip.interviewer_name,
-
-            ip.employee_code
-              AS interviewer_code
-
-          FROM interview_schedule_trn ist
-
-          LEFT JOIN im_interviews i
-            ON i.schedule_id = ist.schedule_id
-
-          LEFT JOIN rm_candidate_mappings rcm
-            ON rcm.map_id = ist.map_id
-           AND rcm.is_active = true
-
-          LEFT JOIN candidate_req_map crm
-            ON crm.map_id = ist.map_id
-
-          INNER JOIN cand_mstr cm
-            ON cm.candidate_id =
-               COALESCE(rcm.candidate_id, crm.candidate_id)
-
-          LEFT JOIN rm_requisitions rr_by_id
-            ON rr_by_id.req_id = COALESCE(i.req_id, rcm.req_id, ist.req_id)
-
-          LEFT JOIN rm_requisitions rr_by_code
-            ON rr_by_code.requisition_code =
-               COALESCE(i.requisition_code, rcm.requisition_code)
-
-          LEFT JOIN req_mstr rm
-            ON rm.req_id = COALESCE(crm.req_id, ist.req_id)
-
-          INNER JOIN interview_panel_mstr ip
-            ON ip.panel_id =
-               ist.interviewer_id
-
-          WHERE
-            ist.schedule_id = $1
-
-          `,
-
-          [scheduleId]
-
-        );
-
-      if (
-        result.rows.length === 0
-      ) {
-
-        return res.status(404).json({
-
-          success: false,
-
-          message:
-            "Interview Schedule Not Found"
-
-        });
-
-      }
+      const interviewService = require("./services/interviewService");
+      const data = await interviewService.getFeedbackDetailsBySchedule(
+        pool,
+        req.params.scheduleId,
+        req
+      );
 
       res.status(200).json({
 
         success: true,
 
-        data:
-          result.rows[0]
+        data
 
       });
 
@@ -7605,12 +6520,12 @@ app.get(
 
       console.log(error);
 
-      res.status(500).json({
+      res.status(error.status || 500).json({
 
         success: false,
 
         message:
-          "Error Fetching Feedback Details"
+          error.message || "Error Fetching Feedback Details"
 
       });
 
@@ -8383,11 +7298,15 @@ const {
   registerHiringControlTowerRoutes
 } = require("./routes/hiringControlTowerRoutes");
 const {
+  registerUserProvisioningRoutes
+} = require("./routes/userProvisioningRoutes");
+const {
   registerAdminCommandCenterRoutes
 } = require("./routes/adminCommandCenterRoutes");
 const {
   registerReportBuilderRoutes
 } = require("./routes/reportBuilderRoutes");
+const { registerAuditRoutes } = require("./routes/auditRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -8404,10 +7323,14 @@ registerDocumentTemplateRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlaceholderRoutes(app, verifyToken);
 registerDocumentRoutes(app, pool, verifyToken);
 registerUserPermissionRoutes(app, pool, verifyToken, verifyAdmin);
+registerUserProvisioningRoutes(app, pool, verifyToken);
 registerTalentDemandDraftRoutes(app, pool, verifyToken);
 registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerHiringControlTowerRoutes(app, pool, verifyToken, verifyAdmin);
+const { registerTaLeadRoutes } = require("./routes/taLeadRoutes");
+registerTaLeadRoutes(app, pool, verifyToken);
 registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
+registerAuditRoutes(app, pool, verifyToken, verifyAdmin);
 registerReportBuilderRoutes(app, pool, verifyToken);
 registerCandidatePortalRoutes(
   app,
@@ -10118,6 +9041,7 @@ app.post(
         SELECT
           intake_id,
           source_id,
+          source_reference,
           resume_path,
           original_file_name,
           parsing_status,

@@ -5,6 +5,7 @@ const taskService = require("./taskService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled, isEnterpriseOperationalSor } = require("../config/operationalCutover");
 const { normalizeRating, formatRatingLabel } = require("./operationalMigrationService");
+const { applyEnterpriseInterviewStageTransition } = require("./pipelineHistoryService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "interviews.seed.json");
 
@@ -143,22 +144,90 @@ function mapInterviewRow(row) {
   };
 }
 
-async function getInterviewBundle(pool) {
-  const interviews = await pool.query(
-    "SELECT * FROM im_interviews ORDER BY created_on DESC"
-  );
-  const panel = await pool.query(
-    "SELECT * FROM im_panel_assignments ORDER BY assigned_on DESC"
+function buildInterviewBundleSummary(rows) {
+  return {
+    scheduled: rows.filter((row) => row.interview_status === "Scheduled").length,
+    completed: rows.filter((row) => row.interview_status === "Completed").length,
+    pendingFeedback: rows.filter((row) => !row.feedback_submitted).length
+  };
+}
+
+async function listScopedInterviewRows(pool, req) {
+  if (isAdminUser(req)) {
+    const result = await pool.query(
+      "SELECT * FROM im_interviews ORDER BY created_on DESC"
+    );
+    return result.rows;
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const panelIds = await resolveCallerPanelIds(pool, req);
+  const panelIdList = panelIds.length ? panelIds : [-1];
+
+  const result = await pool.query(
+    `SELECT DISTINCT i.*
+     FROM im_interviews i
+     LEFT JOIN rm_candidate_mappings rcm
+       ON rcm.map_id = i.map_id
+      AND rcm.is_active = true
+     LEFT JOIN cand_mstr cm
+       ON cm.candidate_id = COALESCE(rcm.candidate_id, i.candidate_id)
+     LEFT JOIN im_panel_assignments ipa
+       ON ipa.interview_id = i.interview_id
+      AND ipa.assignment_status <> 'Reassigned'
+     LEFT JOIN interview_schedule_trn ist
+       ON ist.schedule_id = i.schedule_id
+     WHERE (
+       EXISTS (
+         SELECT 1
+         FROM rm_recruiter_assignments a
+         WHERE a.recruiter_code = $1
+           AND a.is_active = true
+           AND (
+             (i.requisition_code IS NOT NULL AND a.requisition_code = i.requisition_code)
+             OR (i.req_id IS NOT NULL AND a.req_id = i.req_id)
+           )
+       )
+       OR ($1 <> '' AND cm.owner_employee_code = $1)
+       OR ipa.panel_id = ANY($2::int[])
+       OR ist.interviewer_id = ANY($2::int[])
+     )
+     ORDER BY i.created_on DESC`,
+    [employeeCode, panelIdList]
   );
 
+  return result.rows;
+}
+
+async function listScopedPanelAssignmentRows(pool, req, interviewIds) {
+  if (!interviewIds.length) {
+    return [];
+  }
+
+  const result = await pool.query(
+    `SELECT *
+     FROM im_panel_assignments
+     WHERE interview_id = ANY($1::varchar[])
+     ORDER BY assigned_on DESC`,
+    [interviewIds]
+  );
+
+  return result.rows;
+}
+
+async function getInterviewBundle(pool, req) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  const interviewRows = await listScopedInterviewRows(pool, req);
+  const interviewIds = interviewRows.map((row) => row.interview_id);
+  const panelRows = await listScopedPanelAssignmentRows(pool, req, interviewIds);
+
   return {
-    interviews: interviews.rows.map(mapInterviewRow),
-    panelAssignments: panel.rows,
-    summary: {
-      scheduled: interviews.rows.filter((row) => row.interview_status === "Scheduled").length,
-      completed: interviews.rows.filter((row) => row.interview_status === "Completed").length,
-      pendingFeedback: interviews.rows.filter((row) => !row.feedback_submitted).length
-    }
+    interviews: interviewRows.map(mapInterviewRow),
+    panelAssignments: panelRows,
+    summary: buildInterviewBundleSummary(interviewRows)
   };
 }
 
@@ -168,7 +237,6 @@ async function scheduleInterview(pool, payload, req) {
   await assertInterviewModuleEnabled(platformConfig);
 
   const {
-    req_id: reqId,
     map_id: mapId,
     interviewer_id: interviewerId,
     round_no: roundNo = 1,
@@ -181,9 +249,14 @@ async function scheduleInterview(pool, payload, req) {
     interviewer_type: interviewerType
   } = payload;
 
+  let resolvedReqId = payload.req_id ?? null;
+
   if (!mapId || !interviewerId || !roundType || !interviewDate || !interviewTime) {
     throw httpError("Required fields are missing.", 400);
   }
+
+  const recruitmentService = require("./recruitmentService");
+  await recruitmentService.assertAuthorizedMappingAccess(pool, req, mapId);
 
   const selectedDate = new Date(interviewDate);
   const today = new Date();
@@ -201,7 +274,7 @@ async function scheduleInterview(pool, payload, req) {
   let requisitionCode = null;
 
   const enterpriseMap = await pool.query(
-    `SELECT candidate_id, req_id, requisition_code
+    `SELECT mapping_id, candidate_id, req_id, requisition_code, stage_name
      FROM rm_candidate_mappings
      WHERE map_id = $1 AND is_active = true`,
     [mapId]
@@ -209,7 +282,7 @@ async function scheduleInterview(pool, payload, req) {
 
   if (enterpriseMap.rows.length) {
     candidateId = enterpriseMap.rows[0].candidate_id;
-    reqId ||= enterpriseMap.rows[0].req_id;
+    resolvedReqId ||= enterpriseMap.rows[0].req_id;
     requisitionCode = enterpriseMap.rows[0].requisition_code;
   } else if (isLegacyDualWriteEnabled() && (await tableExists(pool, "candidate_req_map"))) {
     const mapResult = await pool.query(
@@ -220,7 +293,7 @@ async function scheduleInterview(pool, payload, req) {
       throw httpError("Candidate mapping not found.", 404);
     }
     candidateId = mapResult.rows[0].candidate_id;
-    reqId ||= mapResult.rows[0].req_id;
+    resolvedReqId ||= mapResult.rows[0].req_id;
   } else {
     throw httpError("Candidate mapping not found.", 404);
   }
@@ -228,9 +301,24 @@ async function scheduleInterview(pool, payload, req) {
   if (!requisitionCode) {
     const rmResult = await pool.query(
       "SELECT requisition_code FROM rm_requisitions WHERE req_id = $1 LIMIT 1",
-      [reqId]
+      [resolvedReqId]
     );
     requisitionCode = rmResult.rows[0]?.requisition_code || null;
+  }
+
+  if (requisitionCode) {
+    const requisitionResult = await pool.query(
+      `SELECT requisition_code, req_status
+       FROM rm_requisitions
+       WHERE requisition_code = $1`,
+      [requisitionCode]
+    );
+    const requisition = requisitionResult.rows[0];
+
+    if (requisition) {
+      const { assertRequisitionOpenForRecruiting } = require("./requisitionFulfillmentService");
+      assertRequisitionOpenForRecruiting(requisition);
+    }
   }
 
   const ruleEval = await evaluateInterviewRules(pool, {
@@ -250,7 +338,7 @@ async function scheduleInterview(pool, payload, req) {
       meta: {
         interview_id: interviewId,
         map_id: mapId,
-        req_id: reqId,
+        req_id: resolvedReqId,
         round_type: roundType
       }
     },
@@ -286,7 +374,7 @@ async function scheduleInterview(pool, payload, req) {
     [
       interviewId,
       mapId,
-      reqId,
+      resolvedReqId,
       requisitionCode,
       candidateId,
       roundNo,
@@ -366,7 +454,7 @@ async function scheduleInterview(pool, payload, req) {
     action: `${roundType} interview scheduled`,
     userName: user.name,
     userRole: user.role,
-    metadata: { mapId, reqId, ruleEvaluation: ruleEval, feedbackReminderHours }
+    metadata: { mapId, reqId: resolvedReqId, ruleEvaluation: ruleEval, feedbackReminderHours }
   });
 
   const stageName = stageNameForRound(roundType);
@@ -378,10 +466,19 @@ async function scheduleInterview(pool, payload, req) {
   }
 
   if (isEnterpriseOperationalSor() && enterpriseMap.rows.length) {
-    await pool.query(
-      "UPDATE rm_candidate_mappings SET stage_name = $1, modified_on = NOW() WHERE map_id = $2",
-      [stageName, mapId]
-    );
+    await applyEnterpriseInterviewStageTransition(pool, {
+      mapId,
+      newStage: stageName,
+      eventType: "InterviewScheduledStage",
+      user,
+      comments: remarks || null,
+      metadata: {
+        interviewId,
+        roundType,
+        reqId: resolvedReqId,
+        ruleEvaluation: ruleEval
+      }
+    });
   }
 
   return {
@@ -390,7 +487,7 @@ async function scheduleInterview(pool, payload, req) {
       interview_id: interviewId,
       schedule_id: null,
       map_id: mapId,
-      req_id: reqId,
+      req_id: resolvedReqId,
       requisition_code: requisitionCode,
       candidate_id: candidateId,
       round_no: roundNo,
@@ -1086,69 +1183,77 @@ function resolveStageFromOutcome(interviewLevel, finalOutcome) {
 }
 
 async function syncLegacyFeedback(pool, interview, payload, user) {
-  if (!isLegacyDualWriteEnabled()) {
-    return;
-  }
-
   const scheduleId = interview.scheduleId || payload.schedule_id;
-  if (!scheduleId || !(await tableExists(pool, "interview_feedback_hdr"))) {
-    return;
-  }
+  const newStage = resolveStageFromOutcome(payload.interview_level, payload.final_outcome);
 
-  const existing = await pool.query(
-    "SELECT 1 FROM interview_feedback_hdr WHERE schedule_id = $1",
-    [scheduleId]
-  );
+  if (isLegacyDualWriteEnabled()) {
+    if (scheduleId && (await tableExists(pool, "interview_feedback_hdr"))) {
+      const existing = await pool.query(
+        "SELECT 1 FROM interview_feedback_hdr WHERE schedule_id = $1",
+        [scheduleId]
+      );
 
-  if (!existing.rows.length) {
-    const header = await pool.query(
-      `INSERT INTO interview_feedback_hdr (
-        schedule_id, interview_level, area_of_interview, overall_rating,
-        strengths, improvement_areas, overall_comments, final_outcome,
-        submitted_by, submitted_on, feedback_status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),'Submitted') RETURNING feedback_id`,
-      [
-        scheduleId,
-        payload.interview_level,
-        payload.area_of_interview,
-        payload.overall_rating,
-        payload.strengths,
-        payload.improvement_areas,
-        payload.overall_comments,
-        payload.final_outcome,
-        user.id || user.name
-      ]
-    );
+      if (!existing.rows.length) {
+        const header = await pool.query(
+          `INSERT INTO interview_feedback_hdr (
+            schedule_id, interview_level, area_of_interview, overall_rating,
+            strengths, improvement_areas, overall_comments, final_outcome,
+            submitted_by, submitted_on, feedback_status
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),'Submitted') RETURNING feedback_id`,
+          [
+            scheduleId,
+            payload.interview_level,
+            payload.area_of_interview,
+            payload.overall_rating,
+            payload.strengths,
+            payload.improvement_areas,
+            payload.overall_comments,
+            payload.final_outcome,
+            user.id || user.name
+          ]
+        );
 
-    for (const skill of payload.skills || []) {
+        for (const skill of payload.skills || []) {
+          await pool.query(
+            `INSERT INTO interview_feedback_dtl (feedback_id, skill_name, rating, comments)
+             VALUES ($1,$2,$3,$4)`,
+            [header.rows[0].feedback_id, skill.skill_name, skill.rating, skill.comments]
+          );
+        }
+      }
+    }
+
+    if (scheduleId && (await tableExists(pool, "interview_schedule_trn"))) {
       await pool.query(
-        `INSERT INTO interview_feedback_dtl (feedback_id, skill_name, rating, comments)
-         VALUES ($1,$2,$3,$4)`,
-        [header.rows[0].feedback_id, skill.skill_name, skill.rating, skill.comments]
+        `UPDATE interview_schedule_trn
+         SET feedback_submitted = true, interview_status = 'Completed', updated_on = NOW()
+         WHERE schedule_id = $1`,
+        [scheduleId]
+      );
+    }
+
+    if (newStage && interview.mapId && (await tableExists(pool, "candidate_req_map"))) {
+      await pool.query(
+        "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
+        [newStage, interview.mapId]
       );
     }
   }
 
-  if (isLegacyDualWriteEnabled() && (await tableExists(pool, "interview_schedule_trn"))) {
-    await pool.query(
-      `UPDATE interview_schedule_trn
-       SET feedback_submitted = true, interview_status = 'Completed', updated_on = NOW()
-       WHERE schedule_id = $1`,
-      [scheduleId]
-    );
-  }
-
-  const newStage = resolveStageFromOutcome(payload.interview_level, payload.final_outcome);
-  if (isLegacyDualWriteEnabled() && newStage && interview.mapId && (await tableExists(pool, "candidate_req_map"))) {
-    await pool.query(
-      "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
-      [newStage, interview.mapId]
-    );
-  } else if (newStage && interview.mapId && isEnterpriseOperationalSor()) {
-    await pool.query(
-      "UPDATE rm_candidate_mappings SET stage_name = $1, modified_on = NOW() WHERE map_id = $2",
-      [newStage, interview.mapId]
-    );
+  if (newStage && interview.mapId && isEnterpriseOperationalSor()) {
+    await applyEnterpriseInterviewStageTransition(pool, {
+      mapId: interview.mapId,
+      newStage,
+      eventType: "InterviewOutcomeStage",
+      user,
+      comments: payload.overall_comments || null,
+      metadata: {
+        interviewId: interview.interviewId,
+        scheduleId,
+        interviewLevel: payload.interview_level,
+        finalOutcome: payload.final_outcome
+      }
+    });
   }
 }
 
@@ -1327,12 +1432,67 @@ async function seedConfiguration(pool, payload, user = { name: "System Seed", ro
   }
 }
 
-async function getInterviewProgressByMapId(pool, mapId) {
+async function getFeedbackDetailsBySchedule(pool, scheduleId, req) {
+  const normalizedScheduleId = String(scheduleId || "").trim();
+
+  if (!normalizedScheduleId) {
+    throw httpError("schedule_id is required.", 400);
+  }
+
+  await assertInterviewFeedbackAccess(pool, req, { scheduleId: normalizedScheduleId });
+
+  const result = await pool.query(
+    `
+    SELECT
+      ist.schedule_id,
+      ist.round_type AS interview_level,
+      cm.candidate_code,
+      CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+      COALESCE(rr_by_id.req_id, rr_by_code.req_id, rm.req_id, ist.req_id) AS req_id,
+      COALESCE(rr_by_id.requisition_code, rr_by_code.requisition_code, rm.req_code) AS req_code,
+      COALESCE(rm.client_name, rr_by_id.department, rr_by_code.department) AS client_name,
+      COALESCE(rr_by_id.position_title, rr_by_code.position_title, rm.job_title) AS job_title,
+      ip.interviewer_name,
+      ip.employee_code AS interviewer_code
+    FROM interview_schedule_trn ist
+    LEFT JOIN im_interviews i
+      ON i.schedule_id = ist.schedule_id
+    LEFT JOIN rm_candidate_mappings rcm
+      ON rcm.map_id = ist.map_id
+     AND rcm.is_active = true
+    LEFT JOIN candidate_req_map crm
+      ON crm.map_id = ist.map_id
+    INNER JOIN cand_mstr cm
+      ON cm.candidate_id = COALESCE(rcm.candidate_id, crm.candidate_id)
+    LEFT JOIN rm_requisitions rr_by_id
+      ON rr_by_id.req_id = COALESCE(i.req_id, rcm.req_id, ist.req_id)
+    LEFT JOIN rm_requisitions rr_by_code
+      ON rr_by_code.requisition_code = COALESCE(i.requisition_code, rcm.requisition_code)
+    LEFT JOIN req_mstr rm
+      ON rm.req_id = COALESCE(crm.req_id, ist.req_id)
+    INNER JOIN interview_panel_mstr ip
+      ON ip.panel_id = ist.interviewer_id
+    WHERE ist.schedule_id = $1
+    `,
+    [normalizedScheduleId]
+  );
+
+  if (!result.rows.length) {
+    throw httpError("Interview Schedule Not Found", 404);
+  }
+
+  return result.rows[0];
+}
+
+async function getInterviewProgressByMapId(pool, mapId, req) {
   const normalizedMapId = String(mapId || "").trim();
 
   if (!normalizedMapId) {
     throw httpError("map_id is required.", 400);
   }
+
+  const recruitmentService = require("./recruitmentService");
+  await recruitmentService.assertAuthorizedMappingAccess(pool, req, normalizedMapId);
 
   let mapping = null;
 
@@ -1459,6 +1619,7 @@ async function getInterviewProgressByMapId(pool, mapId) {
 module.exports = {
   getDefaultSeedPayload,
   getInterviewBundle,
+  getFeedbackDetailsBySchedule,
   getInterviewProgressByMapId,
   scheduleInterview,
   linkLegacySchedule,

@@ -3110,6 +3110,7 @@ module.exports = {
   getInstanceById,
   getCurrentTasks,
   getMyActiveApprovals,
+  assertActiveAssignee,
   approveMyActiveApproval,
   rejectMyActiveApproval,
   requestClarificationMyActiveApproval,

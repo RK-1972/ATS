@@ -14,6 +14,8 @@ function registerCandidatePortalRoutes(
     createCandidatePortalProfileService
   } = require("../services/candidatePortalProfileService");
 
+  const recruitmentService = require("../services/recruitmentService");
+
   const candidatePortalService = createCandidatePortalService(pool);
   const candidatePortalProfileService =
     createCandidatePortalProfileService(pool, parserDeps);
@@ -189,6 +191,95 @@ function registerCandidatePortalRoutes(
         return res.status(500).json({
           success: false,
           message: "Failed to load candidate workspace"
+        });
+      }
+    }
+  );
+
+  // =====================================================
+  // API — Candidate Portal Open Requisitions (read)
+  // =====================================================
+
+  app.get(
+    "/candidate-portal/open-requisitions",
+    verifyCandidateToken,
+    async (req, res) => {
+      try {
+        const requisitions =
+          await recruitmentService.listOpenRequisitionsForCandidatePortal(pool);
+
+        return res.status(200).json({
+          success: true,
+          message: "Open requisitions loaded",
+          data: {
+            requisitions
+          }
+        });
+      } catch (error) {
+        console.error("[candidate-portal/open-requisitions]", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to load open requisitions"
+        });
+      }
+    }
+  );
+
+  // =====================================================
+  // API — Candidate Portal Applications
+  // =====================================================
+
+  app.get(
+    "/candidate-portal/applications",
+    verifyCandidateToken,
+    async (req, res) => {
+      try {
+        const applications =
+          await recruitmentService.listCandidatePortalApplications(
+            pool,
+            req.candidate
+          );
+
+        return res.status(200).json({
+          success: true,
+          message: "Applications loaded",
+          data: {
+            applications
+          }
+        });
+      } catch (error) {
+        console.error("[candidate-portal/applications GET]", error);
+        const status = Number(error.status) || 500;
+        return res.status(status).json({
+          success: false,
+          message: error.message || "Failed to load applications"
+        });
+      }
+    }
+  );
+
+  app.post(
+    "/candidate-portal/applications",
+    verifyCandidateToken,
+    async (req, res) => {
+      try {
+        const application = await recruitmentService.applyCandidateFromPortal(
+          pool,
+          req.candidate,
+          req.body || {}
+        );
+
+        return res.status(201).json({
+          success: true,
+          message: "Application submitted successfully",
+          data: application
+        });
+      } catch (error) {
+        console.error("[candidate-portal/applications]", error);
+        const status = Number(error.status) || 500;
+        return res.status(status).json({
+          success: false,
+          message: error.message || "Failed to submit application"
         });
       }
     }

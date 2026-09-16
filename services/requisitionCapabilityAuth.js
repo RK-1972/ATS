@@ -9,6 +9,7 @@ const { userContext } = require("./enterpriseAuditService");
 
 const REQUISITION_REQUESTOR_CODE = "REQUISITION_REQUESTOR";
 const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
+const TA_LEAD_ROLES = Object.freeze(["TA Lead", "TA Leader"]);
 
 function authError(message) {
   const error = new Error(message);
@@ -214,14 +215,118 @@ function requireRequisitionAssigner(pool) {
   };
 }
 
+function isAdminUser(req) {
+  return String(req.user?.role_name || "").trim().toLowerCase() === "admin";
+}
+
+function isTaLeadRoleName(roleName) {
+  const normalized = String(roleName || "").trim();
+  return TA_LEAD_ROLES.includes(normalized);
+}
+
+function isTaLeadUser(req) {
+  return isTaLeadRoleName(req.user?.role_name);
+}
+
+/**
+ * Canonical recruiter-assignment operator gate:
+ * Admin, TA Lead / TA Leader role, or active REQUISITION_ASSIGNER assignment.
+ */
+async function assertCanAssignRecruiters(pool, req) {
+  if (isAdminUser(req) || isTaLeadUser(req)) {
+    return;
+  }
+
+  await assertHasWorkAssignment(
+    pool,
+    req,
+    REQUISITION_ASSIGNER_CODE,
+    "Enterprise Access Denied. You are not authorized to assign recruiters."
+  );
+}
+
+/**
+ * TA Lead workspace entry gate — same operator rule as recruiter assignment.
+ */
+async function assertCanAccessTaLeadWorkspace(pool, req) {
+  await assertCanAssignRecruiters(pool, req);
+}
+
+function requireRecruiterAssignmentOperator(pool) {
+  return async function recruiterAssignmentOperatorMiddleware(req, res, next) {
+    try {
+      await assertCanAssignRecruiters(pool, req);
+      next();
+    } catch (error) {
+      res.status(error.status || 403).json({
+        success: false,
+        message: error.message || "Enterprise Access Denied."
+      });
+    }
+  };
+}
+
+function requireTaLeadWorkspace(pool) {
+  return async function taLeadWorkspaceMiddleware(req, res, next) {
+    try {
+      await assertCanAccessTaLeadWorkspace(pool, req);
+      next();
+    } catch (error) {
+      res.status(error.status || 403).json({
+        success: false,
+        message: error.message || "Enterprise Access Denied."
+      });
+    }
+  };
+}
+
+/**
+ * Candidate Portal publication: Admin or active REQUISITION_ASSIGNER work assignment.
+ */
+async function assertCanPublishToCandidatePortal(pool, req) {
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  await assertHasWorkAssignment(
+    pool,
+    req,
+    REQUISITION_ASSIGNER_CODE,
+    "Enterprise Access Denied. You are not authorized to manage Candidate Portal publication."
+  );
+}
+
+function requireAdminOrRequisitionAssigner(pool) {
+  return async function adminOrAssignerMiddleware(req, res, next) {
+    try {
+      await assertCanPublishToCandidatePortal(pool, req);
+      next();
+    } catch (error) {
+      res.status(error.status || 403).json({
+        success: false,
+        message: error.message || "Enterprise Access Denied."
+      });
+    }
+  };
+}
+
 module.exports = {
   REQUISITION_REQUESTOR_CODE,
   REQUISITION_ASSIGNER_CODE,
+  TA_LEAD_ROLES,
   assertCanCreateRequisition,
   assertCanManageRequisitionAssignments,
+  assertCanAssignRecruiters,
+  assertCanAccessTaLeadWorkspace,
+  assertCanPublishToCandidatePortal,
   resolveRequisitionRequestorCreatedByKeys,
   assertRequisitionRequestorOwnerAccess,
   assertRequisitionApprovalParticipantAccess,
   requireRequisitionRequestor,
-  requireRequisitionAssigner
+  requireRequisitionAssigner,
+  requireAdminOrRequisitionAssigner,
+  requireRecruiterAssignmentOperator,
+  requireTaLeadWorkspace,
+  isTaLeadRoleName,
+  isTaLeadUser
 };

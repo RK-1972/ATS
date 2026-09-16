@@ -1,4 +1,5 @@
 const interviewService = require("../services/interviewService");
+const interviewNotificationService = require("../services/interviewNotificationService");
 
 async function tableExists(pool, tableName) {
   const result = await pool.query(
@@ -78,13 +79,29 @@ async function handleScheduleInterview(pool, req, res, helpers = {}) {
         teamsLink = meeting?.joinUrl || meeting?.teamsLink || null;
         teamsEventId = meeting?.eventId || meeting?.teamsEventId || null;
 
-        if (helpers.sendInterviewEmail && candidateEmail) {
-          await helpers.sendInterviewEmail(
-            candidateEmail,
-            body.interview_date,
-            body.interview_time,
-            body.round_type,
-            teamsLink
+        const recruiterEmail = req.user?.email_id || null;
+
+        if (
+          helpers.sendInterviewEmail
+          && candidateEmail
+          && candidateName
+          && recruiterEmail
+        ) {
+          await interviewNotificationService.notifyInterviewScheduled(
+            pool,
+            {
+              interviewId: enterprise.interviewId,
+              candidateEmail,
+              candidateName,
+              roundType: body.round_type,
+              interviewDate: body.interview_date,
+              interviewTime: body.interview_time,
+              teamsLink,
+              recruiterEmail,
+              mapId: body.map_id,
+              reqId: body.req_id
+            },
+            { deliverInterviewEmail: helpers.sendInterviewEmail }
           );
         }
       } catch (teamsError) {

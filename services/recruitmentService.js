@@ -3,8 +3,28 @@ const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled } = require("../config/operationalCutover");
-const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
-const { assertCanCreateRequisition, assertRequisitionRequestorOwnerAccess } = require("./requisitionCapabilityAuth");
+const { REQUISITION_STATUS, isClosedRequisitionStatus } = require("../constants/requisitionStatus");
+const {
+  assertRequisitionOpenForRecruiting,
+  enrichRequisitionsWithFulfillment,
+  getFulfillmentForRequisition
+} = require("./requisitionFulfillmentService");
+const {
+  assertCanCreateRequisition,
+  assertCanAssignRecruiters,
+  assertCanPublishToCandidatePortal,
+  assertRequisitionRequestorOwnerAccess
+} = require("./requisitionCapabilityAuth");
+const candidateAccessService = require("./candidateAccessService");
+const candidateService = require("./candidateService");
+const legacyPipelineReadService = require("./legacyPipelineReadService");
+const pipelineHistoryService = require("./pipelineHistoryService");
+const { resolveGovernedAtsStage } = require("./atsStageWriteValidator");
+const {
+  CANDIDATE_PORTAL_INTERVIEW_MICRO_STATE_PATTERN,
+  inferCatalogStageCodeFromOperationalStage,
+  buildCandidateFacingStageResolver
+} = require("./candidatePortalStageResolver");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "recruitment.seed.json");
 
@@ -14,56 +34,11 @@ function httpError(message, status = 400) {
   return error;
 }
 
-const ASSIGN_RECRUITER_ROLES = ["Admin", "TA Lead", "TA Leader"];
-const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
-
 /**
- * V1.0 assign gate: keep legacy Admin/TA Lead roles, and also allow
- * employees with an active REQUISITION_ASSIGNER work assignment.
+ * Recruiter assignment write gate — delegates to canonical requisitionCapabilityAuth rule.
  */
 async function assertCanAssignRecruiter(pool, req) {
-  const user = userContext(req);
-
-  if (ASSIGN_RECRUITER_ROLES.includes(user.role)) {
-    return;
-  }
-
-  const employeeCode = req.user?.employee_code
-    ? String(req.user.employee_code).trim()
-    : "";
-
-  if (!employeeCode) {
-    throw httpError(
-      "Only Admin, TA Lead, or users with Requisition Assigner work assignment can assign recruiters.",
-      403
-    );
-  }
-
-  const workAssignmentService = require("./workAssignmentService");
-  const assignments =
-    await workAssignmentService.getEmployeeWorkAssignments(pool, employeeCode);
-
-  const hasAssignerCapacity = (assignments || []).some((row) => {
-    if (row.is_active !== true) {
-      return false;
-    }
-
-    if (row.master_is_active === false) {
-      return false;
-    }
-
-    return (
-      String(row.assignment_code || "").trim().toUpperCase() ===
-      REQUISITION_ASSIGNER_CODE
-    );
-  });
-
-  if (!hasAssignerCapacity) {
-    throw httpError(
-      "Only Admin, TA Lead, or users with Requisition Assigner work assignment can assign recruiters.",
-      403
-    );
-  }
+  await assertCanAssignRecruiters(pool, req);
 }
 
 /**
@@ -148,11 +123,23 @@ const RECRUITMENT_MASTER_DATA_CHECKS = [
   { field: "grade", entityType: "grades" },
   // Geography masters use cities / work_locations — entity type "locations" does not exist.
   { field: "location", entityType: "cities", alternateEntityTypes: ["work_locations"] },
-  { field: "primary_skill", entityType: "skills" },
+  { field: "primary_skill", entityType: "skills", allowMultiple: true },
+  { field: "secondary_skill", entityType: "skills", allowMultiple: true },
   { field: "employment_type", entityType: "employment_types" },
   { field: "source_type", entityType: "candidate_sources" },
   { field: "business_unit", entityType: "business_units" }
 ];
+
+function splitMasterDataFieldTokens(value) {
+  if (!value) {
+    return [];
+  }
+
+  return String(value)
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
 
 function normalizeMasterLookupKey(value) {
   return String(value)
@@ -198,20 +185,26 @@ async function validateMasterDataFields(pool, data, checks) {
       check.entityType,
       ...(check.alternateEntityTypes || [])
     ];
-    let matched = false;
+    const tokens = check.allowMultiple
+      ? splitMasterDataFieldTokens(value)
+      : [String(value).trim()];
 
-    for (const entityType of entityTypes) {
-      const records = await masterDataService.listByEntityType(pool, entityType);
-      if (masterRecordMatchesValue(records, value)) {
-        matched = true;
-        break;
+    for (const token of tokens) {
+      let matched = false;
+
+      for (const entityType of entityTypes) {
+        const records = await masterDataService.listByEntityType(pool, entityType);
+        if (masterRecordMatchesValue(records, token)) {
+          matched = true;
+          break;
+        }
       }
-    }
 
-    if (!matched) {
-      errors.push(
-        `"${value}" not found in Master Data (${entityTypes.join(" / ")}).`
-      );
+      if (!matched) {
+        errors.push(
+          `"${token}" not found in Master Data (${entityTypes.join(" / ")}).`
+        );
+      }
     }
   }
 
@@ -378,6 +371,392 @@ function recruiterEmployeeCode(req) {
     throw httpError("Authenticated employee_code is required.", 401);
   }
   return code;
+}
+
+function isAdminUser(req) {
+  return String(req.user?.role_name || "").trim() === "Admin";
+}
+
+async function resolveMappingContext(pool, mapId) {
+  let mapping = null;
+  let legacyRow = null;
+
+  const byMapId = await pool.query(
+    `SELECT *
+     FROM rm_candidate_mappings
+     WHERE map_id = $1
+       AND is_active = TRUE
+     ORDER BY modified_on DESC NULLS LAST
+     LIMIT 1`,
+    [mapId]
+  );
+  mapping = byMapId.rows[0] || null;
+
+  if (!mapping) {
+    const byMappingId = await pool.query(
+      "SELECT * FROM rm_candidate_mappings WHERE mapping_id = $1",
+      [mapId]
+    );
+    mapping = byMappingId.rows[0] || null;
+  }
+
+  if (await tableExists(pool, "candidate_req_map")) {
+    const legacy = await pool.query(
+      "SELECT * FROM candidate_req_map WHERE map_id = $1",
+      [mapId]
+    );
+    legacyRow = legacy.rows[0] || null;
+
+    if (!mapping && legacyRow) {
+      const byLegacy = await pool.query(
+        "SELECT * FROM rm_candidate_mappings WHERE map_id = $1",
+        [mapId]
+      );
+      mapping = byLegacy.rows[0] || null;
+    }
+  }
+
+  if (!mapping && !legacyRow) {
+    throw httpError("Mapping not found.", 404);
+  }
+
+  return { mapping, legacyRow };
+}
+
+async function resolveRequisitionForMapping(pool, mapping, legacyRow) {
+  if (mapping?.requisition_code) {
+    const reqResult = await pool.query(
+      "SELECT * FROM rm_requisitions WHERE requisition_code = $1",
+      [mapping.requisition_code]
+    );
+    if (reqResult.rows[0]) {
+      return reqResult.rows[0];
+    }
+  }
+
+  const reqId = mapping?.req_id || legacyRow?.req_id;
+  if (reqId) {
+    const reqResult = await pool.query(
+      "SELECT * FROM rm_requisitions WHERE req_id = $1",
+      [reqId]
+    );
+    if (reqResult.rows[0]) {
+      return reqResult.rows[0];
+    }
+  }
+
+  return null;
+}
+
+async function assertAuthorizedStageUpdate(pool, req, mapId) {
+  const context = await resolveMappingContext(pool, mapId);
+
+  if (isAdminUser(req)) {
+    return context;
+  }
+
+  const requisition = await resolveRequisitionForMapping(
+    pool,
+    context.mapping,
+    context.legacyRow
+  );
+
+  if (!requisition) {
+    throw httpError(
+      "Enterprise Access Denied. Requisition context not found for this mapping.",
+      403
+    );
+  }
+
+  await assertRecruiterAssignedToRequisition(pool, req, requisition);
+  return context;
+}
+
+async function assertAuthorizedMappingAccess(pool, req, mapId) {
+  const context = await resolveMappingContext(pool, mapId);
+  const candidateId = context.mapping?.candidate_id || context.legacyRow?.candidate_id;
+
+  if (!candidateId) {
+    throw httpError("Mapping not found.", 404);
+  }
+
+  if (isAdminUser(req)) {
+    return context;
+  }
+
+  try {
+    await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+    return context;
+  } catch (readError) {
+    if (readError.status && readError.status !== 403) {
+      throw readError;
+    }
+  }
+
+  const requisition = await resolveRequisitionForMapping(
+    pool,
+    context.mapping,
+    context.legacyRow
+  );
+
+  if (!requisition) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view this mapping.",
+      403
+    );
+  }
+
+  await assertRecruiterAssignedToRequisition(pool, req, requisition);
+  return context;
+}
+
+async function assertAuthorizedRelease(pool, req, candidateId) {
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const employeeCode = recruiterEmployeeCode(req);
+
+  const candResult = await pool.query(
+    `SELECT candidate_id, owner_employee_code
+     FROM cand_mstr
+     WHERE candidate_id = $1`,
+    [candidateId]
+  );
+  const candRow = candResult.rows[0];
+
+  if (!candRow) {
+    throw httpError("Candidate not found.", 404);
+  }
+
+  if (String(candRow.owner_employee_code || "").trim() === employeeCode) {
+    return;
+  }
+
+  const activeEnterprise = await pool.query(
+    `SELECT requisition_code, req_id
+     FROM rm_candidate_mappings
+     WHERE candidate_id = $1
+       AND is_active = true
+     ORDER BY applied_on DESC
+     LIMIT 1`,
+    [candidateId]
+  );
+
+  const mappingRow = activeEnterprise.rows[0];
+  if (mappingRow) {
+    const requisition = await resolveRequisitionForMapping(pool, mappingRow, null);
+    if (requisition) {
+      await assertRecruiterAssignedToRequisition(pool, req, requisition);
+      return;
+    }
+  }
+
+  throw httpError(
+    "Enterprise Access Denied. You are not authorized to release this candidate mapping.",
+    403
+  );
+}
+
+async function listTalentPoolCandidates(pool, req) {
+  const employeeCode = String(req.user?.employee_code || "").trim();
+
+  if (!employeeCode) {
+    throw httpError("Authenticated employee_code is required.", 401);
+  }
+
+  const result = await pool.query(
+    `SELECT
+        'AVAILABLE' AS candidate_type,
+        cm.candidate_id,
+        cm.candidate_code,
+        cm.first_name,
+        cm.middle_name,
+        cm.last_name,
+        cm.preferred_name,
+        cm.email_id,
+        cm.mobile_number,
+        cm.primary_skill,
+        cm.total_experience,
+        cm.current_company,
+        cm.current_location,
+        cm.candidate_status,
+        cm.created_on
+     FROM cand_mstr cm
+     WHERE cm.candidate_container = 'TALENT_POOL'
+     ORDER BY cm.created_on DESC`
+  );
+
+  return result.rows;
+}
+
+async function listMyPipelineCandidates(pool, req) {
+  const employeeCode = String(req.user?.employee_code || "").trim();
+
+  if (!employeeCode) {
+    throw httpError("Authenticated employee_code is required.", 401);
+  }
+
+  return legacyPipelineReadService.listMyCandidatesList(pool, employeeCode);
+}
+
+async function listCandidateEducation(pool, candidateId, req) {
+  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+
+  return candidateService.listChildRecords(pool, "education", candidateId);
+}
+
+async function listCandidateExperience(pool, candidateId, req) {
+  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+
+  return candidateService.listChildRecords(pool, "experience", candidateId);
+}
+
+async function getCandidateOwnership(pool, candidateId, req) {
+  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+
+  const recruiterId = String(req.user?.employee_code || "").trim();
+
+  const result = await pool.query(
+    `SELECT
+        c.candidate_id,
+        c.owner_employee_code,
+        u.full_name,
+        CASE
+          WHEN c.candidate_container = 'TALENT_POOL'
+            AND c.owner_employee_code IS NULL
+          THEN NULL
+          WHEN c.owner_employee_code IS NULL
+          THEN NULL
+          ELSE CONCAT(
+            u.full_name,
+            ' (',
+            u.employee_code,
+            ')'
+          )
+        END AS owner_display_name,
+        CASE
+          WHEN c.candidate_container = 'TALENT_POOL'
+            AND c.owner_employee_code IS NULL
+          THEN FALSE
+          ELSE (c.owner_employee_code IS NOT NULL AND c.owner_employee_code = $2)
+        END AS is_owner,
+        EXISTS (
+          SELECT 1
+          FROM rm_candidate_transfer_requests r
+          WHERE r.candidate_id = c.candidate_id
+            AND r.status = 'Pending'
+            AND r.to_recruiter_id = $2
+        ) AS pending_request
+     FROM cand_mstr c
+     LEFT JOIN user_mstr u
+       ON u.employee_code = c.owner_employee_code
+     WHERE c.candidate_id = $1`,
+    [candidateId, recruiterId]
+  );
+
+  if (result.rows.length === 0) {
+    throw httpError("Candidate not found.", 404);
+  }
+
+  return result.rows[0];
+}
+
+async function getCandidateWorkspaceProfile(pool, candidateId, req) {
+  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+
+  const result = await pool.query(
+    `SELECT *
+     FROM cand_mstr
+     WHERE candidate_id = $1`,
+    [candidateId]
+  );
+
+  const row = result.rows[0] || null;
+
+  if (!row) {
+    throw httpError("Candidate not found.", 404);
+  }
+
+  const addressResult = await pool.query(
+    `SELECT country_code, state_code, city_code, address_line_1
+     FROM can_address
+     WHERE candidate_id = $1
+       AND address_type = 'Current'
+       AND active_flag = TRUE
+     ORDER BY address_id DESC
+     LIMIT 1`,
+    [candidateId]
+  );
+
+  const address = addressResult.rows[0] || null;
+
+  const master = {
+    ...row,
+    country_code: row.current_country || address?.country_code || null,
+    state_code: row.current_state || address?.state_code || null,
+    city_code: row.current_city || address?.city_code || null,
+    address_line: address?.address_line_1 || null,
+    alternate_phone: row.alternate_mobile || null
+  };
+
+  const mappingResult = await pool.query(
+    `SELECT
+        c.candidate_id,
+        c.candidate_code,
+        c.first_name,
+        c.last_name,
+        c.email_id,
+        c.pan_number,
+        c.mobile_number,
+        c.primary_skill,
+        c.total_experience,
+        c.candidate_status,
+        c.resume_path,
+        crm.map_id,
+        crm.req_id,
+        crm.requisition_code AS req_code,
+        crm.stage_name,
+        crm.source_type,
+        crm.remarks
+     FROM cand_mstr c
+     LEFT JOIN rm_candidate_mappings crm
+       ON c.candidate_id = crm.candidate_id
+      AND crm.is_active = true
+     WHERE c.candidate_id = $1
+     ORDER BY crm.map_id DESC
+     LIMIT 1`,
+    [candidateId]
+  );
+
+  const mapping = mappingResult.rows[0] || null;
+
+  return {
+    master,
+    mapping
+  };
+}
+
+async function listPipelineHistoryForMapping(pool, mapId, req) {
+  const { mapping, legacyRow } = await assertAuthorizedMappingAccess(pool, req, mapId);
+  const candidateId = mapping?.candidate_id || legacyRow?.candidate_id;
+  const mappingId = mapping?.mapping_id || null;
+
+  const result = await pool.query(
+    `SELECT history_id, requisition_code, mapping_id, candidate_id, event_type,
+            from_stage, to_stage, actor, actor_role, comments, created_on
+     FROM rm_pipeline_history
+     WHERE candidate_id = $1
+       AND (
+         ($2::int IS NOT NULL AND mapping_id = $2)
+         OR mapping_id IS NULL
+       )
+     ORDER BY created_on DESC
+     LIMIT 200`,
+    [candidateId, mappingId]
+  );
+
+  return result.rows;
 }
 
 function formatDateOnly(value) {
@@ -550,11 +929,14 @@ async function getMyRecruiterDashboard(pool, req) {
   const requisitions = await pool.query(
     `SELECT DISTINCT r.*,
       p.position_title AS approved_position_title,
-      p.department AS approved_department
+      p.department AS approved_department,
+      hm.hiring_manager_name,
+      hm.email_id AS hiring_manager_email
      FROM rm_requisitions r
      INNER JOIN rm_recruiter_assignments a
        ON a.requisition_code = r.requisition_code
      LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
+     LEFT JOIN hiring_manager_mstr hm ON hm.hiring_manager_id = r.hiring_manager_id
      WHERE a.recruiter_code = $1 AND a.is_active = true
      ORDER BY r.created_on DESC`,
     [employeeCode]
@@ -893,7 +1275,9 @@ async function createFromApprovedPosition(
     grade: position.grade,
     location: options.location || position.location || null,
     employment_type:
-      options.employment_type || position.employment_type || null
+      options.employment_type || position.employment_type || null,
+    primary_skill: options.primary_skill || null,
+    secondary_skill: options.secondary_skill || null
   });
 
   if (!mdValidation.valid) {
@@ -1018,10 +1402,10 @@ async function createFromApprovedPosition(
     `INSERT INTO rm_requisitions (
       requisition_code, approved_position_id, req_id, position_title, grade,
       department, business_unit, location, budget_approved, hiring_manager,
-      employment_type, headcount, primary_skill, req_status, workflow_instance_id,
-      version, version_status, effective_from, created_by, modified_by,
-      approval_route_id
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+      employment_type, headcount, primary_skill, secondary_skill, req_status,
+      workflow_instance_id, version, version_status, effective_from, created_by,
+      modified_by, approval_route_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
     [
       requisitionCode,
       positionId,
@@ -1036,6 +1420,7 @@ async function createFromApprovedPosition(
       resolvedEmploymentType,
       position.headcount || 1,
       options.primary_skill || null,
+      options.secondary_skill || null,
       initialStatus,
       instance.instanceId,
       1.0,
@@ -1221,6 +1606,10 @@ async function assignRecruiter(pool, reqId, recruiterCode, req) {
     throw httpError("Requisition not found.", 404);
   }
 
+  if (requisition) {
+    assertRequisitionOpenForRecruiting(requisition);
+  }
+
   const ruleEval = await evaluateRecruitmentRules(pool, {
     department: requisition?.department,
     grade: requisition?.grade,
@@ -1343,7 +1732,13 @@ async function mapCandidate(pool, payload, req) {
     throw httpError("Enterprise requisition not found. Requisitions must originate from Workforce Planning.", 400);
   }
 
-  await assertRecruiterAssignedToRequisition(pool, req, requisition);
+  assertRequisitionOpenForRecruiting(requisition);
+
+  const isPortalApply = Boolean(req.candidatePortalApply);
+
+  if (!isPortalApply) {
+    await assertRecruiterAssignedToRequisition(pool, req, requisition);
+  }
 
   const mdValidation = await validateMasterDataReferences(pool, {
     source_type: sourceType
@@ -1376,12 +1771,16 @@ async function mapCandidate(pool, payload, req) {
   ]
 );
 
-if (existingEnterprise.rows.length > 0) {
+  if (existingEnterprise.rows.length > 0) {
   throw httpError(
     "Candidate is already assigned to this requisition.",
     400
   );
 }
+
+  const resolvedStage = await resolveGovernedAtsStage(pool, stageName);
+  const canonicalStageName = resolvedStage.displayName;
+
   let legacyMap = null;
   let allocatedMapId = null;
   const legacyMapTableExists = await tableExists(pool, "candidate_req_map");
@@ -1481,7 +1880,7 @@ if (existingEnterprise.rows.length > 0) {
           candidateId,
           requisition.req_id || reqId,
           user.name,
-          stageName,
+          canonicalStageName,
           sourceType,
           remarks
         ]
@@ -1501,7 +1900,7 @@ if (existingEnterprise.rows.length > 0) {
         requisition.req_id || reqId,
         legacyMap?.map_id || allocatedMapId,
         user.name,
-        stageName,
+        canonicalStageName,
         sourceType,
         instance.instanceId,
         remarks,
@@ -1543,7 +1942,7 @@ if (existingEnterprise.rows.length > 0) {
             candidateId,
             bridgeReqId,
             user.name,
-            stageName,
+            canonicalStageName,
             sourceType,
             remarks
           ]
@@ -1567,7 +1966,7 @@ if (existingEnterprise.rows.length > 0) {
         mappingRow.mapping_id,
         candidateId,
         "CandidateMapped",
-        stageName,
+        canonicalStageName,
         user.name,
         user.role,
         remarks,
@@ -1577,16 +1976,20 @@ if (existingEnterprise.rows.length > 0) {
 
     // Talent Pool unowned → acquire ownership on map (same transaction).
     // PIPELINE + owned by another recruiter: leave ownership unchanged (request workflow).
-    if (shouldAcquireOwnership) {
-      await client.query(
-        `UPDATE cand_mstr
-         SET candidate_container = 'PIPELINE',
-             owner_employee_code = $1
-         WHERE candidate_id = $2
-           AND candidate_container = 'TALENT_POOL'
-           AND owner_employee_code IS NULL`,
-        [recruiterEmployeeCode(req), candidateId]
-      );
+    if (shouldAcquireOwnership && !isPortalApply) {
+      const ownerEmployeeCode = recruiterEmployeeCode(req);
+
+      if (ownerEmployeeCode) {
+        await client.query(
+          `UPDATE cand_mstr
+           SET candidate_container = 'PIPELINE',
+               owner_employee_code = $1
+           WHERE candidate_id = $2
+             AND candidate_container = 'TALENT_POOL'
+             AND owner_employee_code IS NULL`,
+          [ownerEmployeeCode, candidateId]
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -1609,7 +2012,11 @@ if (existingEnterprise.rows.length > 0) {
     action: `Candidate mapped to requisition ${requisition.requisition_code}`,
     userName: user.name,
     userRole: user.role,
-    metadata: { requisitionCode: requisition.requisition_code, stageName, ruleEvaluation: ruleEval }
+    metadata: {
+      requisitionCode: requisition.requisition_code,
+      stageName: canonicalStageName,
+      ruleEvaluation: ruleEval
+    }
   });
 
   return {
@@ -1624,31 +2031,14 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
   const platformConfig = await loadPlatformConfig(pool);
   await assertRecruitmentModuleEnabled(platformConfig);
 
-  let mapping = null;
-
-  const enterpriseMap = await pool.query(
-    "SELECT * FROM rm_candidate_mappings WHERE mapping_id = $1 OR map_id = $1",
-    [mapId]
-  );
-  mapping = enterpriseMap.rows[0];
-
-  let legacyRow = null;
-
-  if (await tableExists(pool, "candidate_req_map")) {
-    const legacy = await pool.query(
-      "SELECT * FROM candidate_req_map WHERE map_id = $1",
-      [mapId]
-    );
-    legacyRow = legacy.rows[0];
-
-    if (!mapping && legacyRow) {
-      const byLegacy = await pool.query(
-        "SELECT * FROM rm_candidate_mappings WHERE map_id = $1",
-        [mapId]
-      );
-      mapping = byLegacy.rows[0];
-    }
+  if (!stageName || !String(stageName).trim()) {
+    throw httpError("stage_name is required.", 400);
   }
+
+  const { mapping, legacyRow } = await assertAuthorizedStageUpdate(pool, req, mapId);
+
+  const resolvedStage = await resolveGovernedAtsStage(pool, stageName);
+  const canonicalStageName = resolvedStage.displayName;
 
   const previousStage = mapping?.stage_name || legacyRow?.stage_name || "Applied";
   const requisitionCode = mapping?.requisition_code;
@@ -1662,91 +2052,154 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
     requisition = reqResult.rows[0];
   }
 
+  if (requisition) {
+    assertRequisitionOpenForRecruiting(requisition);
+  }
+
   const ruleEval = await evaluateRecruitmentRules(pool, {
     department: requisition?.department,
     grade: requisition?.grade,
     from_stage: previousStage,
-    to_stage: stageName,
-    action: /offer/i.test(stageName) ? "offer_routing" : "stage_change"
+    to_stage: canonicalStageName,
+    target_stage: canonicalStageName,
+    action: /offer/i.test(canonicalStageName) ? "offer_routing" : "stage_change"
   }, req);
 
   if (mapping?.workflow_instance_id) {
     await workflowService.advanceWorkflow(
       pool,
       mapping.workflow_instance_id,
-      /reject/i.test(stageName) ? "reject" : "approve",
-      { stageKey: stageName.toLowerCase().replace(/\s+/g, "_"), actor: user.name, comment: remarks },
+      /reject/i.test(canonicalStageName) ? "reject" : "approve",
+      {
+        stageKey: canonicalStageName.toLowerCase().replace(/\s+/g, "_"),
+        actor: user.name,
+        comment: remarks
+      },
       req
     );
+  }
+
+  let eventType = "StageChanged";
+  if (/reject/i.test(canonicalStageName)) {
+    eventType = "CandidateRejected";
+  } else if (/shortlist|cleared/i.test(canonicalStageName)) {
+    eventType = "CandidateShortlisted";
+  }
+
+  if (mapping) {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `UPDATE rm_candidate_mappings
+         SET stage_name = $1, remarks = $2, modified_on = NOW()
+         WHERE mapping_id = $3`,
+        [canonicalStageName, remarks, mapping.mapping_id]
+      );
+
+      await pipelineHistoryService.recordPipelineStageTransition(client, {
+        requisitionCode,
+        mappingId: mapping.mapping_id,
+        candidateId: mapping.candidate_id,
+        eventType,
+        fromStage: previousStage,
+        toStage: canonicalStageName,
+        actor: user.name,
+        actorRole: user.role,
+        comments: remarks,
+        metadata: { ruleEvaluation: ruleEval }
+      });
+
+      await client.query("COMMIT");
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_rollbackError) {
+        // ignore rollback failures
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  } else {
+    await pipelineHistoryService.recordPipelineStageTransition(pool, {
+      requisitionCode,
+      mappingId: null,
+      candidateId: legacyRow?.candidate_id,
+      eventType,
+      fromStage: previousStage,
+      toStage: canonicalStageName,
+      actor: user.name,
+      actorRole: user.role,
+      comments: remarks,
+      metadata: { ruleEvaluation: ruleEval }
+    });
   }
 
   if (isLegacyDualWriteEnabled() && legacyRow && (await tableExists(pool, "candidate_req_map"))) {
     await pool.query(
       "UPDATE candidate_req_map SET stage_name = $1, remarks = $2 WHERE map_id = $3",
-      [stageName, remarks, mapId]
+      [canonicalStageName, remarks, mapId]
     );
 
     await pool.query(
       "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
-      [stageName, legacyRow.candidate_id]
+      [canonicalStageName, legacyRow.candidate_id]
     );
   } else if (mapping?.candidate_id) {
     await pool.query(
       "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
-      [stageName, mapping.candidate_id]
+      [canonicalStageName, mapping.candidate_id]
     );
   }
-
-  if (mapping) {
-    await pool.query(
-      `UPDATE rm_candidate_mappings
-       SET stage_name = $1, remarks = $2, modified_on = NOW()
-       WHERE mapping_id = $3`,
-      [stageName, remarks, mapping.mapping_id]
-    );
-  }
-
-  let eventType = "StageChanged";
-  if (/reject/i.test(stageName)) {
-    eventType = "CandidateRejected";
-  } else if (/shortlist|cleared/i.test(stageName)) {
-    eventType = "CandidateShortlisted";
-  }
-
-  await pool.query(
-    `INSERT INTO rm_pipeline_history (
-      requisition_code, mapping_id, candidate_id, event_type,
-      from_stage, to_stage, actor, actor_role, comments, metadata
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [
-      requisitionCode,
-      mapping?.mapping_id || null,
-      mapping?.candidate_id || legacyRow?.candidate_id,
-      eventType,
-      previousStage,
-      stageName,
-      user.name,
-      user.role,
-      remarks,
-      JSON.stringify({ ruleEvaluation: ruleEval })
-    ]
-  );
 
   await writeEnterpriseAudit(pool, {
     eventType,
     module: "Recruitment Management",
     entity: "Candidate Pipeline",
     entityId: String(mapId),
-    action: `Stage changed from ${previousStage} to ${stageName}`,
+    action: `Stage changed from ${previousStage} to ${canonicalStageName}`,
     previousValue: previousStage,
-    newValue: stageName,
+    newValue: canonicalStageName,
     userName: user.name,
     userRole: user.role,
     metadata: { remarks, ruleEvaluation: ruleEval }
   });
 
+  if (mapping?.mapping_id && mapping?.candidate_id) {
+    try {
+      const candidatePortalNotificationService = require(
+        "./candidatePortalNotificationService"
+      );
+
+      const notifyResult =
+        await candidatePortalNotificationService.notifyStageChanged(pool, {
+          mappingId: mapping.mapping_id,
+          candidateId: mapping.candidate_id,
+          requisitionCode,
+          stageName: canonicalStageName,
+          stageCode: resolvedStage.stageCode,
+          positionTitle: requisition?.position_title || null
+        });
+
+      if (notifyResult?.skipped) {
+        console.warn(
+          "[updateCandidateStage] stage_changed skipped:",
+          notifyResult.reason
+        );
+      }
+    } catch (notificationError) {
+      console.error(
+        "[updateCandidateStage] stage_changed notification failed:",
+        notificationError.message
+      );
+    }
+  }
+
   return {
-    mapping: mapping ? { ...mapping, stage_name: stageName } : legacyRow,
+    mapping: mapping ? { ...mapping, stage_name: canonicalStageName } : legacyRow,
     eventType,
     toastMessage: "ATS stage updated successfully."
   };
@@ -1772,6 +2225,7 @@ async function handleLegacyCreateRequisition(queryable, body, req) {
     location: body.work_location || null,
     hiring_manager: body.hiring_manager,
     primary_skill: body.primary_skill,
+    secondary_skill: body.secondary_skill,
     employment_type: body.employment_type || null,
     approval_route_id: body.approval_route_id ?? body.route_id ?? null
   }, req);
@@ -1915,7 +2369,7 @@ function mapRequisitionForManagementUi(row) {
     job_title: row.position_title,
     job_description: null,
     primary_skill: row.primary_skill,
-    secondary_skill: null,
+    secondary_skill: row.secondary_skill,
     experience_min: null,
     experience_max: null,
     openings_count: row.headcount,
@@ -1923,6 +2377,13 @@ function mapRequisitionForManagementUi(row) {
     employment_type: row.employment_type,
     priority_level: "High",
     req_status: row.req_status,
+    closed_at: row.closed_at || null,
+    closed_by: row.closed_by || null,
+    closure_reason: row.closure_reason || null,
+    is_closed: isClosedRequisitionStatus(row.req_status),
+    candidate_portal_published_at: row.candidate_portal_published_at || null,
+    candidate_portal_published_by: row.candidate_portal_published_by || null,
+    candidate_portal_published: Boolean(row.candidate_portal_published_at),
     recruiter_id: null,
     hiring_manager: row.hiring_manager,
     target_date: null,
@@ -1963,11 +2424,43 @@ async function resolveRequisitionIdentifier(pool, reqIdOrCode) {
 async function listRequisitionsForManagement(pool) {
   const result = await pool.query(
     `SELECT * FROM rm_requisitions
-     WHERE UPPER(COALESCE(req_status, '')) = 'APPROVED'
-     ORDER BY COALESCE(req_id, 0) DESC, created_on DESC`
+     WHERE req_status = ANY($1::text[])
+     ORDER BY COALESCE(req_id, 0) DESC, created_on DESC`,
+    [
+      [
+        REQUISITION_STATUS.APPROVED,
+        REQUISITION_STATUS.CLOSED_FILLED,
+        REQUISITION_STATUS.CLOSED_CANCELLED
+      ]
+    ]
   );
 
-  return result.rows.map(mapRequisitionForManagementUi);
+  const enriched = await enrichRequisitionsWithFulfillment(pool, result.rows);
+
+  return enriched.map((row) => ({
+    ...mapRequisitionForManagementUi(row),
+    ...row.fulfillment,
+    fulfillment: row.fulfillment
+  }));
+}
+
+async function getRequisitionFulfillment(pool, requisitionCode) {
+  const requisition = await loadRequisitionByCode(pool, requisitionCode);
+
+  if (!requisition) {
+    throw httpError(`Requisition not found: ${requisitionCode}`, 404);
+  }
+
+  const fulfillment = await getFulfillmentForRequisition(pool, requisition);
+
+  return {
+    requisition_code: requisition.requisition_code,
+    req_status: requisition.req_status,
+    closed_at: requisition.closed_at || null,
+    closed_by: requisition.closed_by || null,
+    closure_reason: requisition.closure_reason || null,
+    fulfillment
+  };
 }
 
 async function getAssignedRecruitersForRequisition(pool, reqIdOrCode) {
@@ -2114,6 +2607,7 @@ async function removeRecruiterAssignment(pool, mapId, req) {
  */
 async function releaseCandidate(pool, candidateId, req) {
   const user = userContext(req);
+  await assertAuthorizedRelease(pool, req, candidateId);
   const legacyMapTableExists = await tableExists(pool, "candidate_req_map");
 
   const client = await pool.connect();
@@ -2415,6 +2909,614 @@ async function listApprovedPositions(pool) {
   }));
 }
 
+const CANDIDATE_PORTAL_REQUISITION_INTERNAL_FIELDS = [
+  "req_id",
+  "approved_position_id",
+  "budget_approved",
+  "hiring_manager",
+  "hiring_manager_id",
+  "recruiter_id",
+  "workflow_instance_id",
+  "version",
+  "version_status",
+  "candidate_portal_published_at",
+  "candidate_portal_published_by",
+  "effective_from",
+  "effective_to",
+  "created_by",
+  "modified_by",
+  "created_on",
+  "modified_on",
+  "client_id",
+  "project_id",
+  "business_unit",
+  "approval_route_id",
+  "requestor_submitted_on",
+  "priority_level",
+  "target_date",
+  "grade"
+];
+
+function mapRequisitionForCandidatePortal(row) {
+  return {
+    requisition_code: row.requisition_code,
+    title: row.position_title,
+    location: row.location,
+    department: row.department,
+    employment_type: row.employment_type,
+    primary_skill: row.primary_skill,
+    secondary_skill: row.secondary_skill,
+    experience_min: row.experience_min,
+    experience_max: row.experience_max,
+    openings_count: row.headcount,
+    job_description: row.job_description
+  };
+}
+
+/**
+ * Candidate portal job discovery — Approved + explicitly published requisitions only.
+ * Read-only; excludes internal recruiter/approval/budget metadata.
+ */
+async function listOpenRequisitionsForCandidatePortal(pool) {
+  const result = await pool.query(
+    `SELECT
+       r.requisition_code,
+       r.position_title,
+       r.location,
+       r.department,
+       r.employment_type,
+       r.primary_skill,
+       r.secondary_skill,
+       r.experience_min,
+       r.experience_max,
+       r.headcount,
+       r.job_description
+     FROM rm_requisitions r
+     WHERE r.req_status = $1
+       AND r.candidate_portal_published_at IS NOT NULL
+     ORDER BY r.created_on DESC`,
+    [REQUISITION_STATUS.APPROVED]
+  );
+
+  return result.rows.map(mapRequisitionForCandidatePortal);
+}
+
+async function loadOpenRequisitionForCandidatePortal(pool, requisitionCode) {
+  const code = String(requisitionCode || "").trim();
+
+  if (!code) {
+    throw httpError("requisition_code is required.", 400);
+  }
+
+  const result = await pool.query(
+    `SELECT
+       requisition_code,
+       position_title,
+       req_id,
+       department,
+       req_status
+     FROM rm_requisitions
+     WHERE requisition_code = $1
+       AND req_status = $2
+       AND candidate_portal_published_at IS NOT NULL
+     LIMIT 1`,
+    [code, REQUISITION_STATUS.APPROVED]
+  );
+
+  if (!result.rows[0]) {
+    throw httpError("Requisition is not available for applications.", 404);
+  }
+
+  return result.rows[0];
+}
+
+async function publishRequisitionToCandidatePortal(pool, requisitionCode, req) {
+  const user = userContext(req);
+  await assertCanPublishToCandidatePortal(pool, req);
+
+  const code = String(requisitionCode || "").trim();
+  if (!code) {
+    throw httpError("requisition_code is required.", 400);
+  }
+
+  const requisition = await loadRequisitionByCode(pool, code);
+  if (!requisition) {
+    throw httpError(`Requisition not found: ${code}`, 404);
+  }
+
+  if (requisition.req_status !== REQUISITION_STATUS.APPROVED) {
+    throw httpError(
+      "Only Approved requisitions can be published to the Candidate Portal.",
+      400
+    );
+  }
+
+  assertRequisitionOpenForRecruiting(requisition);
+
+  if (requisition.candidate_portal_published_at) {
+    return {
+      success: true,
+      requisition: mapRequisitionForManagementUi(requisition),
+      alreadyPublished: true,
+      toastMessage: "Requisition is already published to the Candidate Portal."
+    };
+  }
+
+  const updated = await pool.query(
+    `UPDATE rm_requisitions
+     SET candidate_portal_published_at = NOW(),
+         candidate_portal_published_by = $1,
+         modified_by = $1,
+         modified_on = NOW()
+     WHERE requisition_code = $2
+     RETURNING *`,
+    [user.name, code]
+  );
+
+  await writeEnterpriseAudit(pool, {
+    eventType: "RequisitionPublishedToCandidatePortal",
+    module: "Recruitment Management",
+    entity: "Requisition",
+    entityId: code,
+    action: `Requisition ${code} published to Candidate Portal`,
+    previousValue: null,
+    newValue: updated.rows[0].candidate_portal_published_at?.toISOString?.()
+      || String(updated.rows[0].candidate_portal_published_at),
+    userName: user.name,
+    userRole: user.role,
+    metadata: {
+      candidate_portal_published_by: user.name
+    }
+  });
+
+  return {
+    success: true,
+    requisition: mapRequisitionForManagementUi(updated.rows[0]),
+    alreadyPublished: false,
+    toastMessage: `Requisition ${code} published to the Candidate Portal.`
+  };
+}
+
+async function unpublishRequisitionFromCandidatePortal(pool, requisitionCode, req) {
+  const user = userContext(req);
+  await assertCanPublishToCandidatePortal(pool, req);
+
+  const code = String(requisitionCode || "").trim();
+  if (!code) {
+    throw httpError("requisition_code is required.", 400);
+  }
+
+  const requisition = await loadRequisitionByCode(pool, code);
+  if (!requisition) {
+    throw httpError(`Requisition not found: ${code}`, 404);
+  }
+
+  if (requisition.req_status !== REQUISITION_STATUS.APPROVED) {
+    throw httpError(
+      "Only Approved requisitions can be unpublished from the Candidate Portal.",
+      400
+    );
+  }
+
+  if (!requisition.candidate_portal_published_at) {
+    return {
+      success: true,
+      requisition: mapRequisitionForManagementUi(requisition),
+      alreadyUnpublished: true,
+      toastMessage: "Requisition is not published to the Candidate Portal."
+    };
+  }
+
+  const previousPublishedAt = requisition.candidate_portal_published_at;
+
+  const updated = await pool.query(
+    `UPDATE rm_requisitions
+     SET candidate_portal_published_at = NULL,
+         candidate_portal_published_by = NULL,
+         modified_by = $1,
+         modified_on = NOW()
+     WHERE requisition_code = $2
+     RETURNING *`,
+    [user.name, code]
+  );
+
+  await writeEnterpriseAudit(pool, {
+    eventType: "RequisitionUnpublishedFromCandidatePortal",
+    module: "Recruitment Management",
+    entity: "Requisition",
+    entityId: code,
+    action: `Requisition ${code} unpublished from Candidate Portal`,
+    previousValue: previousPublishedAt?.toISOString?.() || String(previousPublishedAt),
+    newValue: null,
+    userName: user.name,
+    userRole: user.role,
+    metadata: {
+      candidate_portal_unpublished_by: user.name
+    }
+  });
+
+  return {
+    success: true,
+    requisition: mapRequisitionForManagementUi(updated.rows[0]),
+    alreadyUnpublished: false,
+    toastMessage: `Requisition ${code} unpublished from the Candidate Portal.`
+  };
+}
+
+async function resolvePortalApplyRecruiterContext(pool, requisitionCode) {
+  const result = await pool.query(
+    `SELECT a.recruiter_code, u.full_name
+     FROM rm_recruiter_assignments a
+     LEFT JOIN user_mstr u ON u.employee_code = a.recruiter_code
+     WHERE a.requisition_code = $1
+       AND a.is_active = true
+     ORDER BY a.assigned_on ASC, a.assignment_id ASC
+     LIMIT 1`,
+    [requisitionCode]
+  );
+
+  const row = result.rows[0];
+
+  return {
+    employee_code: row?.recruiter_code || null,
+    full_name: row?.full_name || row?.recruiter_code || "Candidate Portal"
+  };
+}
+
+function mapApplicationForCandidatePortal(mapping, requisition) {
+  return {
+    requisition_code: mapping.requisition_code,
+    title: requisition?.position_title || null,
+    stage_name: mapping.stage_name,
+    applied_on: mapping.applied_on
+  };
+}
+
+function buildCandidatePortalApplyRequest(candidateContext, recruiterContext) {
+  return {
+    candidatePortalApply: true,
+    user: {
+      employee_code: recruiterContext.employee_code,
+      full_name: candidateContext.full_name || candidateContext.email_id || "Candidate",
+      email_id: candidateContext.email_id,
+      role_name: "Candidate"
+    }
+  };
+}
+
+/**
+ * Candidate portal apply — governed mapCandidate path with portal auth context.
+ */
+async function applyCandidateFromPortal(pool, candidateContext, body = {}) {
+  const candidateId = Number(candidateContext?.candidate_id);
+
+  if (!Number.isInteger(candidateId) || candidateId <= 0) {
+    throw httpError("Invalid candidate session.", 401);
+  }
+
+  const requisitionCode = String(body.requisition_code || "").trim();
+
+  if (!requisitionCode) {
+    throw httpError("requisition_code is required.", 400);
+  }
+
+  const candidateCheck = await pool.query(
+    `SELECT c.candidate_id
+     FROM cand_mstr c
+     INNER JOIN candidate_portal_account a
+       ON a.candidate_id = c.candidate_id
+     WHERE c.candidate_id = $1
+     LIMIT 1`,
+    [candidateId]
+  );
+
+  if (!candidateCheck.rows[0]) {
+    throw httpError("Candidate profile not found.", 404);
+  }
+
+  const emailId = String(candidateContext.email_id || "").trim();
+  const candidateCountBefore = await pool.query(
+    `SELECT COUNT(*)::int AS total
+     FROM cand_mstr
+     WHERE LOWER(email_id) = LOWER($1)`,
+    [emailId]
+  );
+
+  if ((candidateCountBefore.rows[0]?.total || 0) !== 1) {
+    throw httpError("Candidate profile not found.", 404);
+  }
+
+  const requisition = await loadOpenRequisitionForCandidatePortal(
+    pool,
+    requisitionCode
+  );
+  const recruiterContext = await resolvePortalApplyRecruiterContext(
+    pool,
+    requisition.requisition_code
+  );
+  const portalReq = buildCandidatePortalApplyRequest(
+    candidateContext,
+    recruiterContext
+  );
+
+  const {
+    assertCandidatePortalApplicationReady
+  } = require("./candidatePortalProfileService");
+  await assertCandidatePortalApplicationReady(pool, candidateId);
+
+  const mapResult = await mapCandidate(
+    pool,
+    {
+      candidate_id: candidateId,
+      requisition_code: requisition.requisition_code,
+      stage_name: "Applied",
+      remarks: "Applied via Candidate Portal"
+    },
+    portalReq
+  );
+
+  if (Number(mapResult.mapping?.candidate_id) !== candidateId) {
+    throw httpError("Application could not be linked to your candidate profile.", 500);
+  }
+
+  const candidateCountAfter = await pool.query(
+    `SELECT COUNT(*)::int AS total
+     FROM cand_mstr
+     WHERE LOWER(email_id) = LOWER($1)`,
+    [emailId]
+  );
+
+  if (candidateCountAfter.rows[0]?.total !== candidateCountBefore.rows[0]?.total) {
+    throw httpError("Application could not be linked to your candidate profile.", 500);
+  }
+
+  const application = mapApplicationForCandidatePortal(
+    mapResult.mapping,
+    requisition
+  );
+
+  try {
+    const candidatePortalNotificationService = require(
+      "./candidatePortalNotificationService"
+    );
+
+    await candidatePortalNotificationService.notifyApplicationSubmitted(pool, {
+      candidateContext,
+      application,
+      mappingId: mapResult.mapping.mapping_id
+    });
+  } catch (notificationError) {
+    console.error(
+      "[applyCandidateFromPortal] application_submitted notification failed:",
+      notificationError.message
+    );
+  }
+
+  return application;
+}
+
+const CANDIDATE_PORTAL_APPLY_REMARKS = "Applied via Candidate Portal";
+
+function mapPendingPortalApplicationRow(row) {
+  const firstName = String(row.first_name || "").trim();
+  const lastName = String(row.last_name || "").trim();
+  const candidateName = [firstName, lastName].filter(Boolean).join(" ").trim();
+
+  return {
+    mapping_id: row.mapping_id,
+    map_id: row.map_id,
+    candidate_id: row.candidate_id,
+    candidate_code: row.candidate_code,
+    candidate_name: candidateName || null,
+    email_id: row.email_id,
+    requisition_code: row.requisition_code,
+    position_title: row.position_title || null,
+    stage_name: row.stage_name,
+    applied_on: row.applied_on,
+    remarks: row.remarks
+  };
+}
+
+/**
+ * Assignment-scoped pending Candidate Portal applications (unowned, Applied).
+ */
+async function listPendingPortalApplications(pool, req) {
+  const employeeCode = recruiterEmployeeCode(req);
+
+  const result = await pool.query(
+    `SELECT
+        m.mapping_id,
+        m.map_id,
+        m.candidate_id,
+        m.requisition_code,
+        m.stage_name,
+        m.applied_on,
+        m.remarks,
+        c.candidate_code,
+        c.first_name,
+        c.last_name,
+        c.email_id,
+        r.position_title
+     FROM rm_candidate_mappings m
+     INNER JOIN cand_mstr c
+       ON c.candidate_id = m.candidate_id
+     INNER JOIN rm_requisitions r
+       ON r.requisition_code = m.requisition_code
+     INNER JOIN rm_recruiter_assignments a
+       ON a.requisition_code = m.requisition_code
+      AND a.is_active = true
+      AND a.recruiter_code = $1
+     WHERE m.is_active = true
+       AND c.owner_employee_code IS NULL
+       AND LOWER(TRIM(COALESCE(m.stage_name, ''))) LIKE '%applied%'
+       AND m.remarks = $2
+     ORDER BY m.applied_on DESC NULLS LAST, m.mapping_id DESC`,
+    [employeeCode, CANDIDATE_PORTAL_APPLY_REMARKS]
+  );
+
+  return result.rows.map(mapPendingPortalApplicationRow);
+}
+
+/**
+ * Claim ownership of an unowned portal application on an assigned requisition.
+ */
+async function claimPendingPortalApplication(pool, mappingId, req) {
+  const employeeCode = recruiterEmployeeCode(req);
+  const normalizedMappingId = Number(mappingId);
+
+  if (!Number.isInteger(normalizedMappingId) || normalizedMappingId <= 0) {
+    throw httpError("Invalid mapping_id.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const mappingResult = await client.query(
+      `SELECT mapping_id, candidate_id, requisition_code, stage_name, remarks, is_active
+       FROM rm_candidate_mappings
+       WHERE mapping_id = $1
+       FOR UPDATE`,
+      [normalizedMappingId]
+    );
+
+    const mapping = mappingResult.rows[0];
+
+    if (!mapping || !mapping.is_active) {
+      throw httpError("Application mapping not found.", 404);
+    }
+
+    if (mapping.remarks !== CANDIDATE_PORTAL_APPLY_REMARKS) {
+      throw httpError("This mapping is not a Candidate Portal application.", 400);
+    }
+
+    if (!/applied/i.test(String(mapping.stage_name || ""))) {
+      throw httpError("Only Applied-stage portal applications can be claimed.", 400);
+    }
+
+    const assignmentResult = await client.query(
+      `SELECT assignment_id
+       FROM rm_recruiter_assignments
+       WHERE recruiter_code = $1
+         AND requisition_code = $2
+         AND is_active = true
+       LIMIT 1`,
+      [employeeCode, mapping.requisition_code]
+    );
+
+    if (!assignmentResult.rows.length) {
+      throw httpError(
+        "Enterprise Access Denied. You are not assigned to this requisition.",
+        403
+      );
+    }
+
+    const candResult = await client.query(
+      `SELECT candidate_id, candidate_container, owner_employee_code
+       FROM cand_mstr
+       WHERE candidate_id = $1
+       FOR UPDATE`,
+      [mapping.candidate_id]
+    );
+
+    const candRow = candResult.rows[0];
+
+    if (!candRow) {
+      throw httpError("Candidate not found.", 404);
+    }
+
+    if (String(candRow.owner_employee_code || "").trim()) {
+      throw httpError("Candidate ownership has already been claimed.", 409);
+    }
+
+    const updateResult = await client.query(
+      `UPDATE cand_mstr
+       SET owner_employee_code = $1,
+           candidate_container = 'PIPELINE'
+       WHERE candidate_id = $2
+         AND owner_employee_code IS NULL
+       RETURNING candidate_id, owner_employee_code, candidate_container`,
+      [employeeCode, mapping.candidate_id]
+    );
+
+    if (!updateResult.rows.length) {
+      throw httpError("Candidate ownership has already been claimed.", 409);
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      mapping_id: mapping.mapping_id,
+      candidate_id: mapping.candidate_id,
+      requisition_code: mapping.requisition_code,
+      owner_employee_code: employeeCode,
+      candidate_container: updateResult.rows[0].candidate_container
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+const CANDIDATE_PORTAL_APPLICATION_ALLOWED_FIELDS = new Set([
+  "requisition_code",
+  "title",
+  "location",
+  "stage_name",
+  "applied_on"
+]);
+
+function mapCandidatePortalApplicationListItem(row, resolveStage) {
+  const stage = resolveStage(row.stage_name);
+
+  return {
+    requisition_code: row.requisition_code,
+    title: row.position_title || null,
+    location: row.location || null,
+    stage_name: stage?.stage_name || null,
+    applied_on: row.applied_on
+  };
+}
+
+/**
+ * Candidate portal My Applications — Enterprise rm_candidate_mappings read.
+ */
+async function listCandidatePortalApplications(pool, candidateContext) {
+  const candidateId = Number(candidateContext?.candidate_id);
+
+  if (!Number.isInteger(candidateId) || candidateId <= 0) {
+    throw httpError("Invalid candidate session.", 401);
+  }
+
+  const result = await pool.query(
+    `SELECT
+       m.requisition_code,
+       m.stage_name,
+       m.applied_on,
+       r.position_title,
+       r.location
+     FROM rm_candidate_mappings m
+     INNER JOIN rm_requisitions r
+       ON r.requisition_code = m.requisition_code
+     WHERE m.candidate_id = $1
+     ORDER BY m.applied_on DESC, m.mapping_id DESC`,
+    [candidateId]
+  );
+
+  const resolveStage = await buildCandidateFacingStageResolver(pool);
+
+  return result.rows.map((row) =>
+    mapCandidatePortalApplicationListItem(row, resolveStage)
+  );
+}
+
 async function loadRequisitionByCode(queryable, code) {
   const requisitionCode = String(code || "").trim();
   if (!requisitionCode) {
@@ -2460,7 +3562,8 @@ function assertExistingRequisitionEditable(requisition) {
   const status = String(requisition.req_status || "").trim();
   if (
     status === REQUISITION_STATUS.APPROVED ||
-    status === REQUISITION_STATUS.REJECTED
+    status === REQUISITION_STATUS.REJECTED ||
+    isClosedRequisitionStatus(status)
   ) {
     throw httpError(
       `Requisition ${requisition.requisition_code} is ${status} and cannot be edited.`,
@@ -2638,6 +3741,21 @@ async function updateRequisition(pool, code, payload, req) {
   assertExistingRequisitionEditable(existing);
 
   const fields = buildRequisitionUpdateFields(payload || {});
+
+  const mdPayload = {};
+  if (fields.primary_skill !== undefined) {
+    mdPayload.primary_skill = fields.primary_skill;
+  }
+  if (fields.secondary_skill !== undefined) {
+    mdPayload.secondary_skill = fields.secondary_skill;
+  }
+  if (Object.keys(mdPayload).length > 0) {
+    const mdValidation = await validateMasterDataReferences(pool, mdPayload);
+    if (!mdValidation.valid) {
+      throw httpError(mdValidation.errors.join(" "), 400);
+    }
+  }
+
   const setClauses = [];
   const params = [];
   let idx = 1;
@@ -2894,6 +4012,15 @@ module.exports = {
   releaseCandidate,
   returnCandidateToTalentPool,
   updateCandidateStage,
+  assertAuthorizedMappingAccess,
+  getCandidateWorkspaceProfile,
+  listCandidateEducation,
+  listCandidateExperience,
+  getCandidateOwnership,
+  listTalentPoolCandidates,
+  listMyPipelineCandidates,
+  listPipelineHistoryForMapping,
+  assertAuthorizedRelease,
   validateMasterDataReferences,
   validateMasterDataFields,
   RECRUITMENT_MASTER_DATA_CHECKS,
@@ -2903,6 +4030,7 @@ module.exports = {
   mapRequisitionForManagementUi,
   mapAssignmentForManagementUi,
   listRequisitionsForManagement,
+  getRequisitionFulfillment,
   getAssignedRecruitersForRequisition,
   listFormRecruiters,
   listFormClients,
@@ -2912,5 +4040,21 @@ module.exports = {
   updateRequisition,
   submitRequisition,
   loadRequisitionByCode,
-  getRequisitionForRequestor
+  getRequisitionForRequestor,
+  mapRequisitionForCandidatePortal,
+  listOpenRequisitionsForCandidatePortal,
+  loadOpenRequisitionForCandidatePortal,
+  publishRequisitionToCandidatePortal,
+  unpublishRequisitionFromCandidatePortal,
+  applyCandidateFromPortal,
+  listPendingPortalApplications,
+  claimPendingPortalApplication,
+  CANDIDATE_PORTAL_APPLY_REMARKS,
+  mapApplicationForCandidatePortal,
+  listCandidatePortalApplications,
+  buildCandidateFacingStageResolver,
+  inferCatalogStageCodeFromOperationalStage,
+  CANDIDATE_PORTAL_REQUISITION_INTERNAL_FIELDS,
+  CANDIDATE_PORTAL_APPLICATION_ALLOWED_FIELDS,
+  CANDIDATE_PORTAL_INTERVIEW_MICRO_STATE_PATTERN
 };

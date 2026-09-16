@@ -137,9 +137,17 @@ async function resolveSubmitDefaults(client) {
        AND is_deleted = FALSE
      ORDER BY id LIMIT 1`
   );
+  const skill = await client.query(
+    `SELECT code FROM md_records
+     WHERE entity_type = 'skills'
+       AND is_deleted = FALSE
+       AND LOWER(COALESCE(status, 'active')) = 'active'
+       AND LOWER(COALESCE(version_status, 'published')) = 'published'
+     ORDER BY id LIMIT 1`
+  );
 
   return {
-    primary_skill: "Verification Skill",
+    primary_skill: skill.rows[0]?.code || null,
     location: city.rows[0]?.name || null,
     employment_type: employment.rows[0]?.name || "Full Time",
     priority_level: priority.rows[0]?.name || "High",

@@ -11,7 +11,7 @@ function handleError(res, error) {
 function registerInterviewRoutes(app, pool, verifyToken) {
   app.get("/api/v1/interviews", verifyToken, async (req, res) => {
     try {
-      const bundle = await interviewService.getInterviewBundle(pool);
+      const bundle = await interviewService.getInterviewBundle(pool, req);
       res.json(bundle);
     } catch (error) {
       handleError(res, error);
@@ -20,7 +20,11 @@ function registerInterviewRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/interviews/progress/:mapId", verifyToken, async (req, res) => {
     try {
-      const data = await interviewService.getInterviewProgressByMapId(pool, req.params.mapId);
+      const data = await interviewService.getInterviewProgressByMapId(
+        pool,
+        req.params.mapId,
+        req
+      );
       res.json({
         success: true,
         message: "Interview progress loaded.",

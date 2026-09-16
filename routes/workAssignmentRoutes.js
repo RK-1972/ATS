@@ -1,4 +1,8 @@
 const workAssignmentService = require("../services/workAssignmentService");
+const {
+  assertCanManageEmployeeWorkAssignments,
+  assertAssignmentGrantAllowed
+} = require("../services/userProvisioningCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Work Assignment API Error:", error.message);
@@ -193,7 +197,22 @@ function registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin) {
   // POST /employee-work-assignments — Assign work assignment to employee
   app.post("/employee-work-assignments", verifyToken, async (req, res) => {
     try {
+      await assertCanManageEmployeeWorkAssignments(pool, req);
+
       const body = req.body || {};
+      const workAssignmentId = body.work_assignment_id;
+
+      if (workAssignmentId) {
+        const master = await workAssignmentService.getWorkAssignmentById(
+          pool,
+          workAssignmentId
+        );
+
+        if (master?.assignment_code) {
+          assertAssignmentGrantAllowed(req, master.assignment_code);
+        }
+      }
+
       const data = await workAssignmentService.assignWorkAssignment(
         pool,
         body.employee_code,
@@ -240,6 +259,8 @@ function registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin) {
     verifyToken,
     async (req, res) => {
       try {
+        await assertCanManageEmployeeWorkAssignments(pool, req);
+
         const data = await workAssignmentService.removeEmployeeWorkAssignment(
           pool,
           req.params.employeeWorkAssignmentId

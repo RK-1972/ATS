@@ -15,7 +15,10 @@ const DEFAULT_WORKSPACE_FLAGS = Object.freeze({
   showRecruitmentWorkspace: false,
   showApprovalWorkspace: false,
   showInterviewWorkspace: false,
-  showRequestWorkspace: false
+  showRequestWorkspace: false,
+  showUserAdministrationWorkspace: false,
+  showHiringManagerWorkspace: false,
+  showTaLeadWorkspace: false
 });
 
 function httpError(message, status = 400) {

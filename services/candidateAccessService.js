@@ -5,6 +5,10 @@
  * Admin retains unrestricted read access.
  */
 
+const {
+  isCandidateInIntakeReviewQueue
+} = require("./candidatePortalProfileService");
+
 function httpError(message, status = 403) {
   const error = new Error(message);
   error.status = status;
@@ -21,6 +25,13 @@ function resolveEmployeeCode(req) {
 
 function normalizeContainer(value) {
   return String(value || "PIPELINE").trim().toUpperCase();
+}
+
+function isRecruiterUser(req) {
+  const roleName = String(req.user?.role_name || "").trim();
+  const secondaryRole = String(req.user?.secondary_role || "").trim();
+
+  return roleName === "Recruiter" || secondaryRole === "Recruiter";
 }
 
 function canReadCandidateRow(row, req) {
@@ -51,9 +62,29 @@ function canReadCandidateRow(row, req) {
   return false;
 }
 
+async function canReviewDraftCandidateRow(pool, row, req) {
+  if (!row) {
+    return false;
+  }
+
+  if (String(row.candidate_status || "").trim().toUpperCase() !== "DRAFT") {
+    return false;
+  }
+
+  if (String(row.owner_employee_code || "").trim()) {
+    return false;
+  }
+
+  if (!isRecruiterUser(req)) {
+    return false;
+  }
+
+  return await isCandidateInIntakeReviewQueue(pool, row.candidate_id);
+}
+
 async function loadCandidateAccessRow(pool, candidateId) {
   const result = await pool.query(
-    `SELECT candidate_id, candidate_container, owner_employee_code
+    `SELECT candidate_id, candidate_container, owner_employee_code, candidate_status
      FROM cand_mstr
      WHERE candidate_id = $1`,
     [candidateId]
@@ -69,14 +100,18 @@ async function assertCandidateReadAccess(pool, req, candidateId) {
     throw httpError("Candidate not found.", 404);
   }
 
-  if (!canReadCandidateRow(accessRow, req)) {
-    throw httpError(
-      "Enterprise Access Denied. You are not authorized to view this candidate.",
-      403
-    );
+  if (canReadCandidateRow(accessRow, req)) {
+    return accessRow;
   }
 
-  return accessRow;
+  if (await canReviewDraftCandidateRow(pool, accessRow, req)) {
+    return accessRow;
+  }
+
+  throw httpError(
+    "Enterprise Access Denied. You are not authorized to view this candidate.",
+    403
+  );
 }
 
 async function listAuthorizedCandidateMasters(pool, req) {
@@ -112,7 +147,9 @@ async function listAuthorizedCandidateMasters(pool, req) {
 
 module.exports = {
   isAdminUser,
+  isRecruiterUser,
   canReadCandidateRow,
+  canReviewDraftCandidateRow,
   assertCandidateReadAccess,
   listAuthorizedCandidateMasters
 };

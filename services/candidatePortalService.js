@@ -4,6 +4,10 @@ const jwt = require("jsonwebtoken");
 const {
   isPasswordStrong
 } = require("../utils/passwordPolicy");
+const {
+  createPortalDraftCandidate,
+  findCandidateByEmail
+} = require("./candidateDraftService");
 
 const EMAIL_REGEX =
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -32,28 +36,6 @@ function splitFullName(fullName) {
     first_name: parts[0],
     last_name: parts.slice(1).join(" ") || ""
   };
-}
-
-async function generateCandidateCode(client) {
-  const today = new Date();
-  const day = String(today.getDate()).padStart(2, "0");
-  const month = String(today.getMonth() + 1).padStart(2, "0");
-  const year = String(today.getFullYear()).slice(-2);
-  const datePrefix = `${day}${month}${year}`;
-
-  const countResult = await client.query(
-    `
-    SELECT COUNT(*) AS total
-    FROM cand_mstr
-    WHERE TO_CHAR(created_on, 'DDMMYY') = $1
-    `,
-    [datePrefix]
-  );
-
-  const runningNumber =
-    parseInt(countResult.rows[0].total, 10) + 1;
-
-  return `${datePrefix}${runningNumber}`;
 }
 
 async function resolvePortalSourceId(queryable) {
@@ -146,50 +128,11 @@ function createCandidatePortalService(pool) {
     return result.rows[0] || null;
   }
 
-  async function createDraftCandidate(client, {
-    fullName,
-    emailId,
-    mobileNumber,
-    sourceId = null
-  }) {
-    const { first_name, last_name } = splitFullName(fullName);
-    const candidateCode = await generateCandidateCode(client);
-
-    const result = await client.query(
-      `
-      INSERT INTO cand_mstr (
-        candidate_code,
-        first_name,
-        last_name,
-        email_id,
-        mobile_number,
-        source_channel,
-        candidate_source_code,
-        candidate_status,
-        remarks,
-        created_by
-      )
-      VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $7, $8, $9, $10
-      )
-      RETURNING candidate_id, candidate_code, candidate_status, profile_completion
-      `,
-      [
-        candidateCode,
-        first_name,
-        last_name,
-        emailId,
-        mobileNumber,
-        sourceId,
-        "PORTAL",
-        "DRAFT",
-        "Created via Candidate Portal registration",
-        "CANDIDATE_PORTAL"
-      ]
-    );
-
-    return result.rows[0];
+  async function createDraftCandidate(client, options) {
+    return createPortalDraftCandidate(client, {
+      ...options,
+      splitFullName
+    });
   }
 
   function signCandidateToken(account) {
@@ -317,26 +260,9 @@ function createCandidatePortalService(pool) {
     try {
       await client.query("BEGIN");
 
-      const existingCandidateResult = await client.query(
-        `
-        SELECT
-          candidate_id,
-          candidate_code,
-          first_name,
-          last_name,
-          email_id,
-          mobile_number,
-          candidate_status,
-          profile_completion
-        FROM cand_mstr
-        WHERE LOWER(email_id) = LOWER($1)
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [emailId]
-      );
-
-      let candidateRecord = existingCandidateResult.rows[0] || null;
+      let candidateRecord = await findCandidateByEmail(client, emailId, {
+        forUpdate: true
+      });
       let linkedExistingCandidate = false;
 
       if (candidateRecord) {

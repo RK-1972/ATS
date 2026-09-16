@@ -1,4 +1,5 @@
 const offerLetterService = require("../services/offerLetterService");
+const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
 
 function handleError(res, error) {
   const status = error.status || 500;
@@ -24,9 +25,10 @@ function verifyTokenOrQuery(verifyToken) {
 }
 
 function registerOfferLetterRoutes(app, pool, verifyToken) {
+  const offerGuard = [verifyToken, requireOfferWorkspace(pool)];
   const authorize = verifyTokenOrQuery(verifyToken);
 
-  app.get("/api/v1/offer-letters/pending", verifyToken, async (req, res) => {
+  app.get("/api/v1/offer-letters/pending", offerGuard, async (req, res) => {
     try {
       const data = await offerLetterService.getPendingLetters(pool);
       res.json({ success: true, data });
@@ -35,7 +37,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.get("/api/v1/offer-letters/generated", verifyToken, async (req, res) => {
+  app.get("/api/v1/offer-letters/generated", offerGuard, async (req, res) => {
     try {
       const data = await offerLetterService.getGeneratedLetters(pool);
       res.json({ success: true, data });
@@ -44,7 +46,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.get("/api/v1/offer-letters/:id/pdf", authorize, async (req, res) => {
+  app.get("/api/v1/offer-letters/:id/pdf", [authorize, requireOfferWorkspace(pool)], async (req, res) => {
     try {
       const pdf = await offerLetterService.getGeneratedOfferLetterPdf(
         pool,
@@ -68,7 +70,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.get("/api/v1/offer-letters/:id", verifyToken, async (req, res) => {
+  app.get("/api/v1/offer-letters/:id", offerGuard, async (req, res) => {
     try {
       const data = await offerLetterService.getOfferLetterDetail(
         pool,
@@ -80,7 +82,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     }
   });
 
-  app.post("/api/v1/offer-letters/:id/generate", verifyToken, async (req, res) => {
+  app.post("/api/v1/offer-letters/:id/generate", offerGuard, async (req, res) => {
     try {
       const data = await offerLetterService.generateOfferLetter(
         pool,

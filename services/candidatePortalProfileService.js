@@ -1,8 +1,62 @@
-const PORTAL_SOURCE_CODE = "PORTAL";
-const PORTAL_SOURCE_REFERENCE_PREFIX = "portal-candidate:";
+const {
+  PORTAL_SOURCE_CODE,
+  PORTAL_SOURCE_REFERENCE_PREFIX,
+  applyParsedResumeToDraftCandidate
+} = require("./candidateDraftService");
 
 function buildPortalSourceReference(candidateId) {
   return `${PORTAL_SOURCE_REFERENCE_PREFIX}${candidateId}`;
+}
+
+function portalHttpError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+async function assertCandidatePortalApplicationReady(pool, candidateId) {
+  const normalizedId = Number(candidateId);
+
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+    throw portalHttpError("Invalid candidate session.", 401);
+  }
+
+  const candidateResult = await pool.query(
+    `
+    SELECT candidate_id, resume_path
+    FROM cand_mstr
+    WHERE candidate_id = $1
+    LIMIT 1
+    `,
+    [normalizedId]
+  );
+
+  if (!candidateResult.rows[0]) {
+    throw portalHttpError("Candidate profile not found.", 404);
+  }
+
+  if (!String(candidateResult.rows[0].resume_path || "").trim()) {
+    throw portalHttpError("Upload your resume before applying.");
+  }
+
+  const intakeResult = await pool.query(
+    `
+    SELECT review_status
+    FROM rm_candidate_intake
+    WHERE source_reference = $1
+    ORDER BY created_on DESC
+    LIMIT 1
+    `,
+    [buildPortalSourceReference(normalizedId)]
+  );
+
+  const reviewStatus = String(intakeResult.rows[0]?.review_status || "")
+    .trim()
+    .toUpperCase();
+
+  if (reviewStatus !== "SUBMITTED") {
+    throw portalHttpError("Complete your profile before applying.");
+  }
 }
 
 function parsePortalSourceReference(sourceReference) {
@@ -111,6 +165,54 @@ async function listIntakeReviewQueue(pool) {
   );
 
   return result.rows;
+}
+
+/**
+ * Authoritative Ready for Review queue membership for a single candidate.
+ * Mirrors listIntakeReviewQueue eligibility rules.
+ */
+async function isCandidateInIntakeReviewQueue(pool, candidateId) {
+  const normalizedId = Number(candidateId);
+
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+    return false;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM rm_candidate_intake i
+    JOIN cand_mstr c
+      ON c.candidate_id = COALESCE(
+        i.created_draft_id,
+        CASE
+          WHEN i.source_reference LIKE $1
+          THEN NULLIF(
+            substring(i.source_reference from 'portal-candidate:([0-9]+)'),
+            ''
+          )::integer
+          ELSE NULL
+        END
+      )
+    WHERE c.candidate_id = $2
+      AND UPPER(c.candidate_status) = 'DRAFT'
+      AND (
+        (
+          i.source_reference LIKE $1
+          AND i.review_status = 'SUBMITTED'
+        )
+        OR (
+          i.parsing_status = 'COMPLETED'
+          AND i.created_draft_id IS NOT NULL
+          AND i.review_status = 'PENDING'
+        )
+      )
+    LIMIT 1
+    `,
+    [`${PORTAL_SOURCE_REFERENCE_PREFIX}%`, normalizedId]
+  );
+
+  return result.rowCount > 0;
 }
 
 function calculateProfileCompletion(candidate = {}) {
@@ -311,52 +413,15 @@ function createCandidatePortalProfileService(pool, parserDeps) {
   }
 
   async function applyParsedDataToCandidate(client, candidateId, parsedCandidate, resumePath) {
-    const { first_name, last_name } = splitCandidateName(
-      parsedCandidate.candidate_name
+    const updatedRow = await applyParsedResumeToDraftCandidate(
+      client,
+      candidateId,
+      parsedCandidate,
+      resumePath,
+      { splitCandidateName, normalizeExperience }
     );
 
-    const skillsList = Array.isArray(parsedCandidate.skills)
-      ? parsedCandidate.skills
-      : [];
-
-    const primarySkill =
-      skillsList.length > 0 ? skillsList.join(", ") : null;
-
-    const result = await client.query(
-      `
-      UPDATE cand_mstr
-      SET
-        first_name = COALESCE(NULLIF($1, ''), first_name),
-        last_name = COALESCE(NULLIF($2, ''), last_name),
-        mobile_number = COALESCE(NULLIF($3, ''), mobile_number),
-        total_experience = COALESCE($4, total_experience),
-        primary_skill = COALESCE(NULLIF($5, ''), primary_skill),
-        resume_path = COALESCE($6, resume_path),
-        resume_uploaded_on = CASE
-          WHEN $6 IS NOT NULL THEN NOW()
-          ELSE resume_uploaded_on
-        END,
-        updated_on = NOW()
-      WHERE candidate_id = $7
-        AND UPPER(candidate_status) = 'DRAFT'
-      RETURNING *
-      `,
-      [
-        first_name,
-        last_name,
-        parsedCandidate.mobile || null,
-        normalizeExperience(parsedCandidate.experience),
-        primarySkill,
-        resumePath || null,
-        candidateId
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      throw new Error("Candidate profile cannot be updated in the current status.");
-    }
-
-    const profileCompletion = calculateProfileCompletion(result.rows[0]);
+    const profileCompletion = calculateProfileCompletion(updatedRow);
 
     const updated = await client.query(
       `
@@ -368,7 +433,7 @@ function createCandidatePortalProfileService(pool, parserDeps) {
       [profileCompletion, candidateId]
     );
 
-    return updated.rows[0];
+    return updated.rows[0] || updatedRow;
   }
 
   async function parseProfileIntake(candidateId, intakeId) {
@@ -713,7 +778,9 @@ function createCandidatePortalProfileService(pool, parserDeps) {
 module.exports = {
   PORTAL_SOURCE_REFERENCE_PREFIX,
   listIntakeReviewQueue,
+  isCandidateInIntakeReviewQueue,
   createCandidatePortalProfileService,
   calculateProfileCompletion,
-  mapParsedCandidateToProfile
+  mapParsedCandidateToProfile,
+  assertCandidatePortalApplicationReady
 };

@@ -206,15 +206,112 @@ function mapOfferRow(row) {
     variablePay: Number(row.variable_pay ?? 0),
     variablePayFrequency: row.variable_pay_frequency || null,
     joiningBonus: Number(row.joining_bonus ?? 0),
-    joiningBonusFrequency: row.joining_bonus_frequency || null
+    joiningBonusFrequency: row.joining_bonus_frequency || null,
+    createdBy: row.created_by,
+    modifiedBy: row.modified_by,
+    createdOn: row.created_on,
+    modifiedOn: row.modified_on
   };
 }
 
-async function getOffer(pool, offerId) {
+function isAdminUser(req) {
+  return String(req?.user?.role_name || "").trim() === "Admin";
+}
+
+function resolveOfferActorIdentity(req) {
+  const employeeCode = String(req?.user?.employee_code || "").trim();
+  const displayName = String(
+    req?.user?.full_name || req?.user?.email_id || ""
+  ).trim();
+  return { employeeCode, displayName };
+}
+
+async function listScopedOfferRows(pool, req) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    const result = await pool.query("SELECT * FROM om_offers ORDER BY created_on DESC");
+    return result.rows;
+  }
+
+  const { employeeCode, displayName } = resolveOfferActorIdentity(req);
+
+  const result = await pool.query(
+    `SELECT DISTINCT o.*
+     FROM om_offers o
+     LEFT JOIN rm_candidate_mappings m
+       ON m.mapping_id = o.mapping_id
+       OR m.map_id = o.mapping_id
+     LEFT JOIN cand_mstr c
+       ON c.candidate_id = COALESCE(o.candidate_id, m.candidate_id)
+     WHERE (
+       ($1 <> '' AND o.created_by = $1)
+       OR ($1 <> '' AND o.recruiter_id = $1)
+       OR ($2 <> '' AND o.recruiter_id = $2)
+       OR ($2 <> '' AND o.created_by = $2)
+       OR EXISTS (
+         SELECT 1
+         FROM rm_recruiter_assignments a
+         WHERE a.recruiter_code = $2
+           AND a.is_active = true
+           AND a.requisition_code = o.requisition_code
+       )
+       OR ($2 <> '' AND c.owner_employee_code = $2)
+     )
+     ORDER BY o.created_on DESC`,
+    [displayName, employeeCode]
+  );
+
+  return result.rows;
+}
+
+async function assertOfferReadAccess(pool, req, offerId) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const scopedRows = await listScopedOfferRows(pool, req);
+  const allowed = scopedRows.some((row) => String(row.offer_id) === String(offerId));
+
+  if (!allowed) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to access this offer.",
+      403
+    );
+  }
+}
+
+async function resolvePendingApprovalTaskId(pool, workflowInstanceId, approvalStep) {
+  const result = await pool.query(
+    `SELECT t.task_id
+     FROM wf_tasks t
+     WHERE t.instance_id = $1
+       AND LOWER(t.status) = 'pending'
+       AND t.title = $2
+     ORDER BY t.created_on ASC, t.task_id ASC
+     LIMIT 1`,
+    [workflowInstanceId, approvalStep]
+  );
+
+  return result.rows[0]?.task_id || null;
+}
+
+async function getOffer(pool, offerId, req = null) {
   const result = await pool.query("SELECT * FROM om_offers WHERE offer_id = $1", [offerId]);
   if (!result.rows.length) {
     throw httpError(`Offer not found: ${offerId}`, 404);
   }
+
+  if (req?.user) {
+    await assertOfferReadAccess(pool, req, offerId);
+  }
+
   return mapOfferRow(result.rows[0]);
 }
 
@@ -269,20 +366,39 @@ async function loadRecruitmentContext(pool, payload) {
   return context;
 }
 
-async function getOfferBundle(pool) {
-  const offers = await pool.query("SELECT * FROM om_offers ORDER BY created_on DESC");
-  const approvals = await pool.query("SELECT * FROM om_offer_approvals ORDER BY sequence_order ASC");
-  const negotiations = await pool.query("SELECT * FROM om_offer_negotiations ORDER BY created_on DESC");
+async function getOfferBundle(pool, req) {
+  const offerRows = await listScopedOfferRows(pool, req);
+  const offerIds = offerRows.map((row) => row.offer_id);
+
+  let approvals = { rows: [] };
+  let negotiations = { rows: [] };
+
+  if (offerIds.length) {
+    approvals = await pool.query(
+      `SELECT *
+       FROM om_offer_approvals
+       WHERE offer_id = ANY($1::varchar[])
+       ORDER BY sequence_order ASC`,
+      [offerIds]
+    );
+    negotiations = await pool.query(
+      `SELECT *
+       FROM om_offer_negotiations
+       WHERE offer_id = ANY($1::varchar[])
+       ORDER BY created_on DESC`,
+      [offerIds]
+    );
+  }
 
   return {
-    offers: offers.rows.map(mapOfferRow),
+    offers: offerRows.map(mapOfferRow),
     approvals: approvals.rows,
     negotiations: negotiations.rows,
     summary: {
-      draft: offers.rows.filter((row) => row.offer_status === "Draft").length,
-      pendingApproval: offers.rows.filter((row) => /pending/i.test(row.offer_status)).length,
-      released: offers.rows.filter((row) => row.offer_status === "Released").length,
-      accepted: offers.rows.filter((row) => row.offer_status === "Accepted").length
+      draft: offerRows.filter((row) => row.offer_status === "Draft").length,
+      pendingApproval: offerRows.filter((row) => /pending/i.test(row.offer_status)).length,
+      released: offerRows.filter((row) => row.offer_status === "Released").length,
+      accepted: offerRows.filter((row) => row.offer_status === "Accepted").length
     }
   };
 }
@@ -300,6 +416,28 @@ async function createOffer(pool, payload, req) {
 
   if (!context.candidate_id && !context.mapping_id) {
     throw httpError("Offer must link to a candidate mapping.", 400);
+  }
+
+  if (context.requisition_code) {
+    const requisitionResult = await pool.query(
+      `SELECT requisition_code, req_status
+       FROM rm_requisitions
+       WHERE requisition_code = $1`,
+      [context.requisition_code]
+    );
+    const requisition = requisitionResult.rows[0];
+
+    if (!requisition) {
+      throw httpError(`Requisition not found: ${context.requisition_code}`, 404);
+    }
+
+    const { assertRequisitionOpenForRecruiting } = require("./requisitionFulfillmentService");
+    assertRequisitionOpenForRecruiting(requisition);
+  }
+
+  const mappingRef = payload.mapping_id ?? payload.map_id ?? context.mapping_id;
+  if (mappingRef) {
+    await recruitmentService.assertAuthorizedMappingAccess(pool, req, mappingRef);
   }
 
   const offeredCtc = Number(context.offered_ctc || context.total_ctc || 0);
@@ -566,7 +704,7 @@ async function submitOffer(pool, offerId, comment, req) {
   const platformConfig = await loadPlatformConfig(pool);
   await assertOfferModuleEnabled(platformConfig);
 
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
   if (offer.offerStatus !== "Draft") {
     throw httpError("Only draft offers can be submitted.", 400);
   }
@@ -701,7 +839,23 @@ async function submitOffer(pool, offerId, comment, req) {
 
 async function approveOffer(pool, offerId, approvalStep, comment, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
+
+  if (!offer.workflowInstanceId) {
+    throw httpError("Offer workflow instance is missing.", 400);
+  }
+
+  const taskId = await resolvePendingApprovalTaskId(
+    pool,
+    offer.workflowInstanceId,
+    approvalStep
+  );
+
+  if (!taskId) {
+    throw httpError(`Pending approval task not found for step: ${approvalStep}`, 404);
+  }
+
+  await workflowService.assertActiveAssignee(pool, taskId, req);
 
   const approvalResult = await pool.query(
     `UPDATE om_offer_approvals
@@ -789,7 +943,7 @@ async function approveOffer(pool, offerId, approvalStep, comment, req) {
 
 async function negotiateOffer(pool, offerId, payload, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
 
   const ruleEval = await evaluateOfferRules(pool, {
     offered_salary_lpa: Number(payload.proposed_ctc || offer.offeredCtc) / 100000,
@@ -841,6 +995,7 @@ async function negotiateOffer(pool, offerId, payload, req) {
 
 async function reviseOffer(pool, offerId, payload, req) {
   const user = userContext(req);
+  await assertOfferReadAccess(pool, req, offerId);
   const row = (await pool.query("SELECT * FROM om_offers WHERE offer_id = $1", [offerId])).rows[0];
   if (!row) {
     throw httpError(`Offer not found: ${offerId}`, 404);
@@ -875,7 +1030,7 @@ async function reviseOffer(pool, offerId, payload, req) {
 
 async function releaseOffer(pool, offerId, payload, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
 
   if (!["Approved", "Pending Approval"].includes(offer.offerStatus)) {
     throw httpError("Offer must be approved before release.", 400);
@@ -947,24 +1102,91 @@ async function releaseOffer(pool, offerId, payload, req) {
 
 async function acceptOffer(pool, offerId, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
 
   if (offer.offerStatus !== "Released") {
     throw httpError("Only released offers can be accepted.", 400);
   }
 
-  await pool.query(
-    `UPDATE om_offers SET offer_status = 'Accepted', modified_by = $1, modified_on = NOW()
-     WHERE offer_id = $2`,
-    [user.name, offerId]
-  );
+  if (!offer.requisitionCode) {
+    throw httpError("Offer must be linked to a requisition before acceptance.", 400);
+  }
 
-  await pool.query(
-    `UPDATE om_offer_acceptance
-     SET response_status = 'Accepted', accepted_on = NOW(), responded_by = $1
-     WHERE offer_id = $2`,
-    [user.name, offerId]
-  );
+  if (!offer.candidateId) {
+    throw httpError("Offer must be linked to a candidate before acceptance.", 400);
+  }
+
+  const {
+    assertRequisitionOpenForRecruiting,
+    assertNoDuplicateAcceptedOffer,
+    assertReservedCapacityAvailable,
+    lockRequisitionForUpdate
+  } = require("./requisitionFulfillmentService");
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const offerLock = await client.query(
+      `SELECT *
+       FROM om_offers
+       WHERE offer_id = $1
+       FOR UPDATE`,
+      [offerId]
+    );
+
+    if (!offerLock.rows[0]) {
+      throw httpError(`Offer not found: ${offerId}`, 404);
+    }
+
+    const lockedOffer = offerLock.rows[0];
+
+    if (lockedOffer.offer_status !== "Released") {
+      throw httpError("Only released offers can be accepted.", 400);
+    }
+
+    const requisition = await lockRequisitionForUpdate(
+      client,
+      lockedOffer.requisition_code
+    );
+
+    assertRequisitionOpenForRecruiting(requisition);
+
+    await assertNoDuplicateAcceptedOffer(
+      client,
+      lockedOffer.requisition_code,
+      lockedOffer.candidate_id,
+      offerId
+    );
+
+    await assertReservedCapacityAvailable(client, requisition, offerId);
+
+    await client.query(
+      `UPDATE om_offers
+       SET offer_status = 'Accepted', modified_by = $1, modified_on = NOW()
+       WHERE offer_id = $2`,
+      [user.name, offerId]
+    );
+
+    await client.query(
+      `UPDATE om_offer_acceptance
+       SET response_status = 'Accepted', accepted_on = NOW(), responded_by = $1
+       WHERE offer_id = $2`,
+      [user.name, offerId]
+    );
+
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 
   const followUpTasks = (await taskService.listInbox(pool, { module: "Offer Management" }))
     .filter((item) => item.businessObjectId === offerId && item.taskType === "Follow-up Acceptance");
@@ -991,7 +1213,7 @@ async function acceptOffer(pool, offerId, req) {
 
 async function rejectOffer(pool, offerId, reason, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
 
   await pool.query(
     `UPDATE om_offers SET offer_status = 'Declined', modified_by = $1, modified_on = NOW()
@@ -1036,7 +1258,7 @@ async function rejectOffer(pool, offerId, reason, req) {
 
 async function withdrawOffer(pool, offerId, reason, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
 
   await pool.query(
     `UPDATE om_offers SET offer_status = 'Withdrawn', modified_by = $1, modified_on = NOW()
@@ -1063,7 +1285,7 @@ async function withdrawOffer(pool, offerId, reason, req) {
 }
 
 async function requestClarification(pool, offerId, comments, req) {
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
   if (!offer.workflowInstanceId) {
     throw httpError("No workflow instance linked to this offer.", 400);
   }
@@ -1077,7 +1299,7 @@ async function requestClarification(pool, offerId, comments, req) {
 }
 
 async function submitClarification(pool, offerId, comments, req) {
-  const offer = await getOffer(pool, offerId);
+  const offer = await getOffer(pool, offerId, req);
   if (!offer.workflowInstanceId) {
     throw httpError("No workflow instance linked to this offer.", 400);
   }

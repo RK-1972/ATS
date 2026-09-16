@@ -105,7 +105,9 @@ async function main() {
   const taskService = require("../services/taskService");
   const interviewService = require("../services/interviewService");
   const taskBundle = await taskService.getTaskBundle(pool);
-  const interviewBundle = await interviewService.getInterviewBundle(pool);
+  const interviewBundle = await interviewService.getInterviewBundle(pool, {
+    user: { role_name: "Admin", employee_code: "SIM-ADMIN" }
+  });
 
   console.log("\n=== SIMULATION: Full live backend data for Sachin ===");
   console.log(JSON.stringify(buildRecruiterWorkspaceData({
