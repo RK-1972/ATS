@@ -1,5 +1,6 @@
 const recruitmentService = require("../services/recruitmentService");
 const resumeMatchService = require("../services/resumeMatchService");
+const aiCandidateReviewService = require("../services/aiCandidateReviewService");
 const requisitionClosureService = require("../services/requisitionClosureService");
 const requisitionHeadcountChangeService = require("../services/requisitionHeadcountChangeService");
 const requisitionBudgetChangeService = require("../services/requisitionBudgetChangeService");
@@ -522,6 +523,43 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
         res.status(200).json({
           success: true,
           message: "Resume matches retrieved successfully.",
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.get("/api/v1/recruitment/ai-review/availability", operatorGuard, async (req, res) => {
+    try {
+      const data = await aiCandidateReviewService.getAiReviewAvailability(pool);
+
+      res.status(200).json({
+        success: true,
+        message: "AI review availability retrieved.",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post(
+    "/api/v1/recruitment/candidates/:candidateId/requisitions/:code/ai-review",
+    operatorGuard,
+    async (req, res) => {
+      try {
+        const data = await aiCandidateReviewService.generateAiCandidateReview(
+          pool,
+          req.params.candidateId,
+          req.params.code,
+          req
+        );
+
+        res.status(200).json({
+          success: true,
+          message: "AI candidate review generated successfully.",
           data
         });
       } catch (error) {

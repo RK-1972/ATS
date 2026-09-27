@@ -9306,6 +9306,10 @@ const {
   listIntakeReviewQueue
 } = require("./services/candidatePortalProfileService");
 
+const {
+  canAccessPortalIntakeReviewQueue
+} = require("./services/candidateAccessService");
+
 app.get(
 
   "/candidate-intake/dashboard",
@@ -9342,8 +9346,10 @@ app.get(
 
       );
 
-      const reviewQueue = await listIntakeReviewQueue(pool);
       const dashboard = result.rows[0];
+      const reviewQueue = canAccessPortalIntakeReviewQueue(req)
+        ? await listIntakeReviewQueue(pool)
+        : [];
 
       res.status(200).json({
 

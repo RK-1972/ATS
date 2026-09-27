@@ -30,7 +30,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/offer-letters/pending", offerGuard, async (req, res) => {
     try {
-      const data = await offerLetterService.getPendingLetters(pool);
+      const data = await offerLetterService.getPendingLetters(pool, req);
       res.json({ success: true, data });
     } catch (error) {
       handleError(res, error);
@@ -39,7 +39,7 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/offer-letters/generated", offerGuard, async (req, res) => {
     try {
-      const data = await offerLetterService.getGeneratedLetters(pool);
+      const data = await offerLetterService.getGeneratedLetters(pool, req);
       res.json({ success: true, data });
     } catch (error) {
       handleError(res, error);
@@ -50,7 +50,8 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     try {
       const pdf = await offerLetterService.getGeneratedOfferLetterPdf(
         pool,
-        req.params.id
+        req.params.id,
+        req
       );
       const disposition =
         req.query.download === "1" ? "attachment" : "inline";
@@ -74,7 +75,8 @@ function registerOfferLetterRoutes(app, pool, verifyToken) {
     try {
       const data = await offerLetterService.getOfferLetterDetail(
         pool,
-        req.params.id
+        req.params.id,
+        req
       );
       res.json({ success: true, data });
     } catch (error) {

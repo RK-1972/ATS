@@ -519,22 +519,104 @@ async function linkLegacySchedule(pool, interviewId, scheduleId, meetingLink, te
   return getInterview(pool, interviewId);
 }
 
-async function getInterview(pool, interviewId) {
+async function fetchInterviewRowByLookup(pool, interviewId) {
   const result = await pool.query(
-    "SELECT * FROM im_interviews WHERE interview_id = $1 OR schedule_id::text = $1",
+    "SELECT * FROM im_interviews WHERE interview_id = $1 OR schedule_id::text = $1 LIMIT 1",
     [interviewId]
   );
 
+  return result.rows[0] || null;
+}
+
+/**
+ * Same visibility rules as GET /api/v1/interviews bundle (listScopedInterviewRows).
+ * Admin retains unrestricted read access.
+ */
+async function assertInterviewReadAccess(pool, req, interviewRow) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const panelIds = await resolveCallerPanelIds(pool, req);
+  const panelIdList = panelIds.length ? panelIds : [-1];
+
+  const result = await pool.query(
+    `SELECT 1
+     FROM im_interviews i
+     LEFT JOIN rm_candidate_mappings rcm
+       ON rcm.map_id = i.map_id
+      AND rcm.is_active = true
+     LEFT JOIN cand_mstr cm
+       ON cm.candidate_id = COALESCE(rcm.candidate_id, i.candidate_id)
+     LEFT JOIN im_panel_assignments ipa
+       ON ipa.interview_id = i.interview_id
+      AND ipa.assignment_status <> 'Reassigned'
+     LEFT JOIN interview_schedule_trn ist
+       ON ist.schedule_id = i.schedule_id
+     WHERE i.interview_id = $3
+       AND (
+         EXISTS (
+           SELECT 1
+           FROM rm_recruiter_assignments a
+           WHERE a.recruiter_code = $1
+             AND a.is_active = true
+             AND (
+               (i.requisition_code IS NOT NULL AND a.requisition_code = i.requisition_code)
+               OR (i.req_id IS NOT NULL AND a.req_id = i.req_id)
+             )
+         )
+         OR ($1 <> '' AND cm.owner_employee_code = $1)
+         OR ipa.panel_id = ANY($2::int[])
+         OR ist.interviewer_id = ANY($2::int[])
+       )
+     LIMIT 1`,
+    [employeeCode, panelIdList, interviewRow.interview_id]
+  );
+
   if (!result.rows.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view this interview.",
+      403
+    );
+  }
+}
+
+async function getInterviewForRequest(pool, interviewId, req) {
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
     throw httpError(`Interview not found: ${interviewId}`, 404);
   }
 
-  return mapInterviewRow(result.rows[0]);
+  await assertInterviewReadAccess(pool, req, row);
+  return mapInterviewRow(row);
+}
+
+async function getInterview(pool, interviewId) {
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  return mapInterviewRow(row);
 }
 
 async function acceptAssignment(pool, interviewId, req) {
   const user = userContext(req);
-  const interview = await getInterview(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewPanelActionAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
 
   await pool.query(
     `UPDATE im_panel_assignments
@@ -582,7 +664,14 @@ async function acceptAssignment(pool, interviewId, req) {
 
 async function rescheduleInterview(pool, interviewId, payload, req) {
   const user = userContext(req);
-  const interview = await getInterview(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewReadAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
   const platformConfig = await loadPlatformConfig(pool);
   await assertInterviewModuleEnabled(platformConfig);
 
@@ -652,7 +741,14 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
 
 async function completeInterview(pool, interviewId, req, comments = "") {
   const user = userContext(req);
-  const interview = await getInterview(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewReadAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
 
   if (interview.workflowInstanceId) {
     await workflowService.advanceWorkflow(
@@ -845,6 +941,40 @@ async function isCallerAssignedToInterview(pool, panelIds, context) {
   }
 
   return false;
+}
+
+/**
+ * Panel-only actions (e.g. accept assignment) require an active panel row on the interview.
+ */
+async function assertInterviewPanelActionAccess(pool, req, interviewRow) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const panelIds = await resolveCallerPanelIds(pool, req);
+
+  if (!panelIds.length) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to perform this interview action.",
+      403
+    );
+  }
+
+  const assigned = await isCallerAssignedToInterview(pool, panelIds, {
+    interview_id: interviewRow.interview_id,
+    schedule_id: interviewRow.schedule_id
+  });
+
+  if (!assigned) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to perform this interview action.",
+      403
+    );
+  }
 }
 
 /**
@@ -1259,7 +1389,14 @@ async function syncLegacyFeedback(pool, interview, payload, user) {
 
 async function reassignPanel(pool, interviewId, payload, req) {
   const user = userContext(req);
-  const interview = await getInterview(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewReadAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
   const { panel_id: panelId, interviewer_name: interviewerName, interviewer_email: interviewerEmail } = payload;
 
   const ruleEval = await evaluateInterviewRules(pool, {
@@ -1323,7 +1460,14 @@ async function reassignPanel(pool, interviewId, payload, req) {
 
 async function assignPanel(pool, interviewId, panelMembers, req) {
   const user = userContext(req);
-  const interview = await getInterview(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewReadAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
 
   const ruleEval = await evaluateInterviewRules(pool, {
     round_type: interview.roundType,
@@ -1624,6 +1768,9 @@ module.exports = {
   scheduleInterview,
   linkLegacySchedule,
   getInterview,
+  getInterviewForRequest,
+  assertInterviewReadAccess,
+  assertInterviewPanelActionAccess,
   acceptAssignment,
   rescheduleInterview,
   completeInterview,

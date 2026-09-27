@@ -15,6 +15,9 @@ function registerCandidatePortalRoutes(
   } = require("../services/candidatePortalProfileService");
 
   const recruitmentService = require("../services/recruitmentService");
+  const {
+    assertPortalIntakeReviewQueueAccess
+  } = require("../services/candidateAccessService");
 
   const candidatePortalService = createCandidatePortalService(pool);
   const candidatePortalProfileService =
@@ -485,6 +488,8 @@ function registerCandidatePortalRoutes(
     verifyToken,
     async (req, res) => {
       try {
+        assertPortalIntakeReviewQueueAccess(req);
+
         const queue =
           await candidatePortalProfileService.listPortalReviewQueue();
 
@@ -495,9 +500,10 @@ function registerCandidatePortalRoutes(
         });
       } catch (error) {
         console.error("[candidate-intake/portal-review-queue]", error);
-        return res.status(500).json({
+        const status = Number(error.status) || 500;
+        return res.status(status).json({
           success: false,
-          message: "Failed to load portal review queue"
+          message: error.message || "Failed to load portal review queue"
         });
       }
     }

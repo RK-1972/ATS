@@ -114,6 +114,36 @@ async function assertCandidateReadAccess(pool, req, candidateId) {
   );
 }
 
+/**
+ * Portal intake review queue — Admin or Recruiter only (matches canReviewDraftCandidateRow policy).
+ */
+function assertPortalIntakeReviewQueueAccess(req) {
+  if (!req?.user) {
+    throw httpError("Access Denied - No Token", 401);
+  }
+
+  if (isAdminUser(req) || isRecruiterUser(req)) {
+    return;
+  }
+
+  throw httpError(
+    "Enterprise Access Denied. You are not authorized to view the portal review queue.",
+    403
+  );
+}
+
+function canAccessPortalIntakeReviewQueue(req) {
+  try {
+    assertPortalIntakeReviewQueueAccess(req);
+    return true;
+  } catch (error) {
+    if (error.status === 401 || error.status === 403) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 async function listAuthorizedCandidateMasters(pool, req) {
   if (isAdminUser(req)) {
     const result = await pool.query(
@@ -150,6 +180,8 @@ module.exports = {
   isRecruiterUser,
   canReadCandidateRow,
   canReviewDraftCandidateRow,
+  assertPortalIntakeReviewQueueAccess,
+  canAccessPortalIntakeReviewQueue,
   assertCandidateReadAccess,
   listAuthorizedCandidateMasters
 };

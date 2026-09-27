@@ -9,7 +9,20 @@ const {
 } = require("../services/hiringControlTowerStageInspector");
 const recruitmentService = require("../services/recruitmentService");
 
-const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
+function resolveLocalApiBaseUrl() {
+  if (process.env.VERIFY_HTTP_API_BASE_URL) {
+    return String(process.env.VERIFY_HTTP_API_BASE_URL).replace(/\/$/, "");
+  }
+  for (const value of [process.env.BACKEND_API_URL, process.env.API_BASE_URL]) {
+    const url = String(value || "").trim();
+    if (url.includes(":5000")) {
+      return url.replace(/\/$/, "");
+    }
+  }
+  return "http://localhost:5000";
+}
+
+const API_BASE_URL = resolveLocalApiBaseUrl();
 
 const EXPECTED_MILESTONE_KEYS = [
   "budget_submitted",
@@ -217,19 +230,29 @@ async function main() {
     pass("missing requisition returns 404");
   }
 
-  const adminToken = signToken({
-    user_id: 1,
-    employee_code: "ADMIN001",
-    role_name: "Admin",
-    email_id: "admin@example.com"
-  });
+  const adminRow = await pool.query(
+    `SELECT user_id, employee_code, email_id, role_name, secondary_role
+     FROM user_mstr
+     WHERE role_name = 'Admin' AND COALESCE(is_active, TRUE) = TRUE
+     ORDER BY user_id ASC
+     LIMIT 1`
+  );
+  const recruiterRow = await pool.query(
+    `SELECT user_id, employee_code, email_id, role_name, secondary_role
+     FROM user_mstr
+     WHERE role_name = 'Recruiter' AND COALESCE(is_active, TRUE) = TRUE
+     ORDER BY user_id ASC
+     LIMIT 1`
+  );
 
-  const recruiterToken = signToken({
-    user_id: 10,
-    employee_code: "IGS0506",
-    role_name: "Recruiter",
-    email_id: "recruiter@example.com"
-  });
+  if (!adminRow.rows[0] || !recruiterRow.rows[0]) {
+    fail("fixtures", "Admin and Recruiter users required for HTTP layer");
+    await pool.end();
+    return;
+  }
+
+  const adminToken = signToken(adminRow.rows[0]);
+  const recruiterToken = signToken(recruiterRow.rows[0]);
 
   await testHttpInspector(adminToken, sampleCode, "budget_submitted", 200, "Admin valid inspector");
   await testHttpInspector(null, sampleCode, "budget_submitted", 401, "Missing token");

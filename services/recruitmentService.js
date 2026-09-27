@@ -2421,18 +2421,16 @@ async function resolveRequisitionIdentifier(pool, reqIdOrCode) {
   return byLegacyId.rows[0] || null;
 }
 
+/**
+ * Requisition list for recruiter-assignment workspace and management UI.
+ * Only Approved, non-closed requisitions are selectable for assignment.
+ */
 async function listRequisitionsForManagement(pool) {
   const result = await pool.query(
     `SELECT * FROM rm_requisitions
-     WHERE req_status = ANY($1::text[])
+     WHERE req_status = $1
      ORDER BY COALESCE(req_id, 0) DESC, created_on DESC`,
-    [
-      [
-        REQUISITION_STATUS.APPROVED,
-        REQUISITION_STATUS.CLOSED_FILLED,
-        REQUISITION_STATUS.CLOSED_CANCELLED
-      ]
-    ]
+    [REQUISITION_STATUS.APPROVED]
   );
 
   const enriched = await enrichRequisitionsWithFulfillment(pool, result.rows);

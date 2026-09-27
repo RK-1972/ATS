@@ -49,9 +49,21 @@ function buildAdminReq() {
 function buildQueryPayload(definition) {
   const config = definition.definition;
 
+  if (config.result_mode === "aggregate") {
+    return {
+      dataset: definition.dataset_code,
+      dimensions: config.dimensions || [],
+      measures: config.measures || [],
+      filters: config.filters || [],
+      sort: config.sort || [],
+      page: 1,
+      pageSize: 25
+    };
+  }
+
   return {
     dataset: definition.dataset_code,
-    fields: config.fields,
+    fields: config.fields || [],
     filters: config.filters || [],
     sort: config.sort || [],
     groupBy: config.group_by || [],

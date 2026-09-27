@@ -174,14 +174,21 @@ async function resolveAdminUser() {
   return result.rows[0] || null;
 }
 
-async function resolveForeignPipelineCandidate() {
+async function resolveForeignPipelineCandidate(excludeEmployeeCodes = []) {
+  const exclude = (excludeEmployeeCodes || []).filter(Boolean);
   const result = await pool.query(
     `SELECT candidate_id, owner_employee_code
      FROM cand_mstr
      WHERE UPPER(COALESCE(candidate_container, 'PIPELINE')) = 'PIPELINE'
        AND COALESCE(owner_employee_code, '') <> ''
+       AND (
+         $1::text[] IS NULL
+         OR cardinality($1::text[]) = 0
+         OR NOT (owner_employee_code = ANY($1::text[]))
+       )
      ORDER BY candidate_id DESC
-     LIMIT 1`
+     LIMIT 1`,
+    [exclude]
   );
 
   return result.rows[0] || null;
@@ -287,7 +294,10 @@ async function main() {
   const recruiter = await resolveUnauthorizedRecruiter();
   const hiringManager = await resolveHiringManager();
   const admin = await resolveAdminUser();
-  const foreignCandidate = await resolveForeignPipelineCandidate();
+  const foreignCandidate = await resolveForeignPipelineCandidate([
+    taLead?.employee_code,
+    taLeader?.employee_code
+  ].filter(Boolean));
 
   await verifyServiceLayer(taLead, taLeader, recruiter, hiringManager, admin);
 

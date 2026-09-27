@@ -12,7 +12,20 @@ const interviewService = require("../services/interviewService");
 const recruitmentService = require("../services/recruitmentService");
 const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
 
-const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
+function resolveLocalApiBaseUrl() {
+  if (process.env.VERIFY_HTTP_API_BASE_URL) {
+    return String(process.env.VERIFY_HTTP_API_BASE_URL).replace(/\/$/, "");
+  }
+  for (const value of [process.env.BACKEND_API_URL, process.env.API_BASE_URL]) {
+    const url = String(value || "").trim();
+    if (url.includes(":5000")) {
+      return url.replace(/\/$/, "");
+    }
+  }
+  return "http://localhost:5000";
+}
+
+const API_BASE_URL = resolveLocalApiBaseUrl();
 const RUN_ID = Date.now();
 
 const pool = new Pool({
@@ -430,36 +443,26 @@ async function main() {
     ).rows[0]
     : null;
 
-  let authorizedMapping = await findAuthorizedMappingFixture(recruiter.employee_code);
-
-  if (!authorizedMapping?.map_id) {
-    try {
-      disposableFixture = await createDisposableAuthorizedFixture(recruiter, admin);
-      authorizedMapping = {
-        map_id: disposableFixture.map_id,
-        candidate_id: disposableFixture.candidateId,
-        requisition_code: disposableFixture.requisitionCode
-      };
-      console.log(
-        `Fixture: created disposable mapping map_id=${authorizedMapping.map_id}, `
-        + `requisition=${disposableFixture.requisitionCode}, recruiter=${recruiter.employee_code}`
-      );
-    } catch (error) {
-      fail("fixtures", `disposable authorized mapping — ${error.message}`);
-    }
-  } else {
+  let authorizedMapping = null;
+  try {
+    disposableFixture = await createDisposableAuthorizedFixture(recruiter, admin);
+    authorizedMapping = {
+      map_id: disposableFixture.map_id,
+      candidate_id: disposableFixture.candidateId,
+      requisition_code: disposableFixture.requisitionCode
+    };
     console.log(
-      `Fixture: existing mapping map_id=${authorizedMapping.map_id}, recruiter=${recruiter.employee_code}`
+      `Fixture: disposable mapping map_id=${authorizedMapping.map_id}, `
+      + `requisition=${disposableFixture.requisitionCode}, recruiter=${recruiter.employee_code}`
     );
+  } catch (error) {
+    fail("fixtures", `disposable authorized mapping — ${error.message}`);
+    return;
   }
 
   let foreignMapping = null;
   if (otherRecruiter) {
-    if (disposableFixture?.map_id) {
-      foreignMapping = { map_id: disposableFixture.map_id };
-    } else {
-      foreignMapping = await findForeignMappingFixture(otherRecruiter.employee_code);
-    }
+    foreignMapping = { map_id: disposableFixture.map_id };
   }
 
   const schedulePanel = await resolvePanelMember();
@@ -708,6 +711,169 @@ async function main() {
     }
   } else {
     skip("S4 unrelated schedule", "no foreign mapping fixture");
+  }
+
+  console.log("\n--- S7 GET /api/v1/interviews/:id caller scope ---");
+
+  const authorizedInterviewId =
+    disposableFixture?.scheduledInterviewId
+    || disposableFixture?.httpScheduledInterviewId
+    || recruiterBundle.interviews[0]?.interviewId
+    || adminBundle.interviews[0]?.interviewId;
+
+  const crossTenantInterviewId = disposableFixture?.scheduledInterviewId || null;
+
+  if (!authorizedInterviewId) {
+    skip("S7 GET interview by id", "no interview id fixture");
+  } else {
+    const unauthGet = await fetchJson(
+      `/api/v1/interviews/${encodeURIComponent(authorizedInterviewId)}`,
+      null
+    );
+    if (unauthGet.status === 401) {
+      pass("S7 HTTP: unauthenticated GET interview blocked (401)");
+    } else {
+      fail("S7 HTTP: unauthenticated GET interview", `status=${unauthGet.status}`);
+    }
+
+    try {
+      await interviewService.getInterviewForRequest(pool, authorizedInterviewId, {
+        user: admin
+      });
+      pass("S7 service: admin can read interview by id");
+    } catch (error) {
+      fail("S7 service: admin read interview by id", error.message);
+    }
+
+    const httpAdminGet = await fetchJson(
+      `/api/v1/interviews/${encodeURIComponent(authorizedInterviewId)}`,
+      adminToken
+    );
+    if (httpAdminGet.status === 200 && httpAdminGet.body?.success) {
+      pass("S7 HTTP: admin GET interview by id (200)");
+    } else {
+      fail("S7 HTTP: admin GET interview by id", `status=${httpAdminGet.status}`);
+    }
+
+    if (disposableFixture?.scheduledInterviewId) {
+      const httpRecruiterGet = await fetchJson(
+        `/api/v1/interviews/${encodeURIComponent(disposableFixture.scheduledInterviewId)}`,
+        recruiterToken
+      );
+      if (httpRecruiterGet.status === 200 && httpRecruiterGet.body?.success) {
+        pass("S7 HTTP: authorized recruiter GET interview by id (200)");
+      } else {
+        fail("S7 HTTP: authorized recruiter GET interview by id", `status=${httpRecruiterGet.status}`);
+      }
+    } else {
+      skip("S7 authorized recruiter GET", "no disposable scheduled interview");
+    }
+
+    if (crossTenantInterviewId && otherRecruiter) {
+      try {
+        await interviewService.getInterviewForRequest(pool, crossTenantInterviewId, {
+          user: otherRecruiter
+        });
+        fail("S7 service: unrelated recruiter GET interview by id", "expected throw");
+      } catch (error) {
+        if (error.status === 403) {
+          pass("S7 service: unrelated recruiter GET interview blocked (403)");
+        } else {
+          fail("S7 service: unrelated recruiter GET interview by id", `status=${error.status}`);
+        }
+      }
+    } else {
+      skip("S7 service unrelated recruiter GET", "no disposable interview fixture");
+    }
+
+    if (crossTenantInterviewId && otherRecruiterToken) {
+      const httpForeignGet = await fetchJson(
+        `/api/v1/interviews/${encodeURIComponent(crossTenantInterviewId)}`,
+        otherRecruiterToken
+      );
+      if (httpForeignGet.status === 403) {
+        pass("S7 HTTP: unrelated recruiter GET interview blocked (403)");
+      } else {
+        fail(
+          "S7 HTTP: unrelated recruiter GET interview",
+          `status=${httpForeignGet.status} (restart backend if 200 with old handler)`
+        );
+      }
+    } else {
+      skip("S7 HTTP unrelated recruiter GET", "no disposable interview fixture");
+    }
+
+    if (panelFixture && panelToken) {
+      const panelInterviewRow = (
+        await pool.query(
+          `SELECT interview_id
+           FROM im_interviews
+           WHERE schedule_id = $1
+           LIMIT 1`,
+          [panelFixture.schedule_id]
+        )
+      ).rows[0];
+
+      const panelInterviewId = panelInterviewRow?.interview_id;
+      if (panelInterviewId) {
+        const httpPanelGet = await fetchJson(
+          `/api/v1/interviews/${encodeURIComponent(panelInterviewId)}`,
+          panelToken
+        );
+        if (httpPanelGet.status === 200 && httpPanelGet.body?.success) {
+          pass("S7 HTTP: assigned panel member GET interview by id (200)");
+        } else {
+          fail("S7 HTTP: panel GET interview by id", `status=${httpPanelGet.status}`);
+        }
+      } else {
+        skip("S7 panel GET interview by id", "no enterprise interview row for panel schedule");
+      }
+    } else {
+      skip("S7 panel GET interview by id", "no panel fixture");
+    }
+  }
+
+  console.log("\n--- S8 interview mutation caller scope ---");
+
+  if (crossTenantInterviewId && otherRecruiter) {
+    try {
+      await interviewService.completeInterview(
+        pool,
+        crossTenantInterviewId,
+        { user: otherRecruiter },
+        "cross-tenant probe"
+      );
+      fail("S8 service: unrelated recruiter complete interview", "expected throw");
+    } catch (error) {
+      if (error.status === 403) {
+        pass("S8 service: unrelated recruiter complete interview blocked (403)");
+      } else {
+        fail("S8 service: unrelated recruiter complete interview", `status=${error.status}`);
+      }
+    }
+  } else {
+    skip("S8 service unrelated complete", "no disposable interview fixture");
+  }
+
+  if (crossTenantInterviewId && otherRecruiterToken) {
+    const httpCompleteDenied = await fetchJson(
+      `/api/v1/interviews/${encodeURIComponent(crossTenantInterviewId)}/complete`,
+      otherRecruiterToken,
+      {
+        method: "POST",
+        body: JSON.stringify({ comment: "cross-tenant probe" })
+      }
+    );
+    if (httpCompleteDenied.status === 403) {
+      pass("S8 HTTP: unrelated recruiter complete interview blocked (403)");
+    } else {
+      fail(
+        "S8 HTTP: unrelated recruiter complete interview",
+        `status=${httpCompleteDenied.status}`
+      );
+    }
+  } else {
+    skip("S8 HTTP unrelated complete", "no disposable interview fixture");
   }
 
   console.log("\n--- S6 interview panel mutations ---");

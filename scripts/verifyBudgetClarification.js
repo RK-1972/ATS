@@ -6,6 +6,9 @@ require("dotenv").config();
 const { Pool } = require("pg");
 const workforcePlanningService = require("../services/workforcePlanningService");
 const workflowService = require("../services/workflowService");
+const {
+  buildBudgetRequestCriteriaFromLiveConfig
+} = require("./lib/budgetVerificationCriteria");
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -135,34 +138,10 @@ async function ensureTwoStepRoute(client) {
   };
 }
 
-async function buildCriteria(client, routeId) {
-  const policy = await client.query(
-    `SELECT department, designation, grade, min_amount
-     FROM approval_route_policy
-     WHERE route_id = $1 AND is_active = TRUE
-     ORDER BY policy_id LIMIT 1`,
-    [routeId]
-  );
-  const dept = await client.query(
-    `SELECT name FROM md_records WHERE entity_type='departments' AND is_deleted=FALSE ORDER BY id LIMIT 1`
-  );
-  const desig = await client.query(
-    `SELECT name FROM md_records WHERE entity_type='designations' AND is_deleted=FALSE ORDER BY id LIMIT 1`
-  );
-  const grade = await client.query(
-    `SELECT COALESCE(code,name) AS v FROM md_records WHERE entity_type='grades' AND is_deleted=FALSE ORDER BY id LIMIT 1`
-  );
-
-  return {
-    department: policy.rows[0]?.department || dept.rows[0].name,
-    position: policy.rows[0]?.designation || desig.rows[0].name,
-    grade: policy.rows[0]?.grade || grade.rows[0].v,
-    proposed_budget:
-      policy.rows[0]?.min_amount != null ? Number(policy.rows[0].min_amount) : 500000,
-    headcount: 1,
-    justification: "Budget clarification verification.",
-    priority: "Medium"
-  };
+async function buildCriteria() {
+  return buildBudgetRequestCriteriaFromLiveConfig(pool, {
+    justification: "Budget clarification verification."
+  });
 }
 
 async function createSubmittedBudget(pool, client, criteria, requestorReq) {
@@ -207,7 +186,7 @@ async function main() {
        WHERE LOWER(TRIM(role_name))='admin' AND is_active=TRUE ORDER BY user_id LIMIT 1`
     );
     const requestorReq = mockReq(admin.rows[0].employee_code, admin.rows[0].role_name);
-    const criteria = await buildCriteria(client, route.rows[0].route_id);
+    const criteria = await buildCriteria();
 
     // --- Scenario A: L1 clarify → initiator → L1 again ---
     const budgetA = await createSubmittedBudget(pool, client, {

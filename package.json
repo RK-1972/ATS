@@ -32,6 +32,8 @@
     "verify:candidate-portal-profile": "node scripts/verifyCandidatePortalProfile.js",
     "verify:candidate-portal-profile-http": "node scripts/verifyCandidatePortalProfileHttp.js",
     "verify:candidate-portal-recruiter": "node scripts/verifyCandidatePortalRecruiterFlow.js",
+    "verify:portal-review-queue-auth": "node scripts/verifyPortalReviewQueueAuthorization.js",
+    "hygiene:unpublish-portal-qa": "node scripts/unpublishPortalQaRequisitions.js",
     "verify:phase6b1-candidate-open-requisitions": "node scripts/verifyPhase6b1CandidatePortalOpenRequisitions.js",
     "verify:phase6b2-candidate-portal-apply": "node scripts/verifyPhase6b2CandidatePortalApply.js",
     "verify:phase6b3-candidate-portal-applications": "node scripts/verifyPhase6b3CandidatePortalApplications.js",
@@ -50,6 +52,8 @@
     "verify:child-profile-write-auth": "node scripts/verifyChildProfileWriteAuth.js",
     "verify:mapping-context-resolution": "node scripts/verifyMappingContextResolution.js",
     "verify:candidate-pool-segregation": "node scripts/verifyCandidatePoolSegregation.js",
+    "verify:wave5-offers": "node scripts/verifyWave5OffersExecution.js",
+    "regression:wave5": "node scripts/runWave5Regression.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

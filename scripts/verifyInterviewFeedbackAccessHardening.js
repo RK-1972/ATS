@@ -3,6 +3,7 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const interviewService = require("../services/interviewService");
+const { resolveTaLeadOperatorUser } = require("./lib/resolveTaLeadOperatorUser");
 
 const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
 
@@ -111,7 +112,7 @@ async function main() {
   const recruiter = await resolveUserByRole("Recruiter");
   const hiringManager = await resolveUserByRole("Hiring Manager");
   const interviewer = await resolveUserByRole("Interviewer");
-  const taLead = await resolveUserByRole("TA Lead");
+  const taLead = await resolveTaLeadOperatorUser(pool, { requireNonPanelMember: true });
 
   if (!admin || !recruiter) {
     fail("fixtures", "Admin and Recruiter users required");
@@ -123,6 +124,10 @@ async function main() {
   const nonPanelFixture = panelFixture
     ? await findNonPanelScheduleFixture(panelFixture.panel_employee_code)
     : null;
+
+  if (taLead) {
+    console.log(`Fixture TA Lead operator: ${taLead.email_id} (${taLead.role_name})`);
+  }
 
   if (!panelFixture) {
     console.log("SKIP: no interview schedule with active panel membership fixture");

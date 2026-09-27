@@ -244,6 +244,14 @@
       "max_tokens": 2000
     },
     {
+      "key": "ai_candidate_review",
+      "title": "AI Candidate Review",
+      "description": "Advisory candidate vs requisition review with evidence",
+      "enabled": false,
+      "confidence_min": 0.7,
+      "max_tokens": 2500
+    },
+    {
       "key": "candidate_ranking",
       "title": "Candidate Ranking",
       "description": "Per-requisition ranked lists",

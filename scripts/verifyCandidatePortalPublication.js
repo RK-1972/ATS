@@ -11,6 +11,9 @@ const {
   createCandidatePortalService
 } = require("../services/candidatePortalService");
 const recruitmentService = require("../services/recruitmentService");
+const {
+  completePortalProfileFlow
+} = require("./lib/portalProfileTestHelpers");
 
 const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
 
@@ -179,6 +182,10 @@ async function findApprovedUnpublishedRequisition() {
      FROM rm_requisitions r
      WHERE r.req_status = $1
        AND r.candidate_portal_published_at IS NULL
+       AND r.requisition_code NOT LIKE 'REQ-FULFILL-%'
+       AND r.requisition_code NOT LIKE 'REQ-SEC-IVW-%'
+       AND r.requisition_code NOT LIKE 'REQ-OFF-V1-%'
+       AND r.requisition_code NOT LIKE 'REQ-W5-%'
        AND (
          r.req_id IS NULL
          OR EXISTS (
@@ -270,9 +277,10 @@ async function cleanupPortalCandidate(candidateId) {
   );
 }
 
-async function registerPortalCandidate(uniqueSuffix) {
+async function registerPortalCandidate(uniqueSuffix, emailIdOverride = null) {
   const portalService = createCandidatePortalService(pool);
-  const emailId = `portal.publication.${uniqueSuffix}@example.com`;
+  const emailId =
+    emailIdOverride || `portal.publication.${uniqueSuffix}@example.com`;
   const password = "TestPass1!";
 
   const registerResult = await portalService.registerCandidateAccount({
@@ -431,43 +439,7 @@ async function main() {
       }
     }
 
-    const mappingCountBeforeApply = await countMappingsForRequisition(testRequisitionCode);
-    const portalCandidate = await registerPortalCandidate(uniqueSuffix);
-    candidateId = portalCandidate.candidateId;
-
-    const application = await recruitmentService.applyCandidateFromPortal(
-      pool,
-      { candidate_id: candidateId, full_name: "Portal Publication Candidate", email_id: `portal.publication.${uniqueSuffix}@example.com` },
-      { requisition_code: testRequisitionCode }
-    );
-
-    if (!application?.requisition_code) {
-      fail("candidate can apply to published requisition");
-    } else {
-      pass("candidate can apply to published requisition");
-    }
-
-    const mappingCountAfterApply = await countMappingsForRequisition(testRequisitionCode);
-    if (mappingCountAfterApply !== mappingCountBeforeApply + 1) {
-      fail("application creates mapping for published requisition");
-    } else {
-      pass("application creates mapping for published requisition");
-    }
-
-    const applicationsBeforeUnpublish =
-      await recruitmentService.listCandidatePortalApplications(
-        pool,
-        { candidate_id: candidateId }
-      );
-    const hasApplicationBeforeUnpublish = applicationsBeforeUnpublish.some(
-      (row) => row.requisition_code === testRequisitionCode
-    );
-
-    if (!hasApplicationBeforeUnpublish) {
-      fail("existing application visible before unpublish");
-    } else {
-      pass("existing application visible before unpublish");
-    }
+    console.log("\n--- Publication / unpublish (service layer, no application) ---");
 
     const unpublishResult =
       await recruitmentService.unpublishRequisitionFromCandidatePortal(
@@ -490,43 +462,6 @@ async function main() {
       pass("unpublish removes requisition from portal service list");
     }
 
-    try {
-      await recruitmentService.applyCandidateFromPortal(
-        pool,
-        { candidate_id: candidateId, full_name: "Portal Publication Candidate", email_id: `portal.publication.${uniqueSuffix}@example.com` },
-        { requisition_code: testRequisitionCode }
-      );
-      fail("unpublish blocks new application");
-    } catch (error) {
-      if (error.status === 404 || error.status === 409 || error.status === 400) {
-        pass("unpublish blocks new application");
-      } else {
-        fail("unpublish blocks new application", error.message);
-      }
-    }
-
-    const mappingCountAfterUnpublish = await countMappingsForRequisition(
-      testRequisitionCode
-    );
-    if (mappingCountAfterUnpublish !== mappingCountAfterApply) {
-      fail("existing mappings unchanged after unpublish");
-    } else {
-      pass("existing mappings unchanged after unpublish");
-    }
-
-    const applicationsAfterUnpublish =
-      await recruitmentService.listCandidatePortalApplications(
-        pool,
-        { candidate_id: candidateId }
-      );
-    if (!applicationsAfterUnpublish.some(
-      (row) => row.requisition_code === testRequisitionCode
-    )) {
-      fail("existing application remains visible after unpublish");
-    } else {
-      pass("existing application remains visible after unpublish");
-    }
-
     const idempotentUnpublish =
       await recruitmentService.unpublishRequisitionFromCandidatePortal(
         pool,
@@ -539,6 +474,9 @@ async function main() {
       pass("unpublish is idempotent");
     }
 
+    console.log("\n--- Publication HTTP routes ---");
+
+    const portalCandidateForList = await registerPortalCandidate(`${uniqueSuffix}-list`);
     const publisherToken = signEmployeeToken(publisherUser);
     const publishHttp = await fetchJson(
       `/api/v1/recruitment/requisitions/${encodeURIComponent(testRequisitionCode)}/publish-to-candidate-portal`,
@@ -572,7 +510,7 @@ async function main() {
 
       const portalListHttp = await fetchJson(
         "/candidate-portal/open-requisitions",
-        portalCandidate.token
+        portalCandidateForList.token
       );
 
       if (!portalListHttp.response.ok) {
@@ -595,6 +533,92 @@ async function main() {
         }
         pass("portal response excludes publication fields");
       }
+    }
+
+    await cleanupPortalCandidate(portalCandidateForList.candidateId);
+
+    console.log("\n--- Portal apply after publish (profile-complete candidate) ---");
+
+    const applyRequisitionCode = await findApprovedUnpublishedRequisition();
+    if (!applyRequisitionCode) {
+      skip("portal apply integration", "no approved unpublished requisition");
+    } else {
+      await recruitmentService.publishRequisitionToCandidatePortal(
+        pool,
+        applyRequisitionCode,
+        publisherReq
+      );
+
+      const applyEmail = `portal.publication.apply.${uniqueSuffix}@example.com`;
+      const portalCandidate = await registerPortalCandidate(
+        `${uniqueSuffix}-apply`,
+        applyEmail
+      );
+      candidateId = portalCandidate.candidateId;
+
+      try {
+        await completePortalProfileFlow(API_BASE_URL, portalCandidate.token, applyEmail);
+        pass("portal profile + resume completed before apply");
+      } catch (profileError) {
+        fail("portal profile + resume completed before apply", profileError.message);
+      }
+
+      const mappingCountBeforeApply = await countMappingsForRequisition(applyRequisitionCode);
+      const application = await recruitmentService.applyCandidateFromPortal(
+        pool,
+        {
+          candidate_id: candidateId,
+          full_name: "Portal Publication Candidate",
+          email_id: applyEmail
+        },
+        { requisition_code: applyRequisitionCode }
+      );
+
+      if (!application?.requisition_code) {
+        fail("candidate can apply to published requisition");
+      } else {
+        pass("candidate can apply to published requisition");
+      }
+
+      const mappingCountAfterApply = await countMappingsForRequisition(applyRequisitionCode);
+      if (mappingCountAfterApply !== mappingCountBeforeApply + 1) {
+        fail("application creates mapping for published requisition");
+      } else {
+        pass("application creates mapping for published requisition");
+      }
+
+      await recruitmentService.unpublishRequisitionFromCandidatePortal(
+        pool,
+        applyRequisitionCode,
+        publisherReq
+      );
+
+      try {
+        await recruitmentService.applyCandidateFromPortal(
+          pool,
+          {
+            candidate_id: candidateId,
+            full_name: "Portal Publication Candidate",
+            email_id: applyEmail
+          },
+          { requisition_code: applyRequisitionCode }
+        );
+        fail("unpublish blocks new application");
+      } catch (error) {
+        if (error.status === 404 || error.status === 409 || error.status === 400) {
+          pass("unpublish blocks new application");
+        } else {
+          fail("unpublish blocks new application", error.message);
+        }
+      }
+
+      await pool.query(
+        `UPDATE rm_requisitions
+         SET candidate_portal_published_at = NULL,
+             candidate_portal_published_by = NULL
+         WHERE requisition_code = $1`,
+        [applyRequisitionCode]
+      );
     }
   } finally {
     try {

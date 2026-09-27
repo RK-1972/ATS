@@ -3,6 +3,7 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const candidateAccessService = require("../services/candidateAccessService");
+const { resolveTaLeadOperatorUser } = require("./lib/resolveTaLeadOperatorUser");
 
 const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
 
@@ -87,7 +88,9 @@ async function main() {
   const recruiter = await resolveUserByRole("Recruiter");
   const hiringManager = await resolveUserByRole("Hiring Manager");
   const interviewer = await resolveUserByRole("Interviewer");
-  const taLead = await resolveUserByRole("TA Lead");
+  const taLead =
+    (await resolveTaLeadOperatorUser(pool, { requireNonPanelMember: true }))
+    || (await resolveTaLeadOperatorUser(pool));
 
   if (!admin || !recruiter) {
     fail("fixtures", "Admin and Recruiter users required");
@@ -212,11 +215,37 @@ async function main() {
 
   const myList = await fetchJson("/my-candidates-list", tokens.recruiter);
   const availList = await fetchJson("/available-candidates", tokens.recruiter);
+  const poolView = await fetchJson(
+    "/api/v1/recruitment/candidates?view=pool",
+    tokens.recruiter
+  );
+  const pipelineView = await fetchJson(
+    "/api/v1/recruitment/candidates?view=pipeline",
+    tokens.recruiter
+  );
 
-  if (myList.status === 200 && availList.status === 200) {
-    pass("Scoped list endpoints still respond for recruiter");
+  if (myList.status === 410 && myList.body?.deprecated) {
+    pass("Classic GET /my-candidates-list retired (410)");
   } else {
-    fail("Scoped list endpoints", `my=${myList.status} avail=${availList.status}`);
+    fail("Classic GET /my-candidates-list retirement", `status=${myList.status}`);
+  }
+
+  if (availList.status === 200) {
+    pass("Legacy talent pool GET /available-candidates still responds (200)");
+  } else {
+    fail("Legacy talent pool GET /available-candidates", `status=${availList.status}`);
+  }
+
+  if (poolView.status === 200 && poolView.body?.success) {
+    pass("Enterprise replacement GET candidates?view=pool (200)");
+  } else {
+    fail("Enterprise replacement pool view", `status=${poolView.status}`);
+  }
+
+  if (pipelineView.status === 200 && pipelineView.body?.success) {
+    pass("Enterprise replacement GET candidates?view=pipeline (200)");
+  } else {
+    fail("Enterprise replacement pipeline view", `status=${pipelineView.status}`);
   }
 
   console.log("\n--- P1-2 GET /candidate/:id ---");

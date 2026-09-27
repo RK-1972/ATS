@@ -12,6 +12,22 @@ const {
 const recruitmentService = require("../services/recruitmentService");
 const candidatePortalNotificationService = require("../services/candidatePortalNotificationService");
 const { DELIVERY_STATUS } = require("../repositories/notificationDeliveryRepository");
+const { completePortalProfileFlow } = require("./lib/portalProfileTestHelpers");
+
+function resolveBackendApiBaseUrl() {
+  if (process.env.BACKEND_API_URL) {
+    return String(process.env.BACKEND_API_URL).replace(/\/$/, "");
+  }
+
+  const configured = String(process.env.API_BASE_URL || "").trim();
+  if (configured.includes(":5000")) {
+    return configured.replace(/\/$/, "");
+  }
+
+  return "http://localhost:5000";
+}
+
+const API_BASE_URL = resolveBackendApiBaseUrl();
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -195,6 +211,29 @@ async function main() {
     );
     candidateId = registration.candidateId;
     const candidateContext = registration.candidateContext;
+
+    const portalService = createCandidatePortalService(pool);
+    const loginResult = await portalService.loginCandidateAccount({
+      email_id: emailId,
+      password: "TestPass1!"
+    });
+
+    if (!loginResult.ok || !loginResult.data?.token) {
+      fail("portal login for profile completion", loginResult.message || "no token");
+      return;
+    }
+
+    try {
+      await completePortalProfileFlow(
+        API_BASE_URL,
+        loginResult.data.token,
+        emailId
+      );
+      pass("complete portal profile flow before apply");
+    } catch (profileError) {
+      fail("complete portal profile flow before apply", profileError.message);
+      return;
+    }
 
     requisitionCode = await findOpenRequisitionWithoutActiveMapping(candidateId);
 

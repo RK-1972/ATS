@@ -1032,7 +1032,7 @@ async function releaseOffer(pool, offerId, payload, req) {
   const user = userContext(req);
   const offer = await getOffer(pool, offerId, req);
 
-  if (!["Approved", "Pending Approval"].includes(offer.offerStatus)) {
+  if (offer.offerStatus !== "Approved") {
     throw httpError("Offer must be approved before release.", 400);
   }
 
@@ -1215,6 +1215,10 @@ async function rejectOffer(pool, offerId, reason, req) {
   const user = userContext(req);
   const offer = await getOffer(pool, offerId, req);
 
+  if (offer.offerStatus !== "Released") {
+    throw httpError("Only released offers can be declined.", 400);
+  }
+
   await pool.query(
     `UPDATE om_offers SET offer_status = 'Declined', modified_by = $1, modified_on = NOW()
      WHERE offer_id = $2`,
@@ -1259,6 +1263,11 @@ async function rejectOffer(pool, offerId, reason, req) {
 async function withdrawOffer(pool, offerId, reason, req) {
   const user = userContext(req);
   const offer = await getOffer(pool, offerId, req);
+
+  const terminalStatuses = new Set(["Accepted", "Declined", "Withdrawn"]);
+  if (terminalStatuses.has(offer.offerStatus)) {
+    throw httpError(`Offer cannot be withdrawn from status: ${offer.offerStatus}.`, 400);
+  }
 
   await pool.query(
     `UPDATE om_offers SET offer_status = 'Withdrawn', modified_by = $1, modified_on = NOW()
@@ -1427,6 +1436,8 @@ module.exports = {
   getDefaultSeedPayload,
   getOfferBundle,
   getOffer,
+  listScopedOfferRows,
+  assertOfferReadAccess,
   createOffer,
   submitOffer,
   approveOffer,

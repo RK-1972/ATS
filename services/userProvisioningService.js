@@ -1152,7 +1152,12 @@ module.exports = {
 
   normalizeWorkAssignmentIds,
 
-  normalizeRoleName
+  normalizeRoleName,
+
+  /** Used by governance verification scripts (transaction-isolated last-Admin checks). */
+  assertLastActiveAdminOnDeactivate,
+
+  assertLastAdminProtection
 
 };
 

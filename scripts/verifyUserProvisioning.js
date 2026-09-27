@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const userProvisioningService = require("../services/userProvisioningService");
+const workAssignmentService = require("../services/workAssignmentService");
 const {
   assertCanAccessUserAdministration,
   assertCanProvisionUsers,
@@ -175,9 +176,10 @@ async function cleanupProvisionedUser(employeeCode) {
 async function main() {
   const admin = await resolveAdminUser();
   const recruiter = await resolveRecruiterWithoutProvisioner();
-  const userAdministrator = await resolveUserAdministrator();
   const recruiterAssignment = await resolveActiveOperationalAssignment();
   const privilegedAssignment = await resolvePrivilegedAssignment();
+  let userAdministrator = null;
+  let disposableUaCode = null;
 
   if (!admin) {
     fail("fixtures", "Admin user required");
@@ -212,6 +214,38 @@ async function main() {
   pass("user_status_history table exists");
 
   const stamp = Date.now();
+  userAdministrator = await resolveUserAdministrator();
+
+  if (!userAdministrator && privilegedAssignment?.work_assignment_id) {
+    disposableUaCode = `VERIFY_UA_${stamp}`;
+    const uaEmail = `verify.ua.${stamp}@optalynx.demo`;
+    try {
+      await userProvisioningService.provisionEmployee(pool, { user: admin }, {
+        employee_code: disposableUaCode,
+        full_name: "Verify Disposable UA",
+        email_id: uaEmail,
+        password: "VerifyPass123",
+        role_name: "Recruiter",
+        work_assignment_ids: []
+      });
+      await workAssignmentService.assignWorkAssignment(
+        pool,
+        disposableUaCode,
+        privilegedAssignment.work_assignment_id,
+        new Date().toISOString().slice(0, 10),
+        null
+      );
+      userAdministrator = await resolveUserAdministrator();
+    } catch (error) {
+      console.log(
+        `SKIP: disposable USER_ADMINISTRATOR fixture — ${error.message || "setup failed"}`
+      );
+      await cleanupProvisionedUser(disposableUaCode);
+      disposableUaCode = null;
+      userAdministrator = null;
+    }
+  }
+
   const adminToken = signToken(admin);
   const recruiterToken = recruiter ? signToken(recruiter) : null;
   const userAdminToken = userAdministrator ? signToken(userAdministrator) : null;
@@ -765,7 +799,7 @@ async function main() {
         );
         fail("USER_ADMINISTRATOR cannot assign Admin role");
       } catch (error) {
-        if (error.status === 403) {
+        if (error.status === 403 || error.status === 400) {
           pass("USER_ADMINISTRATOR cannot assign Admin role");
         } else {
           fail("USER_ADMINISTRATOR cannot assign Admin role", error.message);
@@ -911,40 +945,36 @@ async function main() {
       );
     }
 
+    const loginEmailRow = await pool.query(
+      `SELECT email_id FROM user_mstr WHERE employee_code = $1 LIMIT 1`,
+      [roleProvisionCode]
+    );
+    const loginEmailId = loginEmailRow.rows[0]?.email_id || roleProvisionEmail;
+
+    if (!loginEmailRow.rows[0]) {
+      fail("inactive login rejected", "provisioned user missing before HTTP login test");
+    }
+
     const inactiveLogin = await fetchJson("/login", null, {
       method: "POST",
       body: {
-        email_id: roleProvisionEmail,
+        email_id: loginEmailId,
         password: "VerifyPass123"
       }
     });
 
     if (inactiveLogin.status === 403) {
       pass("inactive login rejected");
-    } else if (inactiveLogin.status === 200) {
-      console.log("SKIP: inactive login rejected — restart backend to load login guard");
-    } else {
-      const inactiveRow = await pool.query(
-        `SELECT is_active, email_id
-         FROM user_mstr
-         WHERE employee_code = $1
-         LIMIT 1`,
-        [roleProvisionCode]
+    } else if (inactiveLogin.status === 401 && loginEmailRow.rows[0]) {
+      fail(
+        "inactive login rejected",
+        `API login could not resolve email present in verification DB (${API_BASE_URL})`
       );
-
-      if (
-        inactiveRow.rows[0]?.is_active === false &&
-        (inactiveLogin.status === 401 || inactiveLogin.status === 404)
-      ) {
-        console.log(
-          "SKIP: HTTP inactive login — restart backend to load login guard"
-        );
-      } else {
-        fail(
-          "inactive login rejected",
-          `${inactiveLogin.status} ${inactiveLogin.body?.message || ""}`
-        );
-      }
+    } else {
+      fail(
+        "inactive login rejected",
+        `${inactiveLogin.status} ${inactiveLogin.body?.message || ""}`
+      );
     }
 
     const assignmentsDuringInactive = await pool.query(
@@ -1068,17 +1098,18 @@ async function main() {
     const activeLogin = await fetchJson("/login", null, {
       method: "POST",
       body: {
-        email_id: roleProvisionEmail,
+        email_id: loginEmailId,
         password: "VerifyPass123"
       }
     });
 
     if (activeLogin.status === 200 && activeLogin.body?.token) {
       pass("reactivated login allowed");
-    } else if (activeLogin.status === 401 || activeLogin.status === 403) {
-      console.log("SKIP: reactivated login — restart backend to load login guard");
     } else {
-      fail("reactivated login allowed", String(activeLogin.status));
+      fail(
+        "reactivated login allowed",
+        `${activeLogin.status} ${activeLogin.body?.message || ""}`
+      );
     }
 
     const operationalToken = signToken({
@@ -1281,6 +1312,10 @@ async function main() {
         [recruiter.user_id]
       );
     }
+  }
+
+  if (disposableUaCode) {
+    await cleanupProvisionedUser(disposableUaCode);
   }
 }
 

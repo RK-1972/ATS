@@ -37,7 +37,11 @@ function registerInterviewRoutes(app, pool, verifyToken) {
 
   app.get("/api/v1/interviews/:id", verifyToken, async (req, res) => {
     try {
-      const interview = await interviewService.getInterview(pool, req.params.id);
+      const interview = await interviewService.getInterviewForRequest(
+        pool,
+        req.params.id,
+        req
+      );
       res.json({ success: true, data: interview });
     } catch (error) {
       handleError(res, error);

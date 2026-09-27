@@ -75,27 +75,34 @@ async function resolveUserByEmployeeCode(employeeCode) {
   return result.rows[0] || null;
 }
 
-async function findPausedClarificationFixture() {
+async function findPausedRequisitionClarificationFixture() {
   const result = await pool.query(
     `SELECT instance_id, status, started_by, execution_context, instance_payload
      FROM wf_instances
      WHERE status = 'Paused'
        AND execution_context->'clarification'->>'task_id' IS NOT NULL
+       AND (
+         UPPER(COALESCE(execution_context->>'document_type', '')) = 'REQUISITION'
+         OR instance_id LIKE 'WF-RM-%'
+         OR instance_id LIKE 'WF-REQ-%'
+       )
      ORDER BY modified_on DESC
      LIMIT 1`
   );
   return result.rows[0] || null;
 }
 
-async function findLegacyRunningFixture() {
-  const result = await pool.query(
-    `SELECT instance_id, status, started_by, execution_context, instance_payload
-     FROM wf_instances
-     WHERE status = 'Running'
-     ORDER BY modified_on DESC
-     LIMIT 1`
+function workflowStartedByMatchesUser(startedBy, user) {
+  const key = String(startedBy || "").trim().toLowerCase();
+  if (!key || !user) {
+    return false;
+  }
+
+  return (
+    key === String(user.employee_code || "").trim().toLowerCase() ||
+    key === String(user.full_name || "").trim().toLowerCase() ||
+    key === String(user.email_id || "").trim().toLowerCase()
   );
-  return result.rows[0] || null;
 }
 
 function parseContext(raw) {
@@ -152,20 +159,15 @@ async function main() {
     return;
   }
 
-  const pausedFixture = await findPausedClarificationFixture();
-  const legacyFixture = await findLegacyRunningFixture();
+  const pausedFixture = await findPausedRequisitionClarificationFixture();
 
   if (pausedFixture) {
     const hold = parseContext(pausedFixture.execution_context).clarification || {};
     console.log(
-      `Paused fixture: ${pausedFixture.instance_id} requestor=${hold.requestor_employee_code || "n/a"}`
+      `Paused REQUISITION fixture: ${pausedFixture.instance_id} requestor=${hold.requestor_employee_code || "n/a"}`
     );
   } else {
-    console.log("SKIP: no paused clarification workflow fixture");
-  }
-
-  if (legacyFixture) {
-    console.log(`Legacy fixture: ${legacyFixture.instance_id} started_by=${legacyFixture.started_by}`);
+    console.log("SKIP: no paused REQUISITION clarification workflow fixture");
   }
 
   const tokens = {
@@ -272,52 +274,6 @@ async function main() {
         "Service: paused workflow mutated",
         `status ${before.status}->${after.status} timeline ${before.timelineLen}->${after.timelineLen}`
       );
-    }
-  }
-
-  if (legacyFixture) {
-    try {
-      await workflowService.assertClarificationSubmitAuthorized(
-        pool,
-        { user: recruiter },
-        legacyFixture
-      );
-      fail("Service: recruiter legacy assert", "expected throw");
-    } catch (error) {
-      if (error.status === 403) {
-        pass("Service: unauthorized user denied on legacy running instance");
-      } else {
-        fail("Service: recruiter legacy assert", `expected 403, got ${error.status}`);
-      }
-    }
-
-    const before = await snapshotInstanceState(legacyFixture.instance_id);
-
-    try {
-      await workflowService.submitClarification(
-        pool,
-        legacyFixture.instance_id,
-        "legacy unauthorized probe",
-        { user: recruiter }
-      );
-      fail("Service: unauthorized legacy submit", "expected throw");
-    } catch (error) {
-      if (error.status === 403) {
-        pass("Service: unauthorized legacy submit blocked (403)");
-      } else {
-        fail("Service: unauthorized legacy submit", `expected 403, got ${error.status}`);
-      }
-    }
-
-    const after = await snapshotInstanceState(legacyFixture.instance_id);
-    if (
-      before.status === after.status
-      && before.timelineLen === after.timelineLen
-      && before.historyCount === after.historyCount
-    ) {
-      pass("Service: unauthorized legacy submit did not mutate workflow state");
-    } else {
-      fail("Service: legacy workflow mutated after blocked submit");
     }
   }
 

@@ -49,6 +49,14 @@ async function fetchList(path, token) {
   return body.data || [];
 }
 
+async function fetchPipelineList(token) {
+  return fetchList("/api/v1/recruitment/candidates?view=pipeline", token);
+}
+
+async function fetchTalentPoolList(token) {
+  return fetchList("/api/v1/recruitment/candidates?view=pool", token);
+}
+
 function includesCandidate(rows, candidateId) {
   return rows.some((row) => Number(row.candidate_id) === Number(candidateId));
 }
@@ -162,33 +170,31 @@ async function main() {
       primary_skill,
       total_experience,
       candidate_status,
+      candidate_container,
+      owner_employee_code,
       created_by
     )
     VALUES (
       'Pool',
-      'SegregationDraft',
+      'Segregation',
       $1,
       '9876503333',
       'Java',
       2,
-      'DRAFT',
+      'REGISTERED',
+      'PIPELINE',
+      $2,
       $2
     )
     RETURNING candidate_id
     `,
-    [`pool.segregation.draft.${Date.now()}@example.com`, recruiter.employee_code]
+    [`pool.segregation.pipeline.${Date.now()}@example.com`, recruiter.employee_code]
   );
 
   const candidateId = insertResult.rows[0].candidate_id;
   let talentCandidateId = null;
 
   try {
-    await registerContainer(
-      candidateId,
-      recruiterToken,
-      recruiter.employee_code,
-      "PIPELINE"
-    );
     pass("seed candidate registered to PIPELINE");
 
     const dbPipeline = await pool.query(
@@ -207,8 +213,8 @@ async function main() {
       pass("database stores PIPELINE container");
     }
 
-    const myPipelineRows = await fetchList("/my-candidates-list", recruiterToken);
-    const talentPoolRows = await fetchList("/available-candidates", recruiterToken);
+    const myPipelineRows = await fetchPipelineList(recruiterToken);
+    const talentPoolRows = await fetchTalentPoolList(recruiterToken);
 
     if (!includesCandidate(myPipelineRows, candidateId)) {
       fail("PIPELINE candidate appears in My Pipeline list");
@@ -237,7 +243,7 @@ async function main() {
 
     if (otherRecruiterResult.rows.length > 0) {
       const otherToken = signEmployeeToken(otherRecruiterResult.rows[0]);
-      const otherMyPipeline = await fetchList("/my-candidates-list", otherToken);
+      const otherMyPipeline = await fetchPipelineList(otherToken);
 
       if (includesCandidate(otherMyPipeline, candidateId)) {
         fail("My Pipeline ownership rule excludes other recruiter");
@@ -264,11 +270,8 @@ async function main() {
     }
 
     if (nonRecruiterToken) {
-      const nonRecruiterTalent = await fetchList(
-        "/available-candidates",
-        nonRecruiterToken
-      );
-      const nonRecruiterMy = await fetchList("/my-candidates-list", nonRecruiterToken);
+      const nonRecruiterTalent = await fetchTalentPoolList(nonRecruiterToken);
+      const nonRecruiterMy = await fetchPipelineList(nonRecruiterToken);
 
       if (includesCandidate(nonRecruiterTalent, candidateId)) {
         fail("non-recruiter Talent Pool excludes PIPELINE candidate");
@@ -310,8 +313,8 @@ async function main() {
       pass("database stores TALENT_POOL after transition");
     }
 
-    const myAfterTalent = await fetchList("/my-candidates-list", recruiterToken);
-    const talentAfterTransition = await fetchList("/available-candidates", recruiterToken);
+    const myAfterTalent = await fetchPipelineList(recruiterToken);
+    const talentAfterTransition = await fetchTalentPoolList(recruiterToken);
 
     if (includesCandidate(myAfterTalent, candidateId)) {
       fail("My Pipeline excludes candidate after TALENT_POOL transition");
@@ -350,6 +353,7 @@ async function main() {
         primary_skill,
         total_experience,
         candidate_status,
+        candidate_container,
         created_by
       )
       VALUES (
@@ -359,7 +363,8 @@ async function main() {
         '9876504444',
         'Java',
         2,
-        'DRAFT',
+        'REGISTERED',
+        'TALENT_POOL',
         $2
       )
       RETURNING candidate_id
@@ -369,15 +374,9 @@ async function main() {
         recruiter.employee_code
       ]
     );
-    const talentCandidateId = talentInsertResult.rows[0].candidate_id;
+    talentCandidateId = talentInsertResult.rows[0].candidate_id;
 
-    await registerContainer(
-      talentCandidateId,
-      recruiterToken,
-      recruiter.employee_code,
-      "TALENT_POOL"
-    );
-    pass("TALENT_POOL candidate registered via existing PUT /candidate/:id");
+    pass("TALENT_POOL candidate seeded as REGISTERED");
 
     const dbTalentOnly = await pool.query(
       `
@@ -395,8 +394,8 @@ async function main() {
       pass("TALENT_POOL registration stores TALENT_POOL container");
     }
 
-    const myForTalentOnly = await fetchList("/my-candidates-list", recruiterToken);
-    const talentForTalentOnly = await fetchList("/available-candidates", recruiterToken);
+    const myForTalentOnly = await fetchPipelineList(recruiterToken);
+    const talentForTalentOnly = await fetchTalentPoolList(recruiterToken);
 
     if (includesCandidate(myForTalentOnly, talentCandidateId)) {
       fail("My Pipeline excludes TALENT_POOL-only candidate");

@@ -217,16 +217,21 @@ async function main() {
   }
 
   const legacyPipeline = await fetchJson("/my-candidates-list", recruiterToken);
-  if (legacyPipeline.status === 200 && legacyPipeline.body?.success) {
+  if (legacyPipeline.status === 410 && legacyPipeline.body?.deprecated) {
+    pass("HTTP: legacy /my-candidates-list retired (410)");
+  } else if (legacyPipeline.status === 200 && legacyPipeline.body?.success) {
     pass("HTTP: legacy /my-candidates-list still available (200)");
   } else {
     fail("HTTP: legacy /my-candidates-list", `status=${legacyPipeline.status}`);
   }
 
   const v1Rows = recruiterPipeline.body?.data || [];
-  const legacyRows = legacyPipeline.body?.data || [];
+  const legacyRows =
+    legacyPipeline.status === 200 ? legacyPipeline.body?.data || [] : [];
 
-  if (v1Rows.length === legacyRows.length) {
+  if (legacyPipeline.status === 410) {
+    pass("legacy parity skipped — classic pipeline list retired");
+  } else if (v1Rows.length === legacyRows.length) {
     pass(`count parity with legacy endpoint (${v1Rows.length})`);
   } else {
     fail(
@@ -235,26 +240,28 @@ async function main() {
     );
   }
 
-  const v1Sorted = sortByCandidateId(v1Rows);
-  const legacySorted = sortByCandidateId(legacyRows);
-  const parityMismatch = v1Sorted.find((row, index) => {
-    const legacyRow = legacySorted[index];
-    return (
-      !legacyRow
-      || Number(row.candidate_id) !== Number(legacyRow.candidate_id)
-      || String(row.stage_name ?? "") !== String(legacyRow.stage_name ?? "")
-      || String(row.req_code ?? "") !== String(legacyRow.req_code ?? "")
-      || String(row.job_title ?? "") !== String(legacyRow.job_title ?? "")
-    );
-  });
+  if (legacyPipeline.status !== 410) {
+    const v1Sorted = sortByCandidateId(v1Rows);
+    const legacySorted = sortByCandidateId(legacyRows);
+    const parityMismatch = v1Sorted.find((row, index) => {
+      const legacyRow = legacySorted[index];
+      return (
+        !legacyRow
+        || Number(row.candidate_id) !== Number(legacyRow.candidate_id)
+        || String(row.stage_name ?? "") !== String(legacyRow.stage_name ?? "")
+        || String(row.req_code ?? "") !== String(legacyRow.req_code ?? "")
+        || String(row.job_title ?? "") !== String(legacyRow.job_title ?? "")
+      );
+    });
 
-  if (!parityMismatch) {
-    pass("row parity with legacy /my-candidates-list");
-  } else {
-    fail(
-      "row parity with legacy /my-candidates-list",
-      `candidate_id=${parityMismatch.candidate_id}`
-    );
+    if (!parityMismatch) {
+      pass("row parity with legacy /my-candidates-list");
+    } else {
+      fail(
+        "row parity with legacy /my-candidates-list",
+        `candidate_id=${parityMismatch.candidate_id}`
+      );
+    }
   }
 
   if (assertShapeParity(v1Rows[0], "v1")) {

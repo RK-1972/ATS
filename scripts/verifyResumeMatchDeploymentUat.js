@@ -224,11 +224,19 @@ async function main() {
 
   const [s1, s2, s3, s4] = skills;
   const requiredCodes = `${s1.code},${s2.code},${s3.code},${s4.code}`;
-  const recruiterToken = signToken(recruiter);
+  const deployedRecruiterToken = process.env.WAVE8_UAT_RECRUITER_BEARER_TOKEN;
+  const deployedUnauthorizedToken = process.env.WAVE8_UAT_UNAUTHORIZED_BEARER_TOKEN;
+  const recruiterToken = deployedRecruiterToken || signToken(recruiter);
   const unauthorizedRecruiter = await resolveUnauthorizedRecruiter(recruiter.employee_code);
-  const unauthorizedToken = unauthorizedRecruiter
-    ? signToken(unauthorizedRecruiter)
-    : null;
+  const unauthorizedToken = deployedUnauthorizedToken
+    ? deployedUnauthorizedToken
+    : unauthorizedRecruiter
+      ? signToken(unauthorizedRecruiter)
+      : null;
+
+  if (deployedRecruiterToken) {
+    pass("Using Render-issued recruiter bearer token (WAVE8_UAT_RECRUITER_BEARER_TOKEN)");
+  }
 
   try {
     await insertApprovedRequisition(REQ_CODE, requiredCodes);

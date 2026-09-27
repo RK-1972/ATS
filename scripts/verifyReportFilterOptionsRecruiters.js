@@ -7,6 +7,7 @@ const { Pool } = require("pg");
 
 const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
 const REQUISITION_ASSIGNER_CODE = "REQUISITION_ASSIGNER";
+const RECRUITER_ASSIGNMENT_OPERATOR_ROLES = ["Admin", "TA Lead", "TA Leader"];
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -76,6 +77,7 @@ async function resolveReportAuthorizedNonAssignerUser() {
       AND f.code IN ('assigned_recruiter_code', 'mapping_recruiter_code')
       AND f.is_filterable = TRUE
      WHERE COALESCE(u.is_active, TRUE) = TRUE
+       AND u.role_name NOT IN ('Admin', 'TA Lead', 'TA Leader')
        AND NOT EXISTS (
          SELECT 1
          FROM work_assignment_mstr wam
@@ -255,6 +257,13 @@ async function main() {
 
     if (recruitmentDeniedResponse.status === 403) {
       pass("Same user is still denied recruitment form-options recruiters");
+    } else if (
+      recruitmentDeniedResponse.status === 200 &&
+      RECRUITER_ASSIGNMENT_OPERATOR_ROLES.includes(reportUser.role_name)
+    ) {
+      pass(
+        `${reportUser.role_name} may use recruitment form-options without REQUISITION_ASSIGNER (operator role policy)`
+      );
     } else {
       fail(
         "Recruitment endpoint authorization regression",

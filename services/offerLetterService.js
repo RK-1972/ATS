@@ -329,34 +329,63 @@ async function uploadOfferLetterPdf(buffer, offerId) {
   return objectKey;
 }
 
-async function getPendingLetters(pool) {
-  const missingLetters = await pool.query(
-    `SELECT o.offer_id
-     FROM om_offers o
-     LEFT JOIN om_offer_letters ol ON ol.offer_id = o.offer_id
-     WHERE ol.letter_id IS NULL
-       AND o.offer_status NOT IN ('Draft', 'Pending Approval', 'Declined', 'Withdrawn')`
-  );
+function resolveOfferReadAccess() {
+  return require("./offerManagementService");
+}
 
-  for (const row of missingLetters.rows) {
-    await offerLetterRepository.ensureAwaitingLetter(pool, row.offer_id);
+async function filterLetterRowsByReadScope(pool, req, rows) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  const { listScopedOfferRows } = resolveOfferReadAccess();
+  const scopedRows = await listScopedOfferRows(pool, req);
+  const allowed = new Set(scopedRows.map((row) => String(row.offer_id)));
+
+  return rows.filter((row) => allowed.has(String(row.offer_id)));
+}
+
+async function getPendingLetters(pool, req) {
+  const { listScopedOfferRows } = resolveOfferReadAccess();
+  const scopedRows = await listScopedOfferRows(pool, req);
+  const scopedIds = scopedRows.map((row) => row.offer_id);
+
+  if (scopedIds.length) {
+    const missingLetters = await pool.query(
+      `SELECT o.offer_id
+       FROM om_offers o
+       LEFT JOIN om_offer_letters ol ON ol.offer_id = o.offer_id
+       WHERE o.offer_id = ANY($1::varchar[])
+         AND ol.letter_id IS NULL
+         AND o.offer_status NOT IN ('Draft', 'Pending Approval', 'Declined', 'Withdrawn')`,
+      [scopedIds]
+    );
+
+    for (const row of missingLetters.rows) {
+      await offerLetterRepository.ensureAwaitingLetter(pool, row.offer_id);
+    }
   }
 
   const rows = await offerLetterRepository.findPendingLetters(pool);
-  return Promise.all(rows.map((row) => buildOfferLetterItem(pool, row)));
+  const scopedRowsFiltered = await filterLetterRowsByReadScope(pool, req, rows);
+  return Promise.all(scopedRowsFiltered.map((row) => buildOfferLetterItem(pool, row)));
 }
 
-async function getGeneratedLetters(pool) {
+async function getGeneratedLetters(pool, req) {
   const rows = await offerLetterRepository.findGeneratedLetters(pool);
-  return Promise.all(rows.map((row) => buildOfferLetterItem(pool, row)));
+  const scopedRowsFiltered = await filterLetterRowsByReadScope(pool, req, rows);
+  return Promise.all(scopedRowsFiltered.map((row) => buildOfferLetterItem(pool, row)));
 }
 
-async function getOfferLetterDetail(pool, offerId) {
+async function getOfferLetterDetail(pool, offerId, req) {
   const row = await offerLetterRepository.findOfferLetterDetail(pool, offerId);
 
   if (!row) {
     throw httpError(`Offer letter record not found: ${offerId}`, 404);
   }
+
+  const { assertOfferReadAccess } = resolveOfferReadAccess();
+  await assertOfferReadAccess(pool, req, offerId);
 
   offerLetterValidation.assertOfferLetterWorkspaceEligible(row);
 
@@ -369,6 +398,9 @@ async function generateOfferLetter(pool, offerId, payload, req) {
   if (!row) {
     throw httpError(`Offer not found: ${offerId}`, 404);
   }
+
+  const { assertOfferReadAccess } = resolveOfferReadAccess();
+  await assertOfferReadAccess(pool, req, offerId);
 
   offerLetterValidation.assertAwaitingLetterOperations(row);
 
@@ -489,7 +521,9 @@ async function downloadStoredPdf(storedPath) {
   };
 }
 
-async function getGeneratedOfferLetterPdf(pool, offerId) {
+async function getGeneratedOfferLetterPdf(pool, offerId, req) {
+  const { assertOfferReadAccess } = resolveOfferReadAccess();
+  await assertOfferReadAccess(pool, req, offerId);
   return offerLetterGenerationService.downloadOfferLetterPdf(pool, offerId);
 }
 

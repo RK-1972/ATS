@@ -157,14 +157,21 @@ async function resolveAssignedRecruiterCode() {
   return result.rows[0]?.recruiter_code || null;
 }
 
-async function resolveForeignPipelineCandidate() {
+async function resolveForeignPipelineCandidate(excludeEmployeeCodes = []) {
+  const exclude = (excludeEmployeeCodes || []).filter(Boolean);
   const result = await pool.query(
     `SELECT candidate_id
      FROM cand_mstr
      WHERE UPPER(COALESCE(candidate_container, 'PIPELINE')) = 'PIPELINE'
        AND COALESCE(owner_employee_code, '') <> ''
+       AND (
+         $1::text[] IS NULL
+         OR cardinality($1::text[]) = 0
+         OR NOT (owner_employee_code = ANY($1::text[]))
+       )
      ORDER BY candidate_id DESC
-     LIMIT 1`
+     LIMIT 1`,
+    [exclude]
   );
   return result.rows[0]?.candidate_id || null;
 }
@@ -250,7 +257,10 @@ async function main() {
   const recruiter = await resolveUnauthorizedRecruiter();
   const hiringManager = await resolveUserByRole("Hiring Manager");
   const assignedRecruiterCode = await resolveAssignedRecruiterCode();
-  const foreignCandidateId = await resolveForeignPipelineCandidate();
+  const foreignCandidateId = await resolveForeignPipelineCandidate([
+    taLead?.employee_code,
+    taLeader?.employee_code
+  ].filter(Boolean));
 
   if (!taLead) {
     fail("fixtures", "TA Lead/Leader or REQUISITION_ASSIGNER user required");
