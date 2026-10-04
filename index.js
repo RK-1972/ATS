@@ -3160,6 +3160,176 @@ app.delete(
 
 );
 
+// =====================================================
+// Candidate Skill Map APIs (can_skill_map via candidateService)
+// =====================================================
+
+app.post(
+
+  "/candidate/:candidateId/skill-map/batch",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const skillRows = Array.isArray(req.body?.skills) ? req.body.skills : [];
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
+      const result =
+        await candidateService.insertSkillMapBatch(
+          pool,
+          candidateId,
+          skillRows
+        );
+
+      res.status(201).json({
+
+        success: true,
+        message: "Skills added successfully.",
+        data: result
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Batch Create Candidate Skill Map Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Creating Candidate Skills"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.put(
+
+  "/candidate/:candidateId/skill-map/:skillMapId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const skillMapId = req.params.skillMapId;
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
+      const result =
+        await candidateService.updateSkillMapRecord(
+          pool,
+          candidateId,
+          skillMapId,
+          req.body
+        );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Skill updated successfully.",
+        data: result
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Update Candidate Skill Map Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Updating Candidate Skill"
+
+      });
+
+    }
+
+  }
+
+);
+
+app.delete(
+
+  "/candidate/:candidateId/skill-map/:skillMapId",
+
+  verifyToken,
+
+  async (req, res) => {
+
+    try {
+
+      const candidateId = req.params.candidateId;
+      const skillMapId = req.params.skillMapId;
+
+      await candidateAccessService.assertCandidateReadAccess(
+        pool,
+        req,
+        candidateId
+      );
+
+      const result =
+        await candidateService.deleteSkillMapRecord(
+          pool,
+          candidateId,
+          skillMapId
+        );
+
+      res.status(200).json({
+
+        success: true,
+        message: "Skill deleted successfully.",
+        data: result
+
+      });
+
+    }
+
+    catch (error) {
+
+      console.log("❌ Delete Candidate Skill Map Error");
+
+      console.log(error);
+
+      res.status(error.status || 500).json({
+
+        success: false,
+        message: error.message || "Error Deleting Candidate Skill"
+
+      });
+
+    }
+
+  }
+
+);
+
 
 // =====================================================
 // API 5 - Register User

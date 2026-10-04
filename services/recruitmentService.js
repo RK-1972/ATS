@@ -612,6 +612,12 @@ async function listCandidateExperience(pool, candidateId, req) {
   return candidateService.listChildRecords(pool, "experience", candidateId);
 }
 
+async function listCandidateSkillMap(pool, candidateId, req) {
+  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+
+  return candidateService.listChildRecords(pool, "skill_map", candidateId);
+}
+
 async function getCandidateOwnership(pool, candidateId, req) {
   await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
 
@@ -4014,6 +4020,7 @@ module.exports = {
   getCandidateWorkspaceProfile,
   listCandidateEducation,
   listCandidateExperience,
+  listCandidateSkillMap,
   getCandidateOwnership,
   listTalentPoolCandidates,
   listMyPipelineCandidates,

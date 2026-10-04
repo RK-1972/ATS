@@ -309,6 +309,581 @@ async function insertChildRecord(pool, childKey, candidateId, payload) {
   return result.rows[0];
 }
 
+const SKILL_MAP_COLUMNS = [
+  "skill_code",
+  "experience_years",
+  "experience_months",
+  "proficiency",
+  "last_used"
+];
+
+function parseSkillMapExperienceYears(value) {
+  if (value === "" || value === null || value === undefined) {
+    return 0;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isInteger(value) || value < 0) {
+      throw httpError(
+        "experience_years must be a whole number greater than or equal to 0.",
+        400
+      );
+    }
+
+    return value;
+  }
+
+  const trimmed = String(value).trim();
+
+  if (!/^\d+$/.test(trimmed)) {
+    throw httpError(
+      "experience_years must be a whole number greater than or equal to 0.",
+      400
+    );
+  }
+
+  return Number.parseInt(trimmed, 10);
+}
+
+function parseSkillMapExperienceMonths(value) {
+  if (value === "" || value === null || value === undefined) {
+    return 0;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isInteger(value) || value < 0 || value > 11) {
+      throw httpError(
+        "experience_months must be a whole number between 0 and 11.",
+        400
+      );
+    }
+
+    return value;
+  }
+
+  const trimmed = String(value).trim();
+
+  if (!/^\d+$/.test(trimmed)) {
+    throw httpError(
+      "experience_months must be a whole number between 0 and 11.",
+      400
+    );
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+
+  if (parsed > 11) {
+    throw httpError(
+      "experience_months must be a whole number between 0 and 11.",
+      400
+    );
+  }
+
+  return parsed;
+}
+
+function pickSkillMapPayload(body = {}) {
+  const source = { ...body };
+  const payload = {};
+
+  SKILL_MAP_COLUMNS.forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) {
+      return;
+    }
+
+    let value = source[field];
+
+    if (field === "skill_code") {
+      value = String(value || "").trim();
+      if (value) {
+        payload.skill_code = value;
+      }
+      return;
+    }
+
+    if (field === "experience_years") {
+      payload.experience_years = parseSkillMapExperienceYears(value);
+      return;
+    }
+
+    if (field === "experience_months") {
+      payload.experience_months = parseSkillMapExperienceMonths(value);
+      return;
+    }
+
+    if (field === "proficiency") {
+      payload.proficiency = value ? String(value).trim() : null;
+      return;
+    }
+
+    if (field === "last_used") {
+      payload.last_used = value ? String(value).trim() : null;
+    }
+  });
+
+  return payload;
+}
+
+function normalizeSkillTokenKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function splitSkillFieldTokens(...fields) {
+  const tokens = [];
+  const seen = new Set();
+
+  fields.forEach((field) => {
+    if (!field) {
+      return;
+    }
+
+    String(field)
+      .split(/[,;/|]+/)
+      .map((token) => token.trim())
+      .filter(Boolean)
+      .forEach((token) => {
+        const key = normalizeSkillTokenKey(token);
+
+        if (seen.has(key)) {
+          return;
+        }
+
+        seen.add(key);
+        tokens.push(token);
+      });
+  });
+
+  return tokens;
+}
+
+function tokenMatchesSkillLabels(token, labels = []) {
+  const key = normalizeSkillTokenKey(token);
+
+  return labels.some((label) => normalizeSkillTokenKey(label) === key);
+}
+
+function mergeSkillTokensWithMapLabels(tokens = [], activeMapDisplayNames = []) {
+  const activeLabels = activeMapDisplayNames
+    .map((name) => String(name || "").trim())
+    .filter(Boolean);
+
+  const final = [];
+  const finalSeen = new Set();
+
+  tokens.forEach((token) => {
+    const key = normalizeSkillTokenKey(token);
+
+    if (!key || finalSeen.has(key)) {
+      return;
+    }
+
+    finalSeen.add(key);
+    final.push(token);
+  });
+
+  activeLabels.forEach((label) => {
+    const key = normalizeSkillTokenKey(label);
+
+    if (!key || finalSeen.has(key)) {
+      return;
+    }
+
+    finalSeen.add(key);
+    final.push(label);
+  });
+
+  return final.join(", ");
+}
+
+function buildAdditivePrimarySkillString(
+  primarySkill,
+  secondarySkill,
+  activeMapDisplayNames = [],
+  options = {}
+) {
+  let tokens = splitSkillFieldTokens(primarySkill, secondarySkill);
+
+  const {
+    deletedSkillLabels = [],
+    priorMapDisplayNames = []
+  } = options;
+
+  if (deletedSkillLabels.length > 0 && priorMapDisplayNames.length > 0) {
+    const protectedKeys = new Set(
+      tokens
+        .filter((token) => !tokenMatchesSkillLabels(token, priorMapDisplayNames))
+        .map((token) => normalizeSkillTokenKey(token))
+    );
+
+    tokens = tokens.filter((token) => {
+      if (!tokenMatchesSkillLabels(token, deletedSkillLabels)) {
+        return true;
+      }
+
+      return protectedKeys.has(normalizeSkillTokenKey(token));
+    });
+  }
+
+  return mergeSkillTokensWithMapLabels(tokens, activeMapDisplayNames);
+}
+
+async function resolveSkillDisplayName(queryable, skillCode) {
+  const result = await queryable.query(
+    `SELECT name
+     FROM md_records
+     WHERE entity_type = 'skills'
+       AND LOWER(code) = LOWER($1)
+       AND is_deleted = FALSE
+     LIMIT 1`,
+    [skillCode]
+  );
+
+  return String(result.rows[0]?.name || skillCode || "").trim();
+}
+
+function collectCandidateSkillTokenKeys(primarySkill, secondarySkill) {
+  return new Set(
+    splitSkillFieldTokens(primarySkill, secondarySkill).map((token) =>
+      normalizeSkillTokenKey(token)
+    )
+  );
+}
+
+async function assertSkillsNotAlreadyOnCandidate(queryable, master, skillCodes = []) {
+  const existingKeys = collectCandidateSkillTokenKeys(
+    master.primary_skill,
+    master.secondary_skill
+  );
+
+  for (const skillCode of skillCodes) {
+    const normalizedCode = normalizeSkillTokenKey(skillCode);
+
+    if (existingKeys.has(normalizedCode)) {
+      throw httpError(
+        `Skill '${skillCode}' is already present on this candidate.`,
+        409
+      );
+    }
+
+    const displayName = await resolveSkillDisplayName(queryable, skillCode);
+
+    if (displayName && existingKeys.has(normalizeSkillTokenKey(displayName))) {
+      throw httpError(
+        `Skill '${displayName}' is already present on this candidate.`,
+        409
+      );
+    }
+  }
+}
+
+async function resolveSkillMapDisplayNames(queryable, candidateId) {
+  const result = await queryable.query(
+    `SELECT sm.skill_code,
+            COALESCE(mr.name, sm.skill_code) AS display_name
+     FROM can_skill_map sm
+     LEFT JOIN md_records mr
+       ON mr.entity_type = 'skills'
+      AND LOWER(mr.code) = LOWER(sm.skill_code)
+      AND mr.is_deleted = FALSE
+     WHERE sm.candidate_id = $1
+       AND sm.active_flag IS NOT FALSE
+     ORDER BY sm.skill_map_id ASC`,
+    [candidateId]
+  );
+
+  return result.rows.map((row) => ({
+    skill_code: row.skill_code,
+    display_name: String(row.display_name || row.skill_code || "").trim()
+  }));
+}
+
+async function syncPrimarySkillFromSkillMap(queryable, candidateId, options = {}) {
+  const masterResult = await queryable.query(
+    `SELECT primary_skill, secondary_skill
+     FROM cand_mstr
+     WHERE candidate_id = $1`,
+    [candidateId]
+  );
+
+  const master = masterResult.rows[0];
+
+  if (!master) {
+    throw httpError("Candidate not found", 404);
+  }
+
+  const mapRows = await resolveSkillMapDisplayNames(queryable, candidateId);
+  const activeMapDisplayNames = mapRows
+    .map((row) => row.display_name)
+    .filter(Boolean);
+
+  const primarySkill = buildAdditivePrimarySkillString(
+    master.primary_skill,
+    master.secondary_skill,
+    activeMapDisplayNames,
+    options
+  );
+
+  await queryable.query(
+    `UPDATE cand_mstr
+     SET primary_skill = $1, updated_on = NOW()
+     WHERE candidate_id = $2`,
+    [primarySkill, candidateId]
+  );
+
+  return primarySkill;
+}
+
+async function insertSkillMapBatch(pool, candidateId, rawSkillRows = []) {
+  if (!Array.isArray(rawSkillRows) || rawSkillRows.length === 0) {
+    throw httpError("At least one skill is required.", 400);
+  }
+
+  const skillPayloads = rawSkillRows.map((row) => pickSkillMapPayload(row));
+
+  for (const payload of skillPayloads) {
+    if (!payload.skill_code) {
+      throw httpError("skill_code is required for each skill.", 400);
+    }
+  }
+
+  const normalizedCodes = skillPayloads.map((row) =>
+    String(row.skill_code).toLowerCase()
+  );
+
+  if (new Set(normalizedCodes).size !== normalizedCodes.length) {
+    throw httpError("Duplicate skill codes in request.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const master = await getCandidateMaster(client, candidateId);
+
+    if (!master) {
+      throw httpError("Candidate not found", 404);
+    }
+
+    const existing = await client.query(
+      `SELECT skill_code
+       FROM can_skill_map
+       WHERE candidate_id = $1
+         AND active_flag IS NOT FALSE`,
+      [candidateId]
+    );
+
+    const existingCodes = new Set(
+      existing.rows.map((row) => String(row.skill_code).toLowerCase())
+    );
+
+    for (const payload of skillPayloads) {
+      if (existingCodes.has(String(payload.skill_code).toLowerCase())) {
+        throw httpError(
+          `Skill '${payload.skill_code}' is already assigned to this candidate.`,
+          409
+        );
+      }
+    }
+
+    await assertSkillsNotAlreadyOnCandidate(
+      client,
+      master,
+      skillPayloads.map((row) => row.skill_code)
+    );
+
+    const inserted = [];
+
+    for (const payload of skillPayloads) {
+      const row = await insertChildRecord(client, "skill_map", candidateId, payload);
+      inserted.push(row);
+    }
+
+    const primarySkill = await syncPrimarySkillFromSkillMap(client, candidateId);
+
+    await client.query("COMMIT");
+
+    return {
+      skills: inserted,
+      primary_skill: primarySkill
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+
+    if (error.code === "23505") {
+      throw httpError("Skill already assigned to this candidate.", 409);
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateSkillMapRecord(pool, candidateId, skillMapId, body = {}) {
+  const payload = pickSkillMapPayload(body);
+
+  if (!Object.keys(payload).length) {
+    throw httpError("No skill fields supplied.", 400);
+  }
+
+  const client = await pool.connect();
+  const config = CHILD_TABLES.skill_map;
+
+  try {
+    await client.query("BEGIN");
+
+    const master = await getCandidateMaster(client, candidateId);
+
+    if (!master) {
+      throw httpError("Candidate not found", 404);
+    }
+
+    const records = await listChildRecords(client, "skill_map", candidateId);
+    const existing = records.find(
+      (row) => String(row.skill_map_id) === String(skillMapId)
+    );
+
+    if (!existing) {
+      throw httpError("Skill record not found.", 404);
+    }
+
+    if (payload.skill_code) {
+      await validateSkillCode(client, payload.skill_code);
+
+      const duplicate = records.find(
+        (row) =>
+          String(row.skill_map_id) !== String(skillMapId) &&
+          String(row.skill_code).toLowerCase() ===
+            String(payload.skill_code).toLowerCase()
+      );
+
+      if (duplicate) {
+        throw httpError(
+          `Skill '${payload.skill_code}' is already assigned to this candidate.`,
+          409
+        );
+      }
+    }
+
+    const columns = Object.keys(payload);
+    const setClauses = columns.map((column, index) => `${column} = $${index + 1}`);
+    setClauses.push("modified_on = CURRENT_TIMESTAMP");
+
+    const values = [
+      ...columns.map((column) => payload[column]),
+      skillMapId,
+      candidateId
+    ];
+
+    const result = await client.query(
+      `UPDATE ${config.table}
+       SET ${setClauses.join(", ")}
+       WHERE ${config.idColumn} = $${columns.length + 1}
+         AND ${config.candidateColumn} = $${columns.length + 2}
+       RETURNING *`,
+      values
+    );
+
+    const primarySkill = await syncPrimarySkillFromSkillMap(client, candidateId);
+
+    await client.query("COMMIT");
+
+    return {
+      skill: result.rows[0],
+      primary_skill: primarySkill
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+
+    if (error.code === "23505") {
+      throw httpError("Skill already assigned to this candidate.", 409);
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function deleteSkillMapRecord(pool, candidateId, skillMapId) {
+  const client = await pool.connect();
+  const config = CHILD_TABLES.skill_map;
+
+  try {
+    await client.query("BEGIN");
+
+    const master = await getCandidateMaster(client, candidateId);
+
+    if (!master) {
+      throw httpError("Candidate not found", 404);
+    }
+
+    const records = await listChildRecords(client, "skill_map", candidateId);
+    const existing = records.find(
+      (row) => String(row.skill_map_id) === String(skillMapId)
+    );
+
+    if (!existing) {
+      throw httpError("Skill record not found.", 404);
+    }
+
+    const priorMapRows = await resolveSkillMapDisplayNames(client, candidateId);
+    const priorMapDisplayNames = priorMapRows
+      .map((row) => row.display_name)
+      .filter(Boolean);
+
+    const deletedSkillLabels = [
+      existing.skill_code,
+      priorMapRows.find(
+        (row) =>
+          String(row.skill_code).toLowerCase() ===
+          String(existing.skill_code).toLowerCase()
+      )?.display_name
+    ].filter(Boolean);
+
+    const result = await client.query(
+      `DELETE FROM ${config.table}
+       WHERE ${config.idColumn} = $1
+         AND ${config.candidateColumn} = $2
+       RETURNING *`,
+      [skillMapId, candidateId]
+    );
+
+    const primarySkill = await syncPrimarySkillFromSkillMap(client, candidateId, {
+      deletedSkillLabels,
+      priorMapDisplayNames
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      skill: result.rows[0],
+      primary_skill: primarySkill
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback failures
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function countCandidateMasters(pool) {
   const result = await pool.query(`SELECT COUNT(*)::int AS count FROM ${MASTER_TABLE}`);
   return result.rows[0].count;
@@ -330,5 +905,15 @@ module.exports = {
   listChildRecords,
   getCandidateProfile,
   insertChildRecord,
+  SKILL_MAP_COLUMNS,
+  pickSkillMapPayload,
+  buildAdditivePrimarySkillString,
+  mergeSkillTokensWithMapLabels,
+  splitSkillFieldTokens,
+  collectCandidateSkillTokenKeys,
+  syncPrimarySkillFromSkillMap,
+  insertSkillMapBatch,
+  updateSkillMapRecord,
+  deleteSkillMapRecord,
   countCandidateMasters
 };

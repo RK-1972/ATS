@@ -138,6 +138,27 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   );
 
+  app.get(
+    "/api/v1/recruitment/candidates/:candidateId/skill-map",
+    operatorGuard,
+    async (req, res) => {
+      try {
+        const data = await recruitmentService.listCandidateSkillMap(
+          pool,
+          req.params.candidateId,
+          req
+        );
+
+        res.status(200).json({
+          success: true,
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
   app.get("/api/v1/recruitment/pending-applications", operatorGuard, async (req, res) => {
     try {
       const data = await recruitmentService.listPendingPortalApplications(pool, req);
