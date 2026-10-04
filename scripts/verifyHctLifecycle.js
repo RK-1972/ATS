@@ -90,6 +90,21 @@ function assertLifecycleShape(data, label) {
     }
   }
 
+  if (!data?.operational_panels?.budget) {
+    fail(`${label} operational_panels.budget`, "missing");
+    return false;
+  }
+
+  if (!Array.isArray(data.operational_panels.activity_events)) {
+    fail(`${label} operational_panels.activity_events`, "not an array");
+    return false;
+  }
+
+  if (!Array.isArray(data.operational_panels.notifications?.deliveries)) {
+    fail(`${label} operational_panels.notifications.deliveries`, "not an array");
+    return false;
+  }
+
   for (const milestone of data.milestones) {
     if (!ALLOWED_STATUSES.has(milestone.status)) {
       fail(`${label} invalid status`, `${milestone.key}: ${milestone.status}`);

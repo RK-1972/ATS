@@ -26,7 +26,9 @@ const {
 
   assertCanChangePrimaryRole,
 
-  assertCanChangeUserStatus
+  assertCanChangeUserStatus,
+
+  assertCanAccessUserAdministration
 
 } = require("./userProvisioningCapabilityAuth");
 
@@ -1088,6 +1090,116 @@ async function changeUserStatus(pool, req, employeeCode, payload = {}) {
 
 
 
+/**
+ * Update employee full_name and/or email_id only (User Administration).
+ * Does not write role or status history.
+ */
+async function updateUserProfile(pool, req, employeeCode, payload = {}) {
+  await assertCanAccessUserAdministration(pool, req);
+
+  const targetEmployeeCode = String(employeeCode || "").trim();
+
+  if (!targetEmployeeCode) {
+    throw httpError("employeeCode is required.", 400);
+  }
+
+  const hasFullName = Object.prototype.hasOwnProperty.call(payload, "full_name");
+  const hasEmail = Object.prototype.hasOwnProperty.call(payload, "email_id");
+
+  if (!hasFullName && !hasEmail) {
+    throw httpError("At least one of full_name or email_id is required.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      `SELECT
+         user_id,
+         employee_code,
+         full_name,
+         email_id,
+         role_name,
+         is_active,
+         created_on
+       FROM user_mstr
+       WHERE employee_code = $1
+       FOR UPDATE`,
+      [targetEmployeeCode]
+    );
+
+    const user = userResult.rows[0];
+
+    if (!user) {
+      throw httpError(`User not found: ${targetEmployeeCode}`, 404);
+    }
+
+    const nextFullName = hasFullName
+      ? String(payload.full_name || "").trim()
+      : String(user.full_name || "").trim();
+
+    const nextEmail = hasEmail
+      ? normalizeEmail(payload.email_id)
+      : normalizeEmail(user.email_id);
+
+    if (isBlank(nextFullName)) {
+      throw httpError("full_name is required.", 400);
+    }
+
+    if (!isValidEmail(nextEmail)) {
+      throw httpError("A valid email_id is required.", 400);
+    }
+
+    const duplicateEmail = await client.query(
+      `SELECT user_id
+       FROM user_mstr
+       WHERE LOWER(email_id) = $1
+         AND employee_code <> $2
+       LIMIT 1`,
+      [nextEmail, targetEmployeeCode]
+    );
+
+    if (duplicateEmail.rows.length > 0) {
+      throw httpError("email_id already exists.", 409);
+    }
+
+    const updateResult = await client.query(
+      `UPDATE user_mstr
+       SET full_name = $1,
+           email_id = $2,
+           updated_on = NOW()
+       WHERE employee_code = $3
+       RETURNING
+         user_id,
+         employee_code,
+         full_name,
+         email_id,
+         role_name,
+         is_active,
+         created_on`,
+      [nextFullName, nextEmail, targetEmployeeCode]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      user: updateResult.rows[0]
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    if (error.code === "23505") {
+      throw httpError("email_id already exists.", 409);
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function getStatusHistory(pool, employeeCode) {
 
   const targetEmployeeCode = String(employeeCode || "").trim();
@@ -1141,6 +1253,8 @@ async function getStatusHistory(pool, employeeCode) {
 module.exports = {
 
   provisionEmployee,
+
+  updateUserProfile,
 
   changePrimaryRole,
 

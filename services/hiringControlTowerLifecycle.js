@@ -878,6 +878,8 @@ async function loadLifecycleContext(pool, requisition) {
 
 async function buildLifecycleSnapshot(pool, requisition) {
   const ctx = await loadLifecycleContext(pool, requisition);
+  const { buildOperationalPanels } = require("./hiringControlTowerPanels");
+  const operationalPanels = await buildOperationalPanels(pool, requisition);
 
   return {
     requisition: {
@@ -889,7 +891,8 @@ async function buildLifecycleSnapshot(pool, requisition) {
     },
     milestones: ctx.milestones,
     summary: ctx.summary,
-    metadata: ctx.metadata
+    metadata: ctx.metadata,
+    operational_panels: operationalPanels
   };
 }
 

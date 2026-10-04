@@ -50,23 +50,29 @@ function normalizeSearchParams(query = {}) {
 async function searchRequisitions(pool, query = {}) {
   const { q, page, pageSize, offset } = normalizeSearchParams(query);
 
-  let whereClause = "";
-  const params = [pageSize, offset];
+  let countWhereClause = "";
+  let listWhereClause = "";
+  const listParams = [pageSize, offset];
 
   if (q) {
-    whereClause = `WHERE (
+    countWhereClause = `WHERE (
+         r.requisition_code ILIKE '%' || $1 || '%'
+         OR COALESCE(r.position_title, p.position_title, '') ILIKE '%' || $1 || '%'
+         OR COALESCE(r.department, p.department, '') ILIKE '%' || $1 || '%'
+       )`;
+    listWhereClause = `WHERE (
          r.requisition_code ILIKE '%' || $3 || '%'
          OR COALESCE(r.position_title, p.position_title, '') ILIKE '%' || $3 || '%'
          OR COALESCE(r.department, p.department, '') ILIKE '%' || $3 || '%'
        )`;
-    params.push(q);
+    listParams.push(q);
   }
 
   const countResult = await pool.query(
     `SELECT COUNT(*)::int AS total
      FROM rm_requisitions r
      LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
-     ${whereClause}`,
+     ${countWhereClause}`,
     q ? [q] : []
   );
 
@@ -83,10 +89,10 @@ async function searchRequisitions(pool, query = {}) {
        p.grade AS approved_grade
      FROM rm_requisitions r
      LEFT JOIN wp_approved_positions p ON r.approved_position_id = p.position_id
-     ${whereClause}
+     ${listWhereClause}
      ORDER BY r.created_on DESC NULLS LAST, r.req_id DESC
      LIMIT $1 OFFSET $2`,
-    params
+    listParams
   );
 
   const items = result.rows.map(mapRequisitionHeader);

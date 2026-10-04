@@ -158,6 +158,60 @@ function registerUserProvisioningRoutes(app, pool, verifyToken) {
 
 
 
+  app.put("/users/:employeeCode", userAdminGuard, async (req, res) => {
+
+    try {
+
+      const body = req.body || {};
+
+      const payload = {};
+
+      if (Object.prototype.hasOwnProperty.call(body, "full_name")) {
+
+        payload.full_name = body.full_name;
+
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, "email_id")) {
+
+        payload.email_id = body.email_id;
+
+      }
+
+      const data = await userProvisioningService.updateUserProfile(
+
+        pool,
+
+        req,
+
+        req.params.employeeCode,
+
+        payload
+
+      );
+
+
+
+      res.status(200).json({
+
+        success: true,
+
+        message: "User profile updated successfully.",
+
+        data
+
+      });
+
+    } catch (error) {
+
+      handleError(res, error);
+
+    }
+
+  });
+
+
+
   app.post("/users/provision", provisionGuard, async (req, res) => {
 
     try {

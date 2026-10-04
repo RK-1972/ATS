@@ -1314,6 +1314,141 @@ async function main() {
     }
   }
 
+  const profileStamp = `${stamp}_PROFILE`;
+  const profileCode = `VERIFY_PROFILE_${profileStamp}`;
+  const profileEmail = `verify.profile.${profileStamp}@optalynx.demo`;
+  const profileEmailUpdated = `verify.profile.updated.${profileStamp}@optalynx.demo`;
+
+  try {
+    await userProvisioningService.provisionEmployee(pool, { user: admin }, {
+      employee_code: profileCode,
+      full_name: "Verify Profile Original",
+      email_id: profileEmail,
+      password: "VerifyPass123",
+      role_name: "Recruiter",
+      work_assignment_ids: []
+    });
+
+    const updated = await userProvisioningService.updateUserProfile(
+      pool,
+      { user: admin },
+      profileCode,
+      {
+        full_name: "Verify Profile Updated",
+        email_id: profileEmailUpdated,
+        role_name: "Admin"
+      }
+    );
+
+    if (updated.user?.full_name === "Verify Profile Updated") {
+      pass("profile update changes full_name");
+    } else {
+      fail("profile update changes full_name");
+    }
+
+    const updatedEmail = String(updated.user?.email_id || "")
+      .trim()
+      .toLowerCase();
+
+    if (updatedEmail === profileEmailUpdated.trim().toLowerCase()) {
+      pass("profile update changes email_id");
+    } else {
+      fail(
+        "profile update changes email_id",
+        `expected ${profileEmailUpdated} got ${updated.user?.email_id}`
+      );
+    }
+
+    if (updated.user?.role_name === "Recruiter") {
+      pass("profile update ignores role_name in payload");
+    } else {
+      fail("profile update ignores role_name in payload");
+    }
+
+    const roleHistoryCount = await pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM user_role_history
+       WHERE employee_code = $1`,
+      [profileCode]
+    );
+
+    if ((roleHistoryCount.rows[0]?.c || 0) === 1) {
+      pass("profile update does not append role history");
+    } else {
+      fail(
+        "profile update does not append role history",
+        `rows=${roleHistoryCount.rows[0]?.c}`
+      );
+    }
+
+    try {
+      await userProvisioningService.updateUserProfile(
+        pool,
+        { user: recruiter },
+        profileCode,
+        { full_name: "Denied Profile Edit" }
+      );
+      fail("ordinary user denied profile update");
+    } catch (error) {
+      if (error.status === 403) {
+        pass("ordinary user denied profile update");
+      } else {
+        fail("ordinary user denied profile update", error.message);
+      }
+    }
+
+    if (adminToken) {
+      const httpProfile = await fetchJson(
+        `/users/${encodeURIComponent(profileCode)}`,
+        adminToken,
+        {
+          method: "PUT",
+          body: {
+            full_name: "Verify Profile HTTP",
+            email_id: profileEmailUpdated
+          }
+        }
+      );
+
+      if (httpProfile.status === 200) {
+        pass("HTTP admin profile update");
+      } else if (httpProfile.status === 404) {
+        console.log("SKIP: HTTP admin profile update — restart backend to load PUT route");
+      } else {
+        fail(
+          "HTTP admin profile update",
+          `${httpProfile.status} ${httpProfile.body?.message || ""}`
+        );
+      }
+    }
+
+    if (recruiterToken) {
+      const deniedProfile = await fetchJson(
+        `/users/${encodeURIComponent(profileCode)}`,
+        recruiterToken,
+        {
+          method: "PUT",
+          body: { full_name: "Denied HTTP Profile" }
+        }
+      );
+
+      if (deniedProfile.status === 403) {
+        pass("HTTP ordinary user denied profile update");
+      } else if (deniedProfile.status === 404) {
+        console.log("SKIP: HTTP profile denial — restart backend to load PUT route");
+      } else {
+        fail(
+          "HTTP ordinary user denied profile update",
+          String(deniedProfile.status)
+        );
+      }
+    }
+  } catch (error) {
+    fail("profile update suite", error.message);
+  } finally {
+    await cleanupProvisionedUser(profileCode);
+  }
+
   if (disposableUaCode) {
     await cleanupProvisionedUser(disposableUaCode);
   }
