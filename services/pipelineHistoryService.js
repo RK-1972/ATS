@@ -65,64 +65,46 @@ async function applyEnterpriseInterviewStageTransition(pool, {
   comments = null,
   metadata = null
 }) {
-  const mapping = await loadActiveEnterpriseMapping(pool, mapId);
-  if (!mapping) {
+  const recruitmentService = require("./recruitmentService");
+
+  const actorReq = {
+    user: {
+      full_name: user?.name || user?.full_name || "System User",
+      role_name: user?.role || user?.role_name || "Admin",
+      email_id: user?.email_id || user?.name || null
+    }
+  };
+
+  const result = await recruitmentService.applyGovernedCandidateStageTransition(
+    pool,
+    mapId,
+    newStage,
+    comments || "",
+    actorReq,
+    {
+      pipelineEventType: eventType,
+      skipIfUnchanged: true,
+      useOperationalStageName: true,
+      historyMetadata: metadata || undefined
+    }
+  );
+
+  if (!result) {
     return null;
   }
 
-  const previousStage = mapping.stage_name || null;
-  const normalizedPrevious = String(previousStage || "").trim();
-  const normalizedNext = String(newStage || "").trim();
-
-  if (normalizedPrevious === normalizedNext) {
+  if (result.skipped) {
     return {
-      mapping,
-      previousStage,
+      mapping: result.mapping,
+      previousStage: result.mapping?.stage_name,
       toStage: newStage,
       historyRecorded: false
     };
   }
 
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    await client.query(
-      `UPDATE rm_candidate_mappings
-       SET stage_name = $1, modified_on = NOW()
-       WHERE map_id = $2`,
-      [newStage, mapId]
-    );
-
-    await module.exports.recordPipelineStageTransition(client, {
-      requisitionCode: mapping.requisition_code,
-      mappingId: mapping.mapping_id,
-      candidateId: mapping.candidate_id,
-      eventType,
-      fromStage: previousStage,
-      toStage: newStage,
-      actor: user.name,
-      actorRole: user.role,
-      comments,
-      metadata
-    });
-
-    await client.query("COMMIT");
-  } catch (error) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_rollbackError) {
-      // ignore rollback failures
-    }
-    throw error;
-  } finally {
-    client.release();
-  }
-
   return {
-    mapping,
-    previousStage,
+    mapping: result.mapping,
+    previousStage: result.mapping?.stage_name,
     toStage: newStage,
     historyRecorded: true
   };

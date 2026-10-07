@@ -2786,7 +2786,7 @@ async function completeTask(queryable, taskId, req, options = {}) {
   }
 }
 
-async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
+async function reassignTask(pool, taskId, assignee, req, assigneeRole = null, txOptions = null) {
   const user = userContext(req);
   const nextAssignee = assignee ? String(assignee).trim() : "";
 
@@ -2794,10 +2794,14 @@ async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
     throw httpError("assignee is required for reassignment.", 400);
   }
 
-  const client = await pool.connect();
+  const externalClient = txOptions?.client || null;
+  const client = externalClient || (await pool.connect());
+  const manageTx = !externalClient;
 
   try {
-    await client.query("BEGIN");
+    if (manageTx) {
+      await client.query("BEGIN");
+    }
 
     const taskResult = await client.query(
       "SELECT * FROM wf_tasks WHERE task_id = $1 FOR UPDATE",
@@ -2857,7 +2861,9 @@ async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
       }
     });
 
-    await client.query("COMMIT");
+    if (manageTx) {
+      await client.query("COMMIT");
+    }
 
     return {
       taskId,
@@ -2867,14 +2873,18 @@ async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
       assignmentId: insertResult.rows[0]?.assignment_id || null
     };
   } catch (error) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_rollbackError) {
-      // Preserve original error
+    if (manageTx) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_rollbackError) {
+        // Preserve original error
+      }
     }
     throw error;
   } finally {
-    client.release();
+    if (!externalClient) {
+      client.release();
+    }
   }
 }
 

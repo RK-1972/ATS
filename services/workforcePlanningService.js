@@ -1425,6 +1425,22 @@ function nextBudgetRequestId(draft) {
  * entry, no workflow, no normalized wp_* writes — those happen on Submit
  * (later step) and final approval respectively.
  */
+function assertBudgetRequestDraftNumericFields(payload = {}) {
+  const headcount = Number(payload.headcount);
+  if (
+    !Number.isFinite(headcount) ||
+    !Number.isInteger(headcount) ||
+    headcount < 1
+  ) {
+    throw httpError("headcount must be a whole number of at least 1.", 400);
+  }
+
+  const proposedBudget = Number(payload.proposed_budget);
+  if (!Number.isFinite(proposedBudget) || proposedBudget <= 0) {
+    throw httpError("proposed_budget must be greater than 0.", 400);
+  }
+}
+
 async function createBudgetRequest(pool, payload, req) {
   await assertCanRaiseBudgetRequest(pool, req);
 
@@ -1432,19 +1448,21 @@ async function createBudgetRequest(pool, payload, req) {
   const row = await ensureConfigState(pool);
   const draft = clonePayload(row.draft_payload);
 
+  if (!String(payload.department || "").trim() || !String(payload.position || "").trim()) {
+    throw httpError("Department and Position Title are required.", 400);
+  }
+
+  assertBudgetRequestDraftNumericFields(payload);
+
   const request = {
     department: String(payload.department || "").trim(),
     position: String(payload.position || "").trim(),
     grade: String(payload.grade || "").trim(),
-    headcount: Number(payload.headcount) || 1,
-    proposed_budget: Number(payload.proposed_budget) || 0,
+    headcount: Number(payload.headcount),
+    proposed_budget: Number(payload.proposed_budget),
     justification: String(payload.justification || "").trim(),
     priority: payload.priority || "Medium"
   };
-
-  if (!request.department || !request.position) {
-    throw httpError("Department and Position Title are required.", 400);
-  }
 
   const mdValidation = await validateMasterDataReferences(pool, request);
   if (!mdValidation.valid) {

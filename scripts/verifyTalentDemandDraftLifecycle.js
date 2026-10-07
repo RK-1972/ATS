@@ -89,22 +89,71 @@ async function resolveForeignRecruiter(excludeCode) {
 }
 
 async function findAvailableApprovedPosition(client) {
-  const state = await client.query(
-    `SELECT draft_payload FROM wp_config_state WHERE id = 1`
+  const result = await client.query(
+    `SELECT position_id, position_title, status
+     FROM wp_approved_positions
+     WHERE COALESCE(status, '') <> 'Fully Utilized'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM rm_requisitions r
+         WHERE r.approved_position_id = wp_approved_positions.position_id
+       )
+     ORDER BY modified_on DESC NULLS LAST, position_id DESC
+     LIMIT 1`
   );
-  const positions = state.rows[0]?.draft_payload?.approved_positions || [];
 
-  for (const position of positions) {
-    const consumed = await client.query(
-      `SELECT 1 FROM rm_requisitions WHERE approved_position_id = $1 LIMIT 1`,
-      [position.id]
-    );
-    if (!consumed.rows.length) {
-      return position;
-    }
+  const row = result.rows[0];
+  if (!row) {
+    return null;
   }
 
-  return null;
+  return {
+    id: row.position_id,
+    position_title: row.position_title,
+    title: row.position_title,
+    status: row.status
+  };
+}
+
+async function bootstrapVerificationApprovedPosition(client) {
+  const template = await client.query(
+    `SELECT department, grade
+     FROM wp_approved_positions
+     WHERE department IS NOT NULL
+       AND grade IS NOT NULL
+     ORDER BY modified_on DESC NULLS LAST
+     LIMIT 1`
+  );
+  const department = template.rows[0]?.department;
+  const grade = template.rows[0]?.grade;
+
+  if (!department || !grade) {
+    return null;
+  }
+
+  const positionId = `TD-D1-${Date.now()}`;
+  await client.query(
+    `INSERT INTO wp_approved_positions (
+      position_id,
+      department,
+      position_title,
+      grade,
+      headcount,
+      budget_approved,
+      budget_consumed,
+      remaining_budget,
+      status
+    ) VALUES ($1, $2, $3, $4, $5, $6, 0, $6, 'Active')`,
+    [positionId, department, "D1 Draft Lifecycle Verify", grade, 1, 1000000]
+  );
+
+  return {
+    id: positionId,
+    position_title: "D1 Draft Lifecycle Verify",
+    title: "D1 Draft Lifecycle Verify",
+    status: "Active",
+    bootstrapped: true
+  };
 }
 
 async function resolveRequisitionApprovalRoute(client) {
@@ -189,20 +238,30 @@ async function main() {
   let requisitionCode = null;
 
   try {
-    const position = await findAvailableApprovedPosition(client);
+    await client.query(
+      `DELETE FROM wp_approved_positions p
+       WHERE p.position_id LIKE 'TD-D1-%'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM rm_requisitions r
+           WHERE r.approved_position_id = p.position_id
+         )`
+    );
+
+    let position = await findAvailableApprovedPosition(client);
     const approvalRouteId = await resolveRequisitionApprovalRoute(client);
 
     if (!position?.id) {
-      skip("draft submit path", "no unconsumed approved position");
-      await client.release();
-      await pool.end();
-      return;
+      position = await bootstrapVerificationApprovedPosition(client);
+      if (!position?.id) {
+        skip("draft submit path", "no eligible approved position and bootstrap template missing");
+        return;
+      }
+      pass(`fixtures: bootstrapped approved position ${position.id}`);
     }
 
     if (!approvalRouteId) {
       fail("fixtures", "no active requisition approval route");
-      await client.release();
-      await pool.end();
       return;
     }
 
@@ -250,7 +309,7 @@ async function main() {
       employment_type: defaults.employment_type,
       priority_level: defaults.priority_level,
       target_date: defaults.target_date,
-      openings_count: 1,
+      openings_count: 3,
       experience_min: 2,
       experience_max: 8
     };
@@ -315,6 +374,27 @@ async function main() {
       fail("draft submit", "missing requisition code in submit result");
     } else {
       pass(`draft submit creates requisition (${requisitionCode})`);
+    }
+
+    const reqNumericRow = await client.query(
+      `SELECT headcount, experience_min, experience_max
+       FROM rm_requisitions
+       WHERE requisition_code = $1
+       LIMIT 1`,
+      [requisitionCode]
+    );
+    const reqNumeric = reqNumericRow.rows[0] || {};
+    const headcountOk = Number(reqNumeric.headcount) === payload.openings_count;
+    const expMinOk = Number(reqNumeric.experience_min) === payload.experience_min;
+    const expMaxOk = Number(reqNumeric.experience_max) === payload.experience_max;
+
+    if (!headcountOk || !expMinOk || !expMaxOk) {
+      fail(
+        "D1 draft fields on rm_requisitions",
+        `headcount=${reqNumeric.headcount}, experience_min=${reqNumeric.experience_min}, experience_max=${reqNumeric.experience_max}`
+      );
+    } else {
+      pass("D1 draft openings/experience persisted on rm_requisitions");
     }
 
     const submittedDraft = await talentDemandDraftService.getDraft(pool, draftId, requestor);

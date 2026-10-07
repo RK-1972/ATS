@@ -183,5 +183,6 @@ module.exports = {
   assertPortalIntakeReviewQueueAccess,
   canAccessPortalIntakeReviewQueue,
   assertCandidateReadAccess,
+  loadCandidateAccessRow,
   listAuthorizedCandidateMasters
 };

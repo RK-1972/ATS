@@ -22,7 +22,9 @@ function handleError(res, error) {
 
     success: false,
 
-    message: error.message || "Internal server error"
+    message: error.message || "Internal server error",
+
+    data: error.data || undefined
 
   });
 
@@ -306,7 +308,9 @@ function registerUserProvisioningRoutes(app, pool, verifyToken) {
 
       try {
 
-        const data = await userProvisioningService.changeUserStatus(
+        const employeeLifecycleService = require("../services/employeeLifecycleService");
+
+        const data = await employeeLifecycleService.deactivateEmployee(
 
           pool,
 
@@ -314,7 +318,15 @@ function registerUserProvisioningRoutes(app, pool, verifyToken) {
 
           req.params.employeeCode,
 
-          { is_active: false, reason: req.body?.reason }
+          {
+
+            reason: req.body?.reason,
+
+            emergency: req.body?.emergency === true,
+
+            resolutions: req.body?.resolutions
+
+          }
 
         );
 
@@ -324,9 +336,11 @@ function registerUserProvisioningRoutes(app, pool, verifyToken) {
 
           success: true,
 
-          message:
+          message: req.body?.emergency
 
-            "User deactivated successfully. Active sessions for this account are no longer authorized.",
+            ? "User emergency-deactivated. Open responsibility clearance is required."
+
+            : "User deactivated successfully. Active sessions for this account are no longer authorized.",
 
           data
 

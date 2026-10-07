@@ -183,7 +183,8 @@ async function main() {
       current_company: profile.current_company || "",
       designation: profile.designation || "",
       experience: profile.experience || "5",
-      skills: profile.skills || "Java, SQL"
+      skills: profile.skills || "Java, SQL",
+      pan_number: `BATCH${String(uniqueSuffix).slice(-4).padStart(4, "0")}Z`
     })
   });
 

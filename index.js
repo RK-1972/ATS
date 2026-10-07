@@ -41,6 +41,7 @@ const {
 const {
   respondClassicCandidateRouteDeprecated
 } = require("./utils/classicCandidateRouteDeprecation");
+const candidateRegistrationValidation = require("./services/candidateRegistrationValidation");
 
 const app = express();
 
@@ -1483,8 +1484,58 @@ app.post(
         created_by
 
       } = req.body;
-      console.log("PAN RECEIVED:");
-      console.log(pan_number);
+
+      const normalizedPan =
+        candidateRegistrationValidation.normalizePan(pan_number);
+      const targetStatus = String(
+        candidate_status || "To be screened"
+      )
+        .trim()
+        .toUpperCase();
+
+      if (normalizedPan) {
+        const panFormatCheck =
+          candidateRegistrationValidation.validatePanFormat(normalizedPan);
+
+        if (!panFormatCheck.valid) {
+          return res.status(400).json({
+            success: false,
+            message: panFormatCheck.message
+          });
+        }
+
+        try {
+          await candidateRegistrationValidation.assertNoDuplicateRegisteredPan(
+            pool,
+            normalizedPan
+          );
+        } catch (duplicateError) {
+          return res.status(duplicateError.status || 409).json({
+            success: false,
+            message: duplicateError.message,
+            code: duplicateError.code || undefined
+          });
+        }
+      }
+
+      if (
+        candidateRegistrationValidation.isRegisteredStatus(targetStatus)
+      ) {
+        const registrationErrors =
+          candidateRegistrationValidation.validateForRegisteredStatus({
+            email_id,
+            mobile_number,
+            pan_number: normalizedPan
+          });
+
+        if (registrationErrors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: registrationErrors.join(" ")
+          });
+        }
+      }
+
       let resumePath = null;
 
 
@@ -1554,7 +1605,7 @@ app.post(
           first_name,
           last_name,
           email_id,
-          pan_number,
+          normalizedPan,
           mobile_number,
           total_experience || null,
           relevant_experience || null,
@@ -1600,6 +1651,23 @@ app.post(
       console.log("❌ Candidate Creation Error");
 
       console.log(error);
+
+      if (error.status === 409) {
+        return res.status(409).json({
+          success: false,
+          message: error.message,
+          code: error.code || undefined
+        });
+      }
+
+      if (error.code === "23505") {
+        return res.status(409).json({
+          success: false,
+          message:
+            candidateRegistrationValidation.DUPLICATE_REGISTERED_PAN_MESSAGE,
+          code: "DUPLICATE_REGISTERED_PAN"
+        });
+      }
 
       res.status(500).json({
 
@@ -2082,6 +2150,80 @@ app.put(
           ? null
           : registrationEmployeeCode;
 
+      let panForUpdate = existing.pan_number;
+
+      if (hasBodyField("pan_number")) {
+        try {
+          panForUpdate = candidateRegistrationValidation.assertPanImmutable(
+            existing.pan_number,
+            req.body.pan_number
+          );
+        } catch (panError) {
+          return res.status(panError.status || 400).json({
+            success: false,
+            message: panError.message
+          });
+        }
+
+        if (panForUpdate) {
+          const panFormatCheck =
+            candidateRegistrationValidation.validatePanFormat(panForUpdate);
+
+          if (!panFormatCheck.valid) {
+            return res.status(400).json({
+              success: false,
+              message: panFormatCheck.message
+            });
+          }
+        }
+      }
+
+      if (isDraftRegistration) {
+        const registrationErrors =
+          candidateRegistrationValidation.validateForRegisteredStatus({
+            email_id: resolveField("email_id"),
+            mobile_number: resolveField("mobile_number"),
+            pan_number:
+              panForUpdate ||
+              candidateRegistrationValidation.normalizePan(
+                hasBodyField("pan_number")
+                  ? req.body.pan_number
+                  : existing.pan_number
+              )
+          });
+
+        if (registrationErrors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: registrationErrors.join(" ")
+          });
+        }
+
+        try {
+          await candidateRegistrationValidation.assertNoDuplicateRegisteredPan(
+            pool,
+            panForUpdate ||
+              candidateRegistrationValidation.normalizePan(
+                req.body.pan_number
+              ),
+            candidateId
+          );
+        } catch (duplicateError) {
+          return res.status(duplicateError.status || 409).json({
+            success: false,
+            message: duplicateError.message,
+            code: duplicateError.code || undefined
+          });
+        }
+      } else if (
+        candidateRegistrationValidation.isRegisteredStatus(
+          existing.candidate_status
+        ) &&
+        hasBodyField("pan_number")
+      ) {
+        // assertPanImmutable already enforced above.
+      }
+
       const result = await pool.query(
 
         `
@@ -2127,6 +2269,8 @@ SET
     owner_employee_code = CASE WHEN $31 THEN $34 ELSE owner_employee_code END,
     registered_by       = CASE WHEN $31 THEN $32 ELSE registered_by END,
     registered_on       = CASE WHEN $31 THEN CURRENT_TIMESTAMP ELSE registered_on END,
+
+    pan_number          = COALESCE($35, pan_number),
 
     updated_on      = CURRENT_TIMESTAMP
 
@@ -2182,7 +2326,11 @@ RETURNING *
     isDraftRegistration,
     registrationEmployeeCode,
     candidateContainer,
-    registrationOwnerEmployeeCode
+    registrationOwnerEmployeeCode,
+    hasBodyField("pan_number") || isDraftRegistration
+      ? panForUpdate ||
+        candidateRegistrationValidation.normalizePan(req.body.pan_number)
+      : null
 ]
 
       );
@@ -7485,7 +7633,10 @@ registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin);
 registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin);
 registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerTaskRoutes(app, pool, verifyToken);
-registerInterviewRoutes(app, pool, verifyToken);
+registerInterviewRoutes(app, pool, verifyToken, {
+  createInterviewMeeting,
+  sendInterviewEmail
+});
 registerOfferRoutes(app, pool, verifyToken);
 registerOfferLetterRoutes(app, pool, verifyToken);
 registerCompensationRoutes(app, pool, verifyToken);
@@ -7494,6 +7645,8 @@ registerPlaceholderRoutes(app, verifyToken);
 registerDocumentRoutes(app, pool, verifyToken);
 registerUserPermissionRoutes(app, pool, verifyToken, verifyAdmin);
 registerUserProvisioningRoutes(app, pool, verifyToken);
+const { registerEmployeeLifecycleRoutes } = require("./routes/employeeLifecycleRoutes");
+registerEmployeeLifecycleRoutes(app, pool, verifyToken);
 registerTalentDemandDraftRoutes(app, pool, verifyToken);
 registerWorkAssignmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerHiringControlTowerRoutes(app, pool, verifyToken, verifyAdmin);

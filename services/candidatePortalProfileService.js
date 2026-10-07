@@ -3,6 +3,12 @@ const {
   PORTAL_SOURCE_REFERENCE_PREFIX,
   applyParsedResumeToDraftCandidate
 } = require("./candidateDraftService");
+const candidateRegistrationValidation = require("./candidateRegistrationValidation");
+const {
+  writeEnterpriseAudit
+} = require("./enterpriseAuditService");
+
+const PORTAL_RESUBMISSION_LABEL = "Updated profile from candidate";
 
 function buildPortalSourceReference(candidateId) {
   return `${PORTAL_SOURCE_REFERENCE_PREFIX}${candidateId}`;
@@ -132,7 +138,14 @@ async function listIntakeReviewQueue(pool) {
       c.profile_completion,
       c.resume_path,
       c.candidate_status,
-      c.candidate_source_code
+      c.candidate_source_code,
+      c.pan_number,
+      CASE
+        WHEN UPPER(c.candidate_status) = 'REGISTERED'
+          AND i.review_status = 'SUBMITTED'
+        THEN $2
+        ELSE NULL
+      END AS submission_label
     FROM rm_candidate_intake i
     JOIN cand_mstr c
       ON c.candidate_id = COALESCE(
@@ -151,17 +164,23 @@ async function listIntakeReviewQueue(pool) {
       (
         i.source_reference LIKE $1
         AND i.review_status = 'SUBMITTED'
+        AND UPPER(c.candidate_status) = 'DRAFT'
       )
       OR (
         i.parsing_status = 'COMPLETED'
         AND i.created_draft_id IS NOT NULL
         AND i.review_status = 'PENDING'
+        AND UPPER(c.candidate_status) = 'DRAFT'
+      )
+      OR (
+        i.source_reference LIKE $1
+        AND i.review_status = 'SUBMITTED'
+        AND UPPER(c.candidate_status) = 'REGISTERED'
       )
     )
-      AND UPPER(c.candidate_status) = 'DRAFT'
     ORDER BY i.created_on DESC
     `,
-    [`${PORTAL_SOURCE_REFERENCE_PREFIX}%`]
+    [`${PORTAL_SOURCE_REFERENCE_PREFIX}%`, PORTAL_RESUBMISSION_LABEL]
   );
 
   return result.rows;
@@ -562,7 +581,7 @@ function createCandidatePortalProfileService(pool, parserDeps) {
     }
   }
 
-  function validateProfilePayload(profile = {}) {
+  function validateProfilePayload(profile = {}, { requirePan = true } = {}) {
     const errors = {};
 
     if (!String(profile.first_name || "").trim()) {
@@ -573,34 +592,79 @@ function createCandidatePortalProfileService(pool, parserDeps) {
       errors.last_name = "Last name is required.";
     }
 
-    const email = String(profile.email || profile.email_id || "").trim();
-    const mobile = String(profile.mobile || profile.mobile_number || "").trim();
+    candidateRegistrationValidation
+      .validateRegisteredContactFields({
+        email_id: profile.email || profile.email_id,
+        mobile_number: profile.mobile || profile.mobile_number
+      })
+      .forEach((message) => {
+        if (message.includes("email")) {
+          errors.email = message;
+        } else if (message.includes("mobile")) {
+          errors.mobile = message;
+        }
+      });
 
-    if (!email && !mobile) {
-      const contactMessage = "Enter email or mobile.";
-      errors.email = contactMessage;
-      errors.mobile = contactMessage;
+    if (requirePan) {
+      const panCheck = candidateRegistrationValidation.validatePanFormat(
+        profile.pan_number || profile.pan
+      );
+
+      if (!panCheck.valid) {
+        errors.pan_number = panCheck.message;
+      }
     }
 
     return errors;
   }
 
-  async function saveCandidateProfile(candidateId, profileInput = {}) {
+  async function resubmitRegisteredCandidateProfile(
+    candidateId,
+    profileInput = {}
+  ) {
     const candidate = await getOwnedCandidate(candidateId);
 
     if (!candidate) {
       return { ok: false, status: 404, message: "Candidate profile not found" };
     }
 
-    if (String(candidate.candidate_status || "").toUpperCase() !== "DRAFT") {
+    if (
+      !candidateRegistrationValidation.isRegisteredStatus(
+        candidate.candidate_status
+      )
+    ) {
       return {
         ok: false,
         status: 409,
-        message: "Only draft candidate profiles can be updated."
+        message: "Only registered candidates can resubmit an updated profile."
       };
     }
 
-    const validationErrors = validateProfilePayload(profileInput);
+    if (
+      profileInput.pan_number !== undefined ||
+      profileInput.pan !== undefined
+    ) {
+      try {
+        candidateRegistrationValidation.assertPanImmutable(
+          candidate.pan_number,
+          profileInput.pan_number || profileInput.pan
+        );
+      } catch (panError) {
+        return {
+          ok: false,
+          status: panError.status || 400,
+          message: panError.message
+        };
+      }
+    }
+
+    const validationErrors = validateProfilePayload(
+      {
+        ...profileInput,
+        pan_number: candidate.pan_number
+      },
+      { requirePan: true }
+    );
 
     if (Object.keys(validationErrors).length > 0) {
       return {
@@ -630,6 +694,196 @@ function createCandidatePortalProfileService(pool, parserDeps) {
           primary_skill = COALESCE(NULLIF($8, ''), primary_skill),
           updated_on = NOW()
         WHERE candidate_id = $9
+          AND UPPER(candidate_status) = 'REGISTERED'
+        RETURNING *
+        `,
+        [
+          String(profileInput.first_name || "").trim(),
+          String(profileInput.last_name || "").trim(),
+          String(profileInput.email || profileInput.email_id || "").trim(),
+          String(profileInput.mobile || profileInput.mobile_number || "").trim(),
+          String(profileInput.current_company || "").trim() || null,
+          String(profileInput.designation || profileInput.current_designation || "").trim() ||
+            null,
+          normalizeExperience(
+            profileInput.experience ?? profileInput.total_experience
+          ),
+          String(profileInput.skills || profileInput.primary_skill || "").trim() ||
+            null,
+          candidateId
+        ]
+      );
+
+      if (updateResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return {
+          ok: false,
+          status: 409,
+          message: "Candidate profile cannot be updated in the current status."
+        };
+      }
+
+      const profileCompletion = calculateProfileCompletion(updateResult.rows[0]);
+
+      await client.query(
+        `
+        UPDATE cand_mstr
+        SET profile_completion = $1
+        WHERE candidate_id = $2
+        `,
+        [profileCompletion, candidateId]
+      );
+
+      const sourceId = await resolvePortalSourceId();
+
+      await client.query(
+        `
+        INSERT INTO rm_candidate_intake (
+          source_id,
+          source_reference,
+          intake_status,
+          parsing_status,
+          review_status
+        )
+        VALUES ($1, $2, 'COMPLETED', 'COMPLETED', 'SUBMITTED')
+        `,
+        [sourceId, buildPortalSourceReference(candidateId)]
+      );
+
+      await client.query(
+        `
+        UPDATE candidate_portal_account
+        SET
+          full_name = $1,
+          mobile_number = COALESCE(NULLIF($2, ''), mobile_number),
+          updated_on = NOW()
+        WHERE candidate_id = $3
+        `,
+        [
+          `${String(profileInput.first_name || "").trim()} ${String(
+            profileInput.last_name || ""
+          ).trim()}`.trim(),
+          String(profileInput.mobile || profileInput.mobile_number || "").trim(),
+          candidateId
+        ]
+      );
+
+      await writeEnterpriseAudit(client, {
+        eventType: "CANDIDATE_PROFILE",
+        module: "Candidate Portal",
+        entity: "cand_mstr",
+        entityId: String(candidateId),
+        action: PORTAL_RESUBMISSION_LABEL,
+        userName: candidate.email_id || "Candidate",
+        userRole: "Candidate",
+        metadata: {
+          submission_label: PORTAL_RESUBMISSION_LABEL,
+          candidate_id: candidateId
+        }
+      });
+
+      await client.query("COMMIT");
+
+      return {
+        ok: true,
+        data: {
+          candidate: updateResult.rows[0],
+          profile_completion: profileCompletion,
+          profile_status: PORTAL_RESUBMISSION_LABEL,
+          submission_label: PORTAL_RESUBMISSION_LABEL
+        }
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function saveCandidateProfile(candidateId, profileInput = {}) {
+    const candidate = await getOwnedCandidate(candidateId);
+
+    if (!candidate) {
+      return { ok: false, status: 404, message: "Candidate profile not found" };
+    }
+
+    const status = String(candidate.candidate_status || "").trim().toUpperCase();
+
+    if (profileInput.resubmit === true) {
+      if (!candidateRegistrationValidation.isRegisteredStatus(status)) {
+        return {
+          ok: false,
+          status: 409,
+          message:
+            "Profile resubmission is only available for registered candidates."
+        };
+      }
+
+      return resubmitRegisteredCandidateProfile(candidateId, profileInput);
+    }
+
+    if (status !== "DRAFT") {
+      return {
+        ok: false,
+        status: 409,
+        message: "Only draft candidate profiles can be updated."
+      };
+    }
+
+    const validationErrors = validateProfilePayload(profileInput, {
+      requirePan: true
+    });
+
+    if (Object.keys(validationErrors).length > 0) {
+      return {
+        ok: false,
+        status: 400,
+        message: "Profile validation failed",
+        errors: validationErrors
+      };
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const normalizedPan = candidateRegistrationValidation.normalizePan(
+        profileInput.pan_number || profileInput.pan
+      );
+
+      try {
+        await candidateRegistrationValidation.assertNoDuplicateRegisteredPan(
+          client,
+          normalizedPan,
+          candidateId
+        );
+      } catch (duplicateError) {
+        await client.query("ROLLBACK");
+        return {
+          ok: false,
+          status: duplicateError.status || 409,
+          message: duplicateError.message,
+          code: duplicateError.code || undefined
+        };
+      }
+
+      const updateResult = await client.query(
+        `
+        UPDATE cand_mstr
+        SET
+          first_name = $1,
+          last_name = $2,
+          email_id = COALESCE(NULLIF($3, ''), email_id),
+          mobile_number = COALESCE(NULLIF($4, ''), mobile_number),
+          pan_number = COALESCE($5, pan_number),
+          current_company = COALESCE(NULLIF($6, ''), current_company),
+          current_designation = COALESCE(NULLIF($7, ''), current_designation),
+          total_experience = COALESCE($8, total_experience),
+          primary_skill = COALESCE(NULLIF($9, ''), primary_skill),
+          updated_on = NOW()
+        WHERE candidate_id = $10
           AND UPPER(candidate_status) = 'DRAFT'
         RETURNING *
         `,
@@ -638,6 +892,7 @@ function createCandidatePortalProfileService(pool, parserDeps) {
           String(profileInput.last_name || "").trim(),
           String(profileInput.email || profileInput.email_id || "").trim(),
           String(profileInput.mobile || profileInput.mobile_number || "").trim(),
+          normalizedPan,
           String(profileInput.current_company || "").trim() || null,
           String(profileInput.designation || profileInput.current_designation || "").trim() || null,
           normalizeExperience(profileInput.experience ?? profileInput.total_experience),
@@ -776,6 +1031,7 @@ function createCandidatePortalProfileService(pool, parserDeps) {
 }
 
 module.exports = {
+  PORTAL_RESUBMISSION_LABEL,
   PORTAL_SOURCE_REFERENCE_PREFIX,
   listIntakeReviewQueue,
   isCandidateInIntakeReviewQueue,

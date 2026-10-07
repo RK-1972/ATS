@@ -54,7 +54,12 @@ function mapTaskRow(row) {
   };
 }
 
-async function createTask(pool, payload, req) {
+function resolveTaskQueryable(pool, txOptions) {
+  return txOptions?.client || pool;
+}
+
+async function createTask(pool, payload, req, txOptions = null) {
+  const queryable = resolveTaskQueryable(pool, txOptions);
   const user = userContext(req);
   const slaHours = payload.slaHours || 24;
   const dueAt = payload.dueAt ? new Date(payload.dueAt) : addHours(new Date(), slaHours);
@@ -62,7 +67,7 @@ async function createTask(pool, payload, req) {
   let workflowTaskId = null;
 
   if (payload.workflowInstanceId) {
-    workflowTaskId = await workflowService.createTask(pool, payload.workflowInstanceId, {
+    workflowTaskId = await workflowService.createTask(queryable, payload.workflowInstanceId, {
       stageKey: payload.stageKey || payload.taskType,
       taskType: payload.taskType,
       title: payload.title,
@@ -73,7 +78,7 @@ async function createTask(pool, payload, req) {
     });
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `INSERT INTO et_tasks (
       module, task_type, title, status, priority, assignee, assignee_role,
       due_at, sla_hours, workflow_instance_id, workflow_task_id,
@@ -103,7 +108,7 @@ async function createTask(pool, payload, req) {
   const task = mapTaskRow(result.rows[0]);
 
   await recordTaskHistory(
-    pool,
+    queryable,
     task.taskId,
     "TaskCreated",
     user.name,
@@ -114,7 +119,7 @@ async function createTask(pool, payload, req) {
     payload.metadata
   );
 
-  await writeEnterpriseAudit(pool, {
+  await writeEnterpriseAudit(queryable, {
     eventType: "TaskCreated",
     module: payload.module || "Enterprise Task Inbox",
     entity: "Task",

@@ -333,6 +333,23 @@ async function assignWorkAssignment(
     throw httpError("work_assignment_id is required.", 400);
   }
 
+  const code = String(employeeCode).trim();
+  const employeeResult = await pool.query(
+    `SELECT employee_code, is_active FROM user_mstr WHERE employee_code = $1`,
+    [code]
+  );
+
+  if (!employeeResult.rows.length) {
+    throw httpError(`Employee not found: ${code}`, 404);
+  }
+
+  if (employeeResult.rows[0].is_active !== true) {
+    throw httpError(
+      "Cannot assign work assignments to an inactive employee.",
+      400
+    );
+  }
+
   const workAssignment = await workAssignmentRepository.getWorkAssignmentById(
     pool,
     workAssignmentId

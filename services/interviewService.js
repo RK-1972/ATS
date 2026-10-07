@@ -5,7 +5,6 @@ const taskService = require("./taskService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled, isEnterpriseOperationalSor } = require("../config/operationalCutover");
 const { normalizeRating, formatRatingLabel } = require("./operationalMigrationService");
-const { applyEnterpriseInterviewStageTransition } = require("./pipelineHistoryService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "interviews.seed.json");
 
@@ -458,27 +457,35 @@ async function scheduleInterview(pool, payload, req) {
   });
 
   const stageName = stageNameForRound(roundType);
-  if (isLegacyDualWriteEnabled() && (await tableExists(pool, "candidate_req_map"))) {
+
+  if (isEnterpriseOperationalSor() && enterpriseMap.rows.length) {
+    const recruitmentService = require("./recruitmentService");
+    await recruitmentService.applyGovernedCandidateStageTransition(
+      pool,
+      mapId,
+      stageName,
+      remarks || "",
+      req,
+      {
+        pipelineEventType: "InterviewScheduledStage",
+        skipIfUnchanged: true,
+        useOperationalStageName: true,
+        historyMetadata: {
+          interviewId,
+          roundType,
+          reqId: resolvedReqId,
+          ruleEvaluation: ruleEval
+        }
+      }
+    );
+  } else if (
+    isLegacyDualWriteEnabled()
+    && (await tableExists(pool, "candidate_req_map"))
+  ) {
     await pool.query(
       "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
       [stageName, mapId]
     );
-  }
-
-  if (isEnterpriseOperationalSor() && enterpriseMap.rows.length) {
-    await applyEnterpriseInterviewStageTransition(pool, {
-      mapId,
-      newStage: stageName,
-      eventType: "InterviewScheduledStage",
-      user,
-      comments: remarks || null,
-      metadata: {
-        interviewId,
-        roundType,
-        reqId: resolvedReqId,
-        ruleEvaluation: ruleEval
-      }
-    });
   }
 
   return {
@@ -517,6 +524,173 @@ async function linkLegacySchedule(pool, interviewId, scheduleId, meetingLink, te
   );
 
   return getInterview(pool, interviewId);
+}
+
+async function resolveActiveInterviewPanelRow(pool, interviewerId) {
+  if (
+    interviewerId === null
+    || interviewerId === undefined
+    || String(interviewerId).trim() === ""
+  ) {
+    return {};
+  }
+
+  if (!(await tableExists(pool, "interview_panel_mstr"))) {
+    return {};
+  }
+
+  const panelResult = await pool.query(
+    `SELECT panel_id, interviewer_name, email_id, interviewer_type
+     FROM interview_panel_mstr
+     WHERE panel_id = $1
+       AND is_active = true`,
+    [interviewerId]
+  );
+
+  if (!panelResult.rows.length) {
+    throw httpError("Interviewer not found or inactive", 404);
+  }
+
+  return panelResult.rows[0];
+}
+
+async function loadCandidateContactForInterviewMap(pool, mapId) {
+  let candidateResult = await pool.query(
+    `SELECT CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+            cm.email_id AS candidate_email
+     FROM cand_mstr cm
+     INNER JOIN rm_candidate_mappings rcm ON rcm.candidate_id = cm.candidate_id
+     WHERE rcm.map_id = $1
+       AND rcm.is_active = true`,
+    [mapId]
+  ).catch(() => ({ rows: [] }));
+
+  if (!candidateResult.rows.length && (await tableExists(pool, "candidate_req_map"))) {
+    candidateResult = await pool.query(
+      `SELECT CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+              cm.email_id AS candidate_email
+       FROM cand_mstr cm
+       INNER JOIN candidate_req_map crm ON crm.candidate_id = cm.candidate_id
+       WHERE crm.map_id = $1`,
+      [mapId]
+    ).catch(() => ({ rows: [] }));
+  }
+
+  return candidateResult.rows[0] || {};
+}
+
+/**
+ * Canonical interview schedule — enterprise SoR plus optional Teams/email/legacy trn.
+ */
+async function scheduleInterviewCanonical(pool, body, req, helpers = {}) {
+  const panelRow = await resolveActiveInterviewPanelRow(pool, body.interviewer_id);
+
+  const enterprise = await scheduleInterview(
+    pool,
+    {
+      ...body,
+      interviewer_name: body.interviewer_name || panelRow.interviewer_name,
+      interviewer_email: body.interviewer_email || panelRow.email_id,
+      interviewer_type: body.interviewer_type || panelRow.interviewer_type
+    },
+    req
+  );
+
+  let teamsLink = null;
+  let teamsEventId = null;
+  let legacyScheduleRow = null;
+
+  if (helpers.createInterviewMeeting) {
+    const candidateContact = await loadCandidateContactForInterviewMap(
+      pool,
+      body.map_id
+    );
+    const candidateName = candidateContact.candidate_name;
+    const candidateEmail = candidateContact.candidate_email;
+
+    try {
+      const meeting = await helpers.createInterviewMeeting(
+        body.interview_date,
+        body.interview_time,
+        body.round_type,
+        candidateName,
+        candidateEmail,
+        panelRow.email_id,
+        req.user?.email_id
+      );
+      teamsLink = meeting?.joinUrl || meeting?.teamsLink || null;
+      teamsEventId = meeting?.eventId || meeting?.teamsEventId || null;
+
+      const recruiterEmail = req.user?.email_id || null;
+      const interviewNotificationService = require("./interviewNotificationService");
+
+      if (
+        helpers.sendInterviewEmail
+        && candidateEmail
+        && candidateName
+        && recruiterEmail
+      ) {
+        await interviewNotificationService.notifyInterviewScheduled(
+          pool,
+          {
+            interviewId: enterprise.interviewId,
+            candidateEmail,
+            candidateName,
+            roundType: body.round_type,
+            interviewDate: body.interview_date,
+            interviewTime: body.interview_time,
+            teamsLink,
+            recruiterEmail,
+            mapId: body.map_id,
+            reqId: body.req_id
+          },
+          { deliverInterviewEmail: helpers.sendInterviewEmail }
+        );
+      }
+    } catch (teamsError) {
+      console.warn("Teams meeting skipped:", teamsError.message);
+    }
+  }
+
+  if (await tableExists(pool, "interview_schedule_trn")) {
+    const scheduleResult = await pool.query(
+      `INSERT INTO interview_schedule_trn (
+        req_id, map_id, interviewer_id, round_no, round_type,
+        interview_date, interview_time, meeting_link, teams_event_id, remarks, created_by
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [
+        body.req_id,
+        body.map_id,
+        body.interviewer_id,
+        body.round_no || 1,
+        body.round_type,
+        body.interview_date,
+        body.interview_time,
+        teamsLink,
+        teamsEventId,
+        body.remarks || null,
+        req.user?.employee_code || null
+      ]
+    );
+
+    legacyScheduleRow = scheduleResult.rows[0];
+
+    await linkLegacySchedule(
+      pool,
+      enterprise.interviewId,
+      legacyScheduleRow.schedule_id,
+      teamsLink,
+      teamsEventId,
+      req
+    );
+  }
+
+  return {
+    ...enterprise,
+    teamsLink,
+    teamsEventId,
+    legacyScheduleRow
+  };
 }
 
 async function fetchInterviewRowByLookup(pool, interviewId) {
@@ -1371,46 +1545,53 @@ async function syncLegacyFeedback(pool, interview, payload, user) {
   }
 
   if (newStage && interview.mapId && isEnterpriseOperationalSor()) {
-    await applyEnterpriseInterviewStageTransition(pool, {
-      mapId: interview.mapId,
+    const recruitmentService = require("./recruitmentService");
+    await recruitmentService.applyGovernedCandidateStageTransition(
+      pool,
+      interview.mapId,
       newStage,
-      eventType: "InterviewOutcomeStage",
-      user,
-      comments: payload.overall_comments || null,
-      metadata: {
-        interviewId: interview.interviewId,
-        scheduleId,
-        interviewLevel: payload.interview_level,
-        finalOutcome: payload.final_outcome
+      payload.overall_comments || "",
+      req,
+      {
+        pipelineEventType: "InterviewOutcomeStage",
+        skipIfUnchanged: true,
+        useOperationalStageName: true,
+        historyMetadata: {
+          interviewId: interview.interviewId,
+          scheduleId,
+          interviewLevel: payload.interview_level,
+          finalOutcome: payload.final_outcome
+        }
       }
-    });
+    );
   }
 }
 
-async function reassignPanel(pool, interviewId, payload, req) {
+async function reassignPanel(pool, interviewId, payload, req, txOptions = null) {
+  const queryable = txOptions?.client || pool;
   const user = userContext(req);
-  const row = await fetchInterviewRowByLookup(pool, interviewId);
+  const row = await fetchInterviewRowByLookup(queryable, interviewId);
 
   if (!row) {
     throw httpError(`Interview not found: ${interviewId}`, 404);
   }
 
-  await assertInterviewReadAccess(pool, req, row);
+  await assertInterviewReadAccess(queryable, req, row);
   const interview = mapInterviewRow(row);
   const { panel_id: panelId, interviewer_name: interviewerName, interviewer_email: interviewerEmail } = payload;
 
-  const ruleEval = await evaluateInterviewRules(pool, {
+  const ruleEval = await evaluateInterviewRules(queryable, {
     round_type: interview.roundType,
     action: "panel_reassignment"
   }, req);
 
-  await pool.query(
+  await queryable.query(
     `UPDATE im_panel_assignments SET assignment_status = 'Reassigned', modified_on = NOW()
      WHERE interview_id = $1 AND assignment_status IN ('Pending', 'Accepted')`,
     [interview.interviewId]
   );
 
-  await pool.query(
+  await queryable.query(
     `INSERT INTO im_panel_assignments (
       interview_id, panel_id, interviewer_name, interviewer_email,
       assignment_status, assigned_by, effective_from
@@ -1426,22 +1607,27 @@ async function reassignPanel(pool, interviewId, payload, req) {
     ]
   );
 
-  await taskService.createTask(pool, {
-    module: "Interview Management",
-    taskType: "Accept Interview Assignment",
-    title: `Reassigned: accept ${interview.roundType} interview`,
-    assignee: interviewerName || null,
-    assigneeRole: "Interviewer",
-    priority: "High",
-    slaHours: 8,
-    workflowInstanceId: interview.workflowInstanceId,
-    stageKey: "scheduled",
-    businessObjectType: "Interview",
-    businessObjectId: interview.interviewId,
-    metadata: { reassigned: true, ruleEvaluation: ruleEval }
-  }, req);
+  await taskService.createTask(
+    queryable,
+    {
+      module: "Interview Management",
+      taskType: "Accept Interview Assignment",
+      title: `Reassigned: accept ${interview.roundType} interview`,
+      assignee: interviewerName || null,
+      assigneeRole: "Interviewer",
+      priority: "High",
+      slaHours: 8,
+      workflowInstanceId: interview.workflowInstanceId,
+      stageKey: "scheduled",
+      businessObjectType: "Interview",
+      businessObjectId: interview.interviewId,
+      metadata: { reassigned: true, ruleEvaluation: ruleEval }
+    },
+    req,
+    txOptions
+  );
 
-  await writeEnterpriseAudit(pool, {
+  await writeEnterpriseAudit(queryable, {
     eventType: "TaskReassigned",
     module: "Interview Management",
     entity: "Interview Panel",
@@ -1766,6 +1952,7 @@ module.exports = {
   getFeedbackDetailsBySchedule,
   getInterviewProgressByMapId,
   scheduleInterview,
+  scheduleInterviewCanonical,
   linkLegacySchedule,
   getInterview,
   getInterviewForRequest,

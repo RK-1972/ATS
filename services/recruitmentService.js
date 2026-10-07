@@ -510,6 +510,109 @@ async function assertAuthorizedMappingAccess(pool, req, mapId) {
   return context;
 }
 
+/**
+ * Workspace read: owner/pool/admin/intake rules, plus recruiters assigned to the
+ * candidate's active requisition mapping (DR1 — no ownership change).
+ */
+async function assertCandidateWorkspaceReadAccess(pool, req, candidateId) {
+  try {
+    return await candidateAccessService.assertCandidateReadAccess(
+      pool,
+      req,
+      candidateId
+    );
+  } catch (readError) {
+    if (readError.status !== 403) {
+      throw readError;
+    }
+  }
+
+  if (isAdminUser(req)) {
+    return await candidateAccessService.loadCandidateAccessRow(pool, candidateId);
+  }
+
+  const mappingResult = await pool.query(
+    `SELECT requisition_code
+     FROM rm_candidate_mappings
+     WHERE candidate_id = $1
+       AND is_active = TRUE
+     ORDER BY mapping_id DESC
+     LIMIT 1`,
+    [candidateId]
+  );
+
+  const requisitionCode = mappingResult.rows[0]?.requisition_code;
+
+  if (!requisitionCode) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view this candidate.",
+      403
+    );
+  }
+
+  const reqResult = await pool.query(
+    "SELECT * FROM rm_requisitions WHERE requisition_code = $1",
+    [requisitionCode]
+  );
+  const requisition = reqResult.rows[0];
+
+  if (!requisition) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view this candidate.",
+      403
+    );
+  }
+
+  await assertRecruiterAssignedToRequisition(pool, req, requisition);
+
+  return await candidateAccessService.loadCandidateAccessRow(pool, candidateId);
+}
+
+/**
+ * Lifecycle clearance governance — mirrors PIPELINE ownership rules without
+ * bypassing recruitment/candidate ownership policy (departing owner must match).
+ */
+async function assertGovernancePipelineOwnershipTransfer(
+  pool,
+  req,
+  candidateId,
+  fromEmployeeCode
+) {
+  const { assertCanManageEmployeeLifecycle } = require("./employeeLifecycleCapabilityAuth");
+  await assertCanManageEmployeeLifecycle(pool, req);
+
+  const result = await pool.query(
+    `SELECT candidate_id, candidate_container, owner_employee_code
+     FROM cand_mstr
+     WHERE candidate_id = $1`,
+    [candidateId]
+  );
+  const row = result.rows[0];
+
+  if (!row) {
+    throw httpError("Candidate not found.", 404);
+  }
+
+  const owner = String(row.owner_employee_code || "").trim();
+  const fromCode = String(fromEmployeeCode || "").trim();
+
+  if (!owner || owner !== fromCode) {
+    throw httpError(
+      "Candidate ownership does not match the employee being cleared.",
+      409
+    );
+  }
+
+  if (String(row.candidate_container || "").trim().toUpperCase() !== "PIPELINE") {
+    throw httpError(
+      "Only PIPELINE candidate ownership can be transferred via lifecycle clearance.",
+      400
+    );
+  }
+
+  return row;
+}
+
 async function assertAuthorizedRelease(pool, req, candidateId) {
   if (isAdminUser(req)) {
     return;
@@ -601,19 +704,19 @@ async function listMyPipelineCandidates(pool, req) {
 }
 
 async function listCandidateEducation(pool, candidateId, req) {
-  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+  await assertCandidateWorkspaceReadAccess(pool, req, candidateId);
 
   return candidateService.listChildRecords(pool, "education", candidateId);
 }
 
 async function listCandidateExperience(pool, candidateId, req) {
-  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+  await assertCandidateWorkspaceReadAccess(pool, req, candidateId);
 
   return candidateService.listChildRecords(pool, "experience", candidateId);
 }
 
 async function listCandidateSkillMap(pool, candidateId, req) {
-  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+  await assertCandidateWorkspaceReadAccess(pool, req, candidateId);
 
   return candidateService.listChildRecords(pool, "skill_map", candidateId);
 }
@@ -669,7 +772,7 @@ async function getCandidateOwnership(pool, candidateId, req) {
 }
 
 async function getCandidateWorkspaceProfile(pool, candidateId, req) {
-  await candidateAccessService.assertCandidateReadAccess(pool, req, candidateId);
+  await assertCandidateWorkspaceReadAccess(pool, req, candidateId);
 
   const result = await pool.query(
     `SELECT *
@@ -1581,11 +1684,31 @@ async function approveRequisition(pool, requisitionCode, comment, req) {
   };
 }
 
+async function assertRecruiterEmployeeActive(pool, recruiterCode) {
+  const code = String(recruiterCode || "").trim();
+  if (!code) {
+    throw httpError("Recruiter employee code is required.", 400);
+  }
+  const result = await pool.query(
+    `SELECT employee_code, is_active, role_name
+     FROM user_mstr
+     WHERE employee_code = $1`,
+    [code]
+  );
+  if (!result.rows.length || result.rows[0].is_active !== true) {
+    throw httpError("Cannot assign an inactive recruiter.", 400);
+  }
+  if (result.rows[0].role_name !== "Recruiter") {
+    throw httpError("Assignee must have the Recruiter role.", 400);
+  }
+}
+
 async function assignRecruiter(pool, reqId, recruiterCode, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
   await assertRecruitmentModuleEnabled(platformConfig);
   await assertCanAssignRecruiter(pool, req);
+  await assertRecruiterEmployeeActive(pool, recruiterCode);
 
   let requisition = null;
 
@@ -2032,7 +2155,18 @@ async function mapCandidate(pool, payload, req) {
   };
 }
 
-async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
+/**
+ * Governed ATS stage transition (history, audit, portal notify).
+ * Caller must enforce authorization unless using updateCandidateStage.
+ */
+async function applyGovernedCandidateStageTransition(
+  pool,
+  mapId,
+  stageName,
+  remarks,
+  req,
+  options = {}
+) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
   await assertRecruitmentModuleEnabled(platformConfig);
@@ -2041,12 +2175,33 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
     throw httpError("stage_name is required.", 400);
   }
 
-  const { mapping, legacyRow } = await assertAuthorizedStageUpdate(pool, req, mapId);
+  const { mapping, legacyRow } = await resolveMappingContext(pool, mapId);
 
-  const resolvedStage = await resolveGovernedAtsStage(pool, stageName);
+  const resolvedStage = options.useOperationalStageName
+    ? {
+        displayName: String(stageName).trim(),
+        stageCode: inferCatalogStageCodeFromOperationalStage(stageName)
+      }
+    : await resolveGovernedAtsStage(pool, stageName);
   const canonicalStageName = resolvedStage.displayName;
 
   const previousStage = mapping?.stage_name || legacyRow?.stage_name || "Applied";
+  const normalizedPrevious = String(previousStage || "").trim();
+  const normalizedNext = String(canonicalStageName || "").trim();
+
+  if (
+    options.skipIfUnchanged
+    && normalizedPrevious === normalizedNext
+    && mapping
+  ) {
+    return {
+      mapping,
+      eventType: options.pipelineEventType || "StageChanged",
+      toastMessage: "ATS stage unchanged.",
+      skipped: true
+    };
+  }
+
   const requisitionCode = mapping?.requisition_code;
 
   let requisition = null;
@@ -2085,12 +2240,19 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
     );
   }
 
-  let eventType = "StageChanged";
-  if (/reject/i.test(canonicalStageName)) {
-    eventType = "CandidateRejected";
-  } else if (/shortlist|cleared/i.test(canonicalStageName)) {
-    eventType = "CandidateShortlisted";
+  let eventType = options.pipelineEventType || "StageChanged";
+  if (!options.pipelineEventType) {
+    if (/reject/i.test(canonicalStageName)) {
+      eventType = "CandidateRejected";
+    } else if (/shortlist|cleared/i.test(canonicalStageName)) {
+      eventType = "CandidateShortlisted";
+    }
   }
+
+  const historyMetadata =
+    options.historyMetadata != null
+      ? { ...options.historyMetadata, ruleEvaluation: ruleEval }
+      : { ruleEvaluation: ruleEval };
 
   if (mapping) {
     const client = await pool.connect();
@@ -2100,9 +2262,9 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
 
       await client.query(
         `UPDATE rm_candidate_mappings
-         SET stage_name = $1, remarks = $2, modified_on = NOW()
+         SET stage_name = $1, remarks = COALESCE($2, remarks), modified_on = NOW()
          WHERE mapping_id = $3`,
-        [canonicalStageName, remarks, mapping.mapping_id]
+        [canonicalStageName, remarks || null, mapping.mapping_id]
       );
 
       await pipelineHistoryService.recordPipelineStageTransition(client, {
@@ -2115,7 +2277,7 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
         actor: user.name,
         actorRole: user.role,
         comments: remarks,
-        metadata: { ruleEvaluation: ruleEval }
+        metadata: historyMetadata
       });
 
       await client.query("COMMIT");
@@ -2140,7 +2302,7 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
       actor: user.name,
       actorRole: user.role,
       comments: remarks,
-      metadata: { ruleEvaluation: ruleEval }
+      metadata: historyMetadata
     });
   }
 
@@ -2192,13 +2354,13 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
 
       if (notifyResult?.skipped) {
         console.warn(
-          "[updateCandidateStage] stage_changed skipped:",
+          "[applyGovernedCandidateStageTransition] stage_changed skipped:",
           notifyResult.reason
         );
       }
     } catch (notificationError) {
       console.error(
-        "[updateCandidateStage] stage_changed notification failed:",
+        "[applyGovernedCandidateStageTransition] stage_changed notification failed:",
         notificationError.message
       );
     }
@@ -2209,6 +2371,19 @@ async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
     eventType,
     toastMessage: "ATS stage updated successfully."
   };
+}
+
+async function updateCandidateStage(pool, mapId, stageName, remarks, req) {
+  await assertAuthorizedStageUpdate(pool, req, mapId);
+
+  return applyGovernedCandidateStageTransition(
+    pool,
+    mapId,
+    stageName,
+    remarks,
+    req,
+    { skipIfUnchanged: false }
+  );
 }
 
 /**
@@ -3624,6 +3799,56 @@ function assertRequestorSubmitReadiness(requisition) {
 }
 
 /**
+ * Validates Talent Demand editor numerics on editable requisition PUT.
+ * Does not enforce maximum experience/headcount limits.
+ */
+function assertRequisitionEditorFieldValidation(payload = {}, existing = {}) {
+  if (
+    payload.openings_count !== undefined &&
+    payload.openings_count !== ""
+  ) {
+    const headcount = Number(payload.openings_count);
+    if (
+      !Number.isFinite(headcount) ||
+      !Number.isInteger(headcount) ||
+      headcount < 1
+    ) {
+      throw httpError(
+        "openings_count must be a whole number of at least 1.",
+        400
+      );
+    }
+  }
+
+  const expMinInPayload = payload.experience_min !== undefined;
+  const expMaxInPayload = payload.experience_max !== undefined;
+
+  if (expMinInPayload || expMaxInPayload) {
+    const min = expMinInPayload
+      ? payload.experience_min === "" || payload.experience_min === null
+        ? null
+        : Number(payload.experience_min)
+      : existing.experience_min != null
+        ? Number(existing.experience_min)
+        : null;
+    const max = expMaxInPayload
+      ? payload.experience_max === "" || payload.experience_max === null
+        ? null
+        : Number(payload.experience_max)
+      : existing.experience_max != null
+        ? Number(existing.experience_max)
+        : null;
+
+    if (min != null && max != null && min > max) {
+      throw httpError(
+        "experience_min cannot be greater than experience_max.",
+        400
+      );
+    }
+  }
+}
+
+/**
  * Map Talent Demand editor payload onto rm_requisitions columns.
  * Never creates a requisition and never changes requisition_code / approved_position_id.
  */
@@ -3743,6 +3968,8 @@ async function updateRequisition(pool, code, payload, req) {
   await assertRequisitionRequestorOwnerAccess(pool, req, existing);
 
   assertExistingRequisitionEditable(existing);
+
+  assertRequisitionEditorFieldValidation(payload || {}, existing);
 
   const fields = buildRequisitionUpdateFields(payload || {});
 
@@ -4010,12 +4237,15 @@ module.exports = {
   createFromApprovedPosition,
   approveRequisition,
   assignRecruiter,
+  assertRecruiterEmployeeActive,
   removeRecruiterAssignment,
   resolveRecruiterAssignmentTarget,
   mapCandidate,
   releaseCandidate,
   returnCandidateToTalentPool,
   updateCandidateStage,
+  applyGovernedCandidateStageTransition,
+  assertCandidateWorkspaceReadAccess,
   assertAuthorizedMappingAccess,
   getCandidateWorkspaceProfile,
   listCandidateEducation,
@@ -4026,6 +4256,7 @@ module.exports = {
   listMyPipelineCandidates,
   listPipelineHistoryForMapping,
   assertAuthorizedRelease,
+  assertGovernancePipelineOwnershipTransfer,
   validateMasterDataReferences,
   validateMasterDataFields,
   RECRUITMENT_MASTER_DATA_CHECKS,

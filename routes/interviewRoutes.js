@@ -8,7 +8,7 @@ function handleError(res, error) {
   });
 }
 
-function registerInterviewRoutes(app, pool, verifyToken) {
+function registerInterviewRoutes(app, pool, verifyToken, scheduleIntegrations = {}) {
   app.get("/api/v1/interviews", verifyToken, async (req, res) => {
     try {
       const bundle = await interviewService.getInterviewBundle(pool, req);
@@ -50,7 +50,27 @@ function registerInterviewRoutes(app, pool, verifyToken) {
 
   app.post("/api/v1/interviews/schedule", verifyToken, async (req, res) => {
     try {
-      const result = await interviewService.scheduleInterview(pool, req.body, req);
+      const result = await interviewService.scheduleInterviewCanonical(
+        pool,
+        req.body,
+        req,
+        scheduleIntegrations
+      );
+
+      if (result.legacyScheduleRow) {
+        return res.status(201).json({
+          success: true,
+          message: result.toastMessage,
+          data: {
+            ...result.legacyScheduleRow,
+            teams_link: result.teamsLink,
+            interview_id: result.interviewId,
+            interview: result.interview,
+            workflowInstanceId: result.workflowInstanceId
+          }
+        });
+      }
+
       res.status(201).json({ success: true, ...result });
     } catch (error) {
       handleError(res, error);

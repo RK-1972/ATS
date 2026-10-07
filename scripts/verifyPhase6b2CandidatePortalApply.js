@@ -246,6 +246,9 @@ async function completePortalProfileFlow(token, emailId) {
     parseResult.body.data ||
     {};
 
+  const panSuffix = String(Date.now()).slice(-4).padStart(4, "0");
+  const panNumber = `PORTL${panSuffix}Z`;
+
   const saveResult = await fetchJson("/candidate-portal/profile", token, {
     method: "PUT",
     body: {
@@ -256,7 +259,8 @@ async function completePortalProfileFlow(token, emailId) {
       current_company: profile.current_company || "",
       designation: profile.designation || "",
       experience: profile.experience || "5",
-      skills: profile.skills || "Java, SQL"
+      skills: profile.skills || "Java, SQL",
+      pan_number: profile.pan_number || profile.pan || panNumber
     }
   });
 
@@ -459,13 +463,16 @@ async function main() {
     );
   }
 
+  const profileOnlyPan = `PORTL${String(Date.now()).slice(-4).padStart(4, "0")}Z`;
+
   const profileOnlySave = await fetchJson("/candidate-portal/profile", tokenB, {
     method: "PUT",
     body: {
       first_name: "Apply",
       last_name: "Candidate B",
       email: emailB,
-      mobile: "9876503333"
+      mobile: "9876503333",
+      pan_number: profileOnlyPan
     }
   });
 

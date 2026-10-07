@@ -217,6 +217,19 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
       requisitionResult.legacyRequisition?.req_code ||
       null;
 
+    if (requisitionCode) {
+      await recruitmentService.updateRequisition(
+        client,
+        requisitionCode,
+        {
+          openings_count: requisitionPayload.openings_count,
+          experience_min: requisitionPayload.experience_min,
+          experience_max: requisitionPayload.experience_max
+        },
+        actorReq
+      );
+    }
+
     const reqId =
       requisitionResult.legacyRequisition?.req_id ||
       requisitionResult.requisition?.req_id ||
