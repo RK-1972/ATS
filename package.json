@@ -42,6 +42,7 @@
     "verify:phase6c3-notification-config": "node scripts/verifyPhase6c3NotificationConfig.js",
     "verify:phase6c4-candidate-portal-notifications": "node scripts/verifyPhase6c4CandidatePortalNotifications.js",
     "verify:phase6c5-interview-schedule-notification": "node scripts/verifyPhase6c5InterviewScheduleNotification.js",
+    "verify:uat-production-defect-regressions": "node scripts/verifyUatProductionDefectRegressions.js",
     "verify:o1-audit-read-api": "node scripts/verifyO1AuditReadApi.js",
     "verify:phase7b-candidate-profile-read": "node scripts/verifyPhase7bCandidateProfileRead.js",
     "verify:phase7c-talent-pool-read": "node scripts/verifyPhase7cTalentPoolRead.js",

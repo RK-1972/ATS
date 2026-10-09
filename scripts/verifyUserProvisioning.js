@@ -753,10 +753,31 @@ async function main() {
       [roleProvisionCode]
     );
 
-    if (assignmentsAfter.rows[0].cnt !== assignmentsBefore.rows[0].cnt) {
-      fail("work assignments remain unchanged after role change");
+    if (assignmentsAfter.rows[0].cnt !== assignmentsBefore.rows[0].cnt + 1) {
+      fail(
+        "Interviewer role change grants INTERVIEWER work assignment",
+        `before=${assignmentsBefore.rows[0].cnt} after=${assignmentsAfter.rows[0].cnt}`
+      );
     } else {
-      pass("work assignments remain unchanged after role change");
+      pass("Interviewer role change grants INTERVIEWER work assignment");
+    }
+
+    const interviewerAssignment = await pool.query(
+      `SELECT 1
+       FROM employee_work_assignment ewa
+       INNER JOIN work_assignment_mstr wa
+         ON wa.work_assignment_id = ewa.work_assignment_id
+       WHERE ewa.employee_code = $1
+         AND ewa.is_active = TRUE
+         AND wa.assignment_code = 'INTERVIEWER'
+       LIMIT 1`,
+      [roleProvisionCode]
+    );
+
+    if (!interviewerAssignment.rows.length) {
+      fail("Interviewer role change active INTERVIEWER assignment row");
+    } else {
+      pass("Interviewer role change active INTERVIEWER assignment row");
     }
 
     try {
@@ -984,8 +1005,11 @@ async function main() {
       [roleProvisionCode]
     );
 
-    if (assignmentsDuringInactive.rows[0].cnt !== assignmentsBefore.rows[0].cnt) {
-      fail("work assignments preserved during status change");
+    if (assignmentsDuringInactive.rows[0].cnt !== assignmentsAfter.rows[0].cnt) {
+      fail(
+        "work assignments preserved during status change",
+        `after_role_change=${assignmentsAfter.rows[0].cnt} during_inactive=${assignmentsDuringInactive.rows[0].cnt}`
+      );
     } else {
       pass("work assignments preserved during status change");
     }

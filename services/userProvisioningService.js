@@ -153,6 +153,88 @@ function resolveActorIdentity(req) {
 
 
 
+const INTERVIEWER_PRIMARY_ROLE = "Interviewer";
+
+async function loadInterviewerWorkAssignmentMaster(queryable) {
+  const result = await queryable.query(
+    `SELECT work_assignment_id, assignment_code, assignment_name, is_active
+     FROM work_assignment_mstr
+     WHERE assignment_code = $1
+       AND is_active = TRUE
+     LIMIT 1`,
+    [interviewPanelRegistry.INTERVIEWER_ASSIGNMENT_CODE]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function employeeHasActiveInterviewerAssignment(queryable, employeeCode) {
+  const result = await queryable.query(
+    `SELECT 1
+     FROM employee_work_assignment ewa
+     INNER JOIN work_assignment_mstr wa
+       ON wa.work_assignment_id = ewa.work_assignment_id
+     WHERE ewa.employee_code = $1
+       AND ewa.is_active = TRUE
+       AND wa.assignment_code = $2
+       AND wa.is_active = TRUE
+     LIMIT 1`,
+    [
+      String(employeeCode).trim(),
+      interviewPanelRegistry.INTERVIEWER_ASSIGNMENT_CODE
+    ]
+  );
+
+  return result.rows.length > 0;
+}
+
+/**
+ * Primary Role Interviewer requires active INTERVIEWER work assignment for scheduling pickers.
+ * Grants assignment through the same authorization gates as provisioning when missing.
+ */
+async function ensureInterviewerOperationalEligibility(client, req, employeeCode) {
+  if (await employeeHasActiveInterviewerAssignment(client, employeeCode)) {
+    await interviewPanelRegistry.syncInterviewerPanelForActiveAssignment(
+      client,
+      employeeCode
+    );
+    return { work_assignment_granted: false };
+  }
+
+  const master = await loadInterviewerWorkAssignmentMaster(client);
+
+  if (!master) {
+    throw httpError("INTERVIEWER work assignment master is not configured.", 500);
+  }
+
+  assertAssignmentGrantAllowed(req, master.assignment_code);
+
+  if (
+    !isPlatformAdmin(req) &&
+    isPrivilegedAssignmentCode(master.assignment_code)
+  ) {
+    throw httpError(
+      "Enterprise Access Denied. Only Platform Admins may grant privileged work assignments.",
+      403
+    );
+  }
+
+  await workAssignmentRepository.assignWorkAssignment(
+    client,
+    String(employeeCode).trim(),
+    master.work_assignment_id,
+    null,
+    null
+  );
+
+  await interviewPanelRegistry.syncInterviewerPanelForActiveAssignment(
+    client,
+    employeeCode
+  );
+
+  return { work_assignment_granted: true };
+}
+
 async function loadActiveWorkAssignmentMasters(pool, workAssignmentIds) {
 
   if (!workAssignmentIds.length) {
@@ -824,6 +906,16 @@ async function changePrimaryRole(pool, req, employeeCode, payload = {}) {
 
     });
 
+    let interviewerEligibility = null;
+
+    if (newRoleName === INTERVIEWER_PRIMARY_ROLE) {
+      interviewerEligibility = await ensureInterviewerOperationalEligibility(
+        client,
+        req,
+        targetEmployeeCode
+      );
+    }
+
 
 
     await client.query("COMMIT");
@@ -834,7 +926,9 @@ async function changePrimaryRole(pool, req, employeeCode, payload = {}) {
 
       user: updateResult.rows[0],
 
-      history
+      history,
+
+      interviewer_eligibility: interviewerEligibility
 
     };
 

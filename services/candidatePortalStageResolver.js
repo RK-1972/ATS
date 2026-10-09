@@ -46,6 +46,30 @@ function inferCatalogStageCodeFromOperationalStage(stageName) {
   return null;
 }
 
+/**
+ * Maps rm_ats_stage_catalog.stage_code to CANDIDATE workflow stage_key
+ * (see seed/workflows.seed.json).
+ */
+function catalogStageCodeToCandidateWorkflowStageKey(stageCode) {
+  const normalized = String(stageCode || "").trim().toUpperCase();
+
+  if (!normalized) {
+    return null;
+  }
+
+  const map = {
+    APPLIED: "applied",
+    SCREENING: "screening",
+    L1_INTERVIEW: "l1",
+    L2_INTERVIEW: "l2",
+    CLIENT_INTERVIEW: "client",
+    OFFER: "offer",
+    JOINED: "joined"
+  };
+
+  return map[normalized] || null;
+}
+
 async function buildCandidateFacingStageResolver(pool) {
   const catalog = await listActiveAtsStageCatalog(pool);
   const catalogByDisplay = new Map(
@@ -99,5 +123,6 @@ async function buildCandidateFacingStageResolver(pool) {
 module.exports = {
   CANDIDATE_PORTAL_INTERVIEW_MICRO_STATE_PATTERN,
   inferCatalogStageCodeFromOperationalStage,
+  catalogStageCodeToCandidateWorkflowStageKey,
   buildCandidateFacingStageResolver
 };

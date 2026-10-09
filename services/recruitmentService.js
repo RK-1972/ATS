@@ -23,6 +23,7 @@ const { resolveGovernedAtsStage } = require("./atsStageWriteValidator");
 const {
   CANDIDATE_PORTAL_INTERVIEW_MICRO_STATE_PATTERN,
   inferCatalogStageCodeFromOperationalStage,
+  catalogStageCodeToCandidateWorkflowStageKey,
   buildCandidateFacingStageResolver
 } = require("./candidatePortalStageResolver");
 
@@ -2227,17 +2228,23 @@ async function applyGovernedCandidateStageTransition(
   }, req);
 
   if (mapping?.workflow_instance_id) {
-    await workflowService.advanceWorkflow(
-      pool,
-      mapping.workflow_instance_id,
-      /reject/i.test(canonicalStageName) ? "reject" : "approve",
-      {
-        stageKey: canonicalStageName.toLowerCase().replace(/\s+/g, "_"),
-        actor: user.name,
-        comment: remarks
-      },
-      req
+    const workflowStageKey = catalogStageCodeToCandidateWorkflowStageKey(
+      resolvedStage.stageCode
     );
+
+    if (workflowStageKey) {
+      await workflowService.advanceWorkflow(
+        pool,
+        mapping.workflow_instance_id,
+        /reject/i.test(canonicalStageName) ? "reject" : "approve",
+        {
+          stageKey: workflowStageKey,
+          actor: user.name,
+          comment: remarks
+        },
+        req
+      );
+    }
   }
 
   let eventType = options.pipelineEventType || "StageChanged";
