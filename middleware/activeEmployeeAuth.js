@@ -62,7 +62,21 @@ function createRequireActiveEmployee(pool) {
   };
 }
 
+/**
+ * Reject admin mutations to employee master / operational config while inactive.
+ */
+function assertEmployeeActiveForMasterMutation(userRow) {
+  if (!userRow || userRow.is_active !== true) {
+    const error = new Error(
+      "Cannot modify an inactive employee. Reactivate the account first or use responsibility clearance where applicable."
+    );
+    error.status = 403;
+    throw error;
+  }
+}
+
 module.exports = {
   assertEmployeeAccountActive,
+  assertEmployeeActiveForMasterMutation,
   createRequireActiveEmployee
 };

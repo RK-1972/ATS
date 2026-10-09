@@ -5564,7 +5564,8 @@ app.post(
             user_id,
             employee_code,
             full_name,
-            email_id
+            email_id,
+            is_active
 
           FROM user_mstr
 
@@ -5593,6 +5594,19 @@ app.post(
 
       const user =
         userResult.rows[0];
+
+      if (user.is_active !== true) {
+
+        return res.status(403).json({
+
+          success: false,
+
+          message:
+            "Cannot modify interview panel configuration for an inactive employee."
+
+        });
+
+      }
 
       // ==========================================
       // Duplicate Check
@@ -5856,6 +5870,23 @@ app.put(
     message: "Mandatory fields missing"
   });
 }
+
+      const panelEmployee = await pool.query(
+        `SELECT is_active FROM user_mstr WHERE employee_code = $1 LIMIT 1`,
+        [employee_code]
+      );
+
+      if (
+        !panelEmployee.rows[0] ||
+        panelEmployee.rows[0].is_active !== true
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Cannot modify interview panel configuration for an inactive employee."
+        });
+      }
+
       const result =
         await pool.query(
 
@@ -5994,6 +6025,8 @@ app.get(
          AND wa.assignment_code = 'INTERVIEWER'
 
         WHERE ip.is_active = true
+
+          AND u.is_active = true
 
         ORDER BY
 
@@ -6758,6 +6791,8 @@ app.get(
 
            AND wa.assignment_code = 'INTERVIEWER'
 
+           AND u.is_active = true
+
           ORDER BY u.full_name
           `
 
@@ -7155,7 +7190,8 @@ app.post(
 
             user_id,
             full_name,
-            email_id
+            email_id,
+            is_active
 
           FROM user_mstr
 
@@ -7174,6 +7210,19 @@ app.post(
 
         const user =
           userResult.rows[0];
+
+        if (user.is_active !== true) {
+
+          return res.status(403).json({
+
+            success: false,
+
+            message:
+              "Account is inactive. Contact your administrator for reactivation."
+
+          });
+
+        }
 
           await pool.query(
 
@@ -7339,7 +7388,8 @@ app.post(
           SELECT
 
             prt.*,
-            um.user_id
+            um.user_id,
+            um.is_active
 
           FROM password_reset_tokens prt
 
@@ -7379,6 +7429,19 @@ app.post(
 
       const tokenData =
         tokenResult.rows[0];
+
+      if (tokenData.is_active !== true) {
+
+        return res.status(403).json({
+
+          success: false,
+
+          message:
+            "Account is inactive. Contact your administrator for reactivation."
+
+        });
+
+      }
 
       // ==========================
 // Password Validation

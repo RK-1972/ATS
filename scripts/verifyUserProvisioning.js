@@ -1147,7 +1147,7 @@ async function main() {
         pool,
         { user: admin },
         roleProvisionCode,
-        { is_active: true }
+        { is_active: true, reason: "HTTP verification reactivate cleanup" }
       );
     } else if (httpDeactivate.status === 404) {
       console.log("SKIP: HTTP deactivate user — restart backend to load new routes");

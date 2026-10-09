@@ -9,6 +9,7 @@
 const bcrypt = require("bcryptjs");
 
 const workAssignmentRepository = require("../repositories/workAssignmentRepository");
+const interviewPanelRegistry = require("./interviewPanelRegistryService");
 
 const userRoleHistoryRepository = require("../repositories/userRoleHistoryRepository");
 
@@ -33,6 +34,8 @@ const {
 } = require("./userProvisioningCapabilityAuth");
 
 const { PLATFORM_ADMIN_ROLE } = require("../constants/employeeRoles");
+const { assertEmployeeActiveForMasterMutation } = require("../middleware/activeEmployeeAuth");
+const { recordLifecycleAudit } = require("./employeeLifecycleAudit");
 
 
 
@@ -606,6 +609,13 @@ async function provisionEmployee(pool, req, payload = {}) {
 
       });
 
+      if (interviewPanelRegistry.isInterviewerAssignmentCode(master.assignment_code)) {
+        await interviewPanelRegistry.syncInterviewerPanelForActiveAssignment(
+          client,
+          employeeCode
+        );
+      }
+
     }
 
 
@@ -743,6 +753,8 @@ async function changePrimaryRole(pool, req, employeeCode, payload = {}) {
       throw httpError(`User not found: ${targetEmployeeCode}`, 404);
 
     }
+
+    assertEmployeeActiveForMasterMutation(user);
 
 
 
@@ -990,6 +1002,13 @@ async function changeUserStatus(pool, req, employeeCode, payload = {}) {
 
     }
 
+    if (targetActive && !reason) {
+      throw httpError(
+        "A reason is required to reactivate an inactive employee.",
+        400
+      );
+    }
+
 
 
     if (!targetActive) {
@@ -1064,7 +1083,15 @@ async function changeUserStatus(pool, req, employeeCode, payload = {}) {
 
     await client.query("COMMIT");
 
-
+    if (targetActive) {
+      await recordLifecycleAudit(pool, req, {
+        action: "Employee reactivated",
+        entityId: targetEmployeeCode,
+        affectedEmployeeCode: targetEmployeeCode,
+        sourceOperation: "reactivate",
+        reason
+      });
+    }
 
     return {
 
@@ -1135,6 +1162,8 @@ async function updateUserProfile(pool, req, employeeCode, payload = {}) {
     if (!user) {
       throw httpError(`User not found: ${targetEmployeeCode}`, 404);
     }
+
+    assertEmployeeActiveForMasterMutation(user);
 
     const nextFullName = hasFullName
       ? String(payload.full_name || "").trim()

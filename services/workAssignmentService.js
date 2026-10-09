@@ -5,6 +5,8 @@
  */
 
 const workAssignmentRepository = require("../repositories/workAssignmentRepository");
+const interviewPanelRegistry = require("./interviewPanelRegistryService");
+const { assertEmployeeActiveForMasterMutation } = require("../middleware/activeEmployeeAuth");
 
 function httpError(message, status = 400) {
   const error = new Error(message);
@@ -381,21 +383,40 @@ async function assignWorkAssignment(
   );
 
   if (duplicate) {
+    if (interviewPanelRegistry.isInterviewerAssignmentCode(workAssignment.assignment_code)) {
+      await interviewPanelRegistry.syncInterviewerPanelForActiveAssignment(pool, code);
+    }
     throw httpError(
       "Employee already has an active assignment for this work assignment.",
       409
     );
   }
 
+  const client = await pool.connect();
+
   try {
-    return await workAssignmentRepository.assignWorkAssignment(
-      pool,
+    await client.query("BEGIN");
+
+    const assigned = await workAssignmentRepository.assignWorkAssignment(
+      client,
       String(employeeCode).trim(),
       workAssignmentId,
       from,
       to
     );
+
+    if (interviewPanelRegistry.isInterviewerAssignmentCode(workAssignment.assignment_code)) {
+      await interviewPanelRegistry.syncInterviewerPanelForActiveAssignment(
+        client,
+        code
+      );
+    }
+
+    await client.query("COMMIT");
+    return assigned;
   } catch (error) {
+    await client.query("ROLLBACK");
+
     if (error && error.code === "23505") {
       throw httpError(
         "Employee already has an active assignment for this work assignment.",
@@ -403,6 +424,8 @@ async function assignWorkAssignment(
       );
     }
     throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -422,16 +445,63 @@ async function removeEmployeeWorkAssignment(pool, employeeWorkAssignmentId) {
     throw httpError("employee_work_assignment_id is required.", 400);
   }
 
-  const removed = await workAssignmentRepository.removeEmployeeWorkAssignment(
-    pool,
-    employeeWorkAssignmentId
-  );
+  const client = await pool.connect();
 
-  if (!removed) {
-    throw httpError("Employee work assignment not found.", 404);
+  try {
+    await client.query("BEGIN");
+
+    const preview = await client.query(
+      `SELECT
+         ewa.employee_work_assignment_id,
+         ewa.employee_code,
+         ewa.work_assignment_id,
+         wa.assignment_code
+       FROM employee_work_assignment ewa
+       INNER JOIN work_assignment_mstr wa
+         ON wa.work_assignment_id = ewa.work_assignment_id
+       WHERE ewa.employee_work_assignment_id = $1`,
+      [employeeWorkAssignmentId]
+    );
+
+    if (!preview.rows.length) {
+      throw httpError("Employee work assignment not found.", 404);
+    }
+
+    const assignmentRow = preview.rows[0];
+
+    const employeeStatus = await client.query(
+      `SELECT employee_code, is_active FROM user_mstr WHERE employee_code = $1`,
+      [assignmentRow.employee_code]
+    );
+
+    assertEmployeeActiveForMasterMutation(employeeStatus.rows[0]);
+
+    const removed = await workAssignmentRepository.removeEmployeeWorkAssignment(
+      client,
+      employeeWorkAssignmentId
+    );
+
+    if (!removed) {
+      throw httpError("Employee work assignment not found.", 404);
+    }
+
+    if (
+      interviewPanelRegistry.isInterviewerAssignmentCode(assignmentRow.assignment_code)
+    ) {
+      await interviewPanelRegistry.deactivateInterviewerPanelForEmployee(
+        client,
+        assignmentRow.employee_code
+      );
+    }
+
+    await client.query("COMMIT");
+    return removed;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
-
-  return removed;
 }
 
 module.exports = {
