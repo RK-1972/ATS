@@ -86,6 +86,92 @@ async function findPanelMemberScheduleFixture() {
   return result.rows[0] || null;
 }
 
+async function findActiveRecruiterUserForSchedule(scheduleId) {
+  const result = await pool.query(
+    `SELECT DISTINCT u.user_id, u.employee_code, u.email_id, u.role_name, u.secondary_role
+     FROM rm_recruiter_assignments a
+     INNER JOIN user_mstr u
+       ON u.employee_code = a.recruiter_code
+      AND COALESCE(u.is_active, TRUE) = TRUE
+     WHERE a.is_active = true
+       AND (
+         EXISTS (
+           SELECT 1
+           FROM im_interviews i
+           WHERE i.schedule_id = $1
+             AND (
+               (i.requisition_code IS NOT NULL AND a.requisition_code = i.requisition_code)
+               OR (i.req_id IS NOT NULL AND a.req_id = i.req_id)
+             )
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM interview_schedule_trn ist
+           LEFT JOIN req_mstr rm ON rm.req_id = ist.req_id
+           WHERE ist.schedule_id = $1
+             AND (
+               (ist.req_id IS NOT NULL AND a.req_id = ist.req_id)
+               OR (
+                 rm.req_code IS NOT NULL
+                 AND a.requisition_code IS NOT NULL
+                 AND a.requisition_code = rm.req_code
+               )
+             )
+         )
+       )
+     ORDER BY u.user_id ASC
+     LIMIT 1`,
+    [scheduleId]
+  );
+  return result.rows[0] || null;
+}
+
+async function findUnassignedRecruiterUserForSchedule(scheduleId, excludeEmployeeCodes = []) {
+  const params = [scheduleId, excludeEmployeeCodes];
+  const result = await pool.query(
+    `SELECT u.user_id, u.employee_code, u.email_id, u.role_name, u.secondary_role
+     FROM user_mstr u
+     WHERE u.role_name = 'Recruiter'
+       AND COALESCE(u.is_active, TRUE) = TRUE
+       AND NOT (u.employee_code = ANY($2::text[]))
+       AND NOT EXISTS (
+         SELECT 1
+         FROM rm_recruiter_assignments a
+         WHERE a.recruiter_code = u.employee_code
+           AND a.is_active = true
+           AND (
+             EXISTS (
+               SELECT 1
+               FROM im_interviews i
+               WHERE i.schedule_id = $1
+                 AND (
+                   (i.requisition_code IS NOT NULL AND a.requisition_code = i.requisition_code)
+                   OR (i.req_id IS NOT NULL AND a.req_id = i.req_id)
+                 )
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM interview_schedule_trn ist
+               LEFT JOIN req_mstr rm ON rm.req_id = ist.req_id
+               WHERE ist.schedule_id = $1
+                 AND (
+                   (ist.req_id IS NOT NULL AND a.req_id = ist.req_id)
+                   OR (
+                     rm.req_code IS NOT NULL
+                     AND a.requisition_code IS NOT NULL
+                     AND a.requisition_code = rm.req_code
+                   )
+                 )
+             )
+           )
+       )
+     ORDER BY u.user_id ASC
+     LIMIT 1`,
+    params
+  );
+  return result.rows[0] || null;
+}
+
 async function findNonPanelScheduleFixture(excludeEmployeeCode) {
   const result = await pool.query(
     `SELECT s.schedule_id, f.feedback_id
@@ -183,17 +269,48 @@ async function main() {
       fail("Service: panel member feedback access", `${error.status} ${error.message}`);
     }
 
-    try {
-      await interviewService.assertInterviewFeedbackAccess(pool, recruiterReq, {
-        scheduleId: panelFixture.schedule_id
-      });
-      fail("Service: recruiter assert", "expected throw");
-    } catch (error) {
-      if (error.status === 403) {
-        pass("Service: Recruiter denied feedback access");
-      } else {
-        fail("Service: recruiter assert", `expected 403, got ${error.status}`);
+    const assignedRecruiter = await findActiveRecruiterUserForSchedule(panelFixture.schedule_id);
+    const unassignedRecruiter = await findUnassignedRecruiterUserForSchedule(
+      panelFixture.schedule_id,
+      [
+        assignedRecruiter?.employee_code,
+        panelFixture.panel_employee_code,
+        recruiter.employee_code
+      ].filter(Boolean)
+    );
+
+    if (assignedRecruiter) {
+      try {
+        await interviewService.assertInterviewFeedbackAccess(pool, { user: assignedRecruiter }, {
+          scheduleId: panelFixture.schedule_id
+        });
+        pass(
+          `Service: assigned recruiter allowed feedback access (${assignedRecruiter.employee_code})`
+        );
+      } catch (error) {
+        fail("Service: assigned recruiter feedback access", `${error.status} ${error.message}`);
       }
+    } else {
+      console.log("SKIP: no active recruiter assignment for panel schedule fixture");
+    }
+
+    if (unassignedRecruiter) {
+      try {
+        await interviewService.assertInterviewFeedbackAccess(pool, { user: unassignedRecruiter }, {
+          scheduleId: panelFixture.schedule_id
+        });
+        fail("Service: unassigned recruiter assert", "expected throw");
+      } catch (error) {
+        if (error.status === 403) {
+          pass(
+            `Service: unassigned recruiter denied feedback access (${unassignedRecruiter.employee_code})`
+          );
+        } else {
+          fail("Service: unassigned recruiter assert", `expected 403, got ${error.status}`);
+        }
+      }
+    } else {
+      console.log("SKIP: no unassigned recruiter fixture for service deny case");
     }
 
     if (hiringManager) {
@@ -324,11 +441,34 @@ async function main() {
       console.log("SKIP: panel member token unavailable");
     }
 
-    const recruiterRead = await fetchJson(`/feedback/${scheduleId}`, tokens.recruiter);
-    if (recruiterRead.status === 403) {
-      pass("HTTP: Recruiter denied feedback read");
+    const assignedRecruiter = await findActiveRecruiterUserForSchedule(scheduleId);
+    const unassignedRecruiter = await findUnassignedRecruiterUserForSchedule(
+      scheduleId,
+      [assignedRecruiter?.employee_code, panelFixture.panel_employee_code].filter(Boolean)
+    );
+
+    if (assignedRecruiter) {
+      const assignedToken = signToken(assignedRecruiter);
+      const assignedRead = await fetchJson(`/feedback/${scheduleId}`, assignedToken);
+      if (assignedRead.status === 200 && assignedRead.body?.success) {
+        pass("HTTP: assigned recruiter can read feedback endpoint");
+      } else {
+        fail("HTTP: assigned recruiter feedback read", `status=${assignedRead.status}`);
+      }
     } else {
-      fail("HTTP: Recruiter feedback read", `expected 403, got ${recruiterRead.status}`);
+      console.log("SKIP: HTTP assigned recruiter feedback read — no assignment fixture");
+    }
+
+    if (unassignedRecruiter) {
+      const unassignedToken = signToken(unassignedRecruiter);
+      const recruiterRead = await fetchJson(`/feedback/${scheduleId}`, unassignedToken);
+      if (recruiterRead.status === 403) {
+        pass("HTTP: unassigned recruiter denied feedback read");
+      } else {
+        fail("HTTP: unassigned recruiter feedback read", `expected 403, got ${recruiterRead.status}`);
+      }
+    } else {
+      console.log("SKIP: HTTP unassigned recruiter feedback read — no unassigned recruiter fixture");
     }
 
     for (const [label, token] of [

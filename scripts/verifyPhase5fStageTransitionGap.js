@@ -288,6 +288,12 @@ async function main() {
           pass("submitFeedback rm stage matches history to_stage");
         }
       } catch (error) {
+        if (String(error.message || "").includes("req is not defined")) {
+          fail(
+            "submitFeedback enterprise path",
+            "syncLegacyFeedback must receive authenticated req for governed stage transition"
+          );
+        }
         fail("submitFeedback enterprise path", error.message);
       }
     }

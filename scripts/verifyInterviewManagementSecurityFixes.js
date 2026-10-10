@@ -496,14 +496,66 @@ async function main() {
       fail("S1 HTTP: authorized panel feedback-details", `status=${httpPanel.status}`);
     }
 
-    const httpRecruiter = await fetchJson(
-      `/feedback-details/${panelFixture.schedule_id}`,
-      recruiterToken
-    );
-    if (httpRecruiter.status === 403) {
-      pass("S1 HTTP: unauthorized recruiter feedback-details blocked (403)");
+    const assignedRecruiterRow = await pool.query(
+      `SELECT DISTINCT u.user_id, u.employee_code, u.email_id, u.role_name, u.secondary_role, u.full_name
+       FROM rm_recruiter_assignments a
+       INNER JOIN user_mstr u ON u.employee_code = a.recruiter_code
+       WHERE a.is_active = true
+         AND (
+           EXISTS (
+             SELECT 1 FROM im_interviews i
+             WHERE i.schedule_id = $1
+               AND (
+                 (i.requisition_code IS NOT NULL AND a.requisition_code = i.requisition_code)
+                 OR (i.req_id IS NOT NULL AND a.req_id = i.req_id)
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM interview_schedule_trn ist
+             LEFT JOIN req_mstr rm ON rm.req_id = ist.req_id
+             WHERE ist.schedule_id = $1
+               AND (
+                 (ist.req_id IS NOT NULL AND a.req_id = ist.req_id)
+                 OR (
+                   rm.req_code IS NOT NULL
+                   AND a.requisition_code IS NOT NULL
+                   AND a.requisition_code = rm.req_code
+                 )
+               )
+           )
+         )
+       LIMIT 1`,
+      [panelFixture.schedule_id]
+    ).then((r) => r.rows[0] || null);
+
+    if (assignedRecruiterRow) {
+      const assignedToken = signToken(assignedRecruiterRow);
+      const httpAssigned = await fetchJson(
+        `/feedback-details/${panelFixture.schedule_id}`,
+        assignedToken
+      );
+      if (httpAssigned.status === 200 && httpAssigned.body?.success) {
+        pass("S1 HTTP: assigned recruiter feedback-details (200)");
+      } else {
+        fail("S1 HTTP: assigned recruiter feedback-details", `status=${httpAssigned.status}`);
+      }
     } else {
-      fail("S1 HTTP: recruiter feedback-details IDOR", `status=${httpRecruiter.status}`);
+      skip("S1 HTTP: assigned recruiter feedback-details", "no recruiter assignment on fixture");
+    }
+
+    if (otherRecruiterToken) {
+      const httpRecruiter = await fetchJson(
+        `/feedback-details/${panelFixture.schedule_id}`,
+        otherRecruiterToken
+      );
+      if (httpRecruiter.status === 403) {
+        pass("S1 HTTP: unassigned recruiter feedback-details blocked (403)");
+      } else {
+        fail("S1 HTTP: unassigned recruiter feedback-details IDOR", `status=${httpRecruiter.status}`);
+      }
+    } else {
+      skip("S1 HTTP: unassigned recruiter feedback-details", "no alternate recruiter user");
     }
   } else {
     skip("S1 feedback-details", "no panel schedule fixture");

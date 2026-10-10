@@ -295,31 +295,26 @@ const LEGACY_SCHEDULE_NOT_IN_ENTERPRISE = `
   )
 `;
 
-function parseDdMmYyyy(value) {
-  if (!value || typeof value !== "string") {
+function parseCreatedOnMs(value) {
+  if (value == null || value === "") {
     return 0;
   }
 
-  const [day, month, year] = value.split("-").map((part) => Number(part));
-  if (!day || !month || !year) {
-    return 0;
+  if (value instanceof Date) {
+    const time = value.getTime();
+    return Number.isFinite(time) ? time : 0;
   }
 
-  return new Date(year, month - 1, day).getTime();
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
 function sortInterviewScheduleRows(rows) {
   return rows.sort((a, b) => {
-    const dateA = parseDdMmYyyy(a.interview_date);
-    const dateB = parseDdMmYyyy(b.interview_date);
-    if (dateB !== dateA) {
-      return dateB - dateA;
-    }
-
-    const timeA = String(a.interview_time || "");
-    const timeB = String(b.interview_time || "");
-    if (timeB !== timeA) {
-      return timeB.localeCompare(timeA);
+    const createdA = parseCreatedOnMs(a.created_on);
+    const createdB = parseCreatedOnMs(b.created_on);
+    if (createdB !== createdA) {
+      return createdB - createdA;
     }
 
     return Number(b.schedule_id || 0) - Number(a.schedule_id || 0);
@@ -738,5 +733,6 @@ module.exports = {
   buildRecruiterDashboardResponse,
   listInterviewSchedules,
   listInterviewSchedulesForLegacyApi,
-  listMyInterviewsForLegacyApi
+  listMyInterviewsForLegacyApi,
+  sortInterviewScheduleRows
 };

@@ -1117,6 +1117,89 @@ async function isCallerAssignedToInterview(pool, panelIds, context) {
   return false;
 }
 
+async function isCallerRecruiterAssignedToScheduleContext(pool, employeeCode, context) {
+  const code = String(employeeCode || "").trim();
+  if (!code) {
+    return false;
+  }
+
+  const scheduleId = context.schedule_id;
+  const interviewId = context.interview_id;
+
+  const recruiterMatchSql = `
+    EXISTS (
+      SELECT 1
+      FROM rm_recruiter_assignments a
+      WHERE a.recruiter_code = $1
+        AND a.is_active = true
+        AND (
+          (target.requisition_code IS NOT NULL AND a.requisition_code = target.requisition_code)
+          OR (target.req_id IS NOT NULL AND a.req_id = target.req_id)
+        )
+    )`;
+
+  if (interviewId) {
+    const byInterview = await pool.query(
+      `SELECT 1
+       FROM im_interviews target
+       WHERE target.interview_id = $2
+         AND ${recruiterMatchSql}
+       LIMIT 1`,
+      [code, interviewId]
+    );
+
+    if (byInterview.rows.length) {
+      return true;
+    }
+  }
+
+  if (scheduleId) {
+    const byEnterpriseSchedule = await pool.query(
+      `SELECT 1
+       FROM im_interviews target
+       WHERE target.schedule_id = $2
+         AND ${recruiterMatchSql}
+       LIMIT 1`,
+      [code, scheduleId]
+    );
+
+    if (byEnterpriseSchedule.rows.length) {
+      return true;
+    }
+
+    if (await tableExists(pool, "interview_schedule_trn")) {
+      const byLegacySchedule = await pool.query(
+        `SELECT 1
+         FROM interview_schedule_trn target
+         LEFT JOIN req_mstr rm ON rm.req_id = target.req_id
+         WHERE target.schedule_id = $2
+           AND EXISTS (
+             SELECT 1
+             FROM rm_recruiter_assignments a
+             WHERE a.recruiter_code = $1
+               AND a.is_active = true
+               AND (
+                 (target.req_id IS NOT NULL AND a.req_id = target.req_id)
+                 OR (
+                   rm.req_code IS NOT NULL
+                   AND a.requisition_code IS NOT NULL
+                   AND a.requisition_code = rm.req_code
+                 )
+               )
+           )
+         LIMIT 1`,
+        [code, scheduleId]
+      );
+
+      if (byLegacySchedule.rows.length) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 /**
  * Panel-only actions (e.g. accept assignment) require an active panel row on the interview.
  */
@@ -1152,9 +1235,8 @@ async function assertInterviewPanelActionAccess(pool, req, interviewRow) {
 }
 
 /**
- * Mirrors /my-interviews panel rule: active interview_panel_mstr row for caller,
- * assigned via interview_schedule_trn.interviewer_id or im_panel_assignments.panel_id.
- * Admin retains unrestricted access.
+ * Feedback read: Admin; active panel on the interview; or active recruiter assigned to
+ * the interview requisition (aligned with interview schedule list scoping).
  */
 async function assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewId } = {}) {
   if (!req?.user) {
@@ -1173,21 +1255,28 @@ async function assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewI
 
   const panelIds = await resolveCallerPanelIds(pool, req);
 
-  if (!panelIds.length) {
-    throw httpError(
-      "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
-      403
-    );
+  if (panelIds.length) {
+    const panelAssigned = await isCallerAssignedToInterview(pool, panelIds, context);
+    if (panelAssigned) {
+      return;
+    }
   }
 
-  const assigned = await isCallerAssignedToInterview(pool, panelIds, context);
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const recruiterAssigned = await isCallerRecruiterAssignedToScheduleContext(
+    pool,
+    employeeCode,
+    context
+  );
 
-  if (!assigned) {
-    throw httpError(
-      "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
-      403
-    );
+  if (recruiterAssigned) {
+    return;
   }
+
+  throw httpError(
+    "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
+    403
+  );
 }
 
 async function submitFeedback(pool, payload, req) {
@@ -1326,7 +1415,7 @@ async function submitFeedback(pool, payload, req) {
     metadata: { finalOutcome, ruleEvaluation: ruleEval }
   });
 
-  await syncLegacyFeedback(pool, interview, payload, user);
+  await syncLegacyFeedback(pool, interview, payload, user, req);
 
   return {
     interview: await getInterview(pool, interview.interviewId),
@@ -1486,7 +1575,7 @@ function resolveStageFromOutcome(interviewLevel, finalOutcome) {
   return null;
 }
 
-async function syncLegacyFeedback(pool, interview, payload, user) {
+async function syncLegacyFeedback(pool, interview, payload, user, req) {
   const scheduleId = interview.scheduleId || payload.schedule_id;
   const newStage = resolveStageFromOutcome(payload.interview_level, payload.final_outcome);
 
