@@ -12,6 +12,116 @@ function httpError(message, status = 500) {
   return error;
 }
 
+function getConfiguredSofficePaths() {
+  const raw =
+    process.env.LIBREOFFICE_PATH ||
+    process.env.SOFFICE_PATH ||
+    process.env.LIBRE_OFFICE_EXE ||
+    "";
+
+  const trimmed = String(raw).trim();
+
+  return trimmed ? [trimmed] : [];
+}
+
+function resolveSofficeBinaryCandidates() {
+  const configured = getConfiguredSofficePaths();
+  const candidates = [...configured];
+
+  if (process.platform === "win32") {
+    const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
+    const programFilesX86 =
+      process.env["PROGRAMFILES(X86)"] ||
+      process.env.PROGRAMFILES_X86 ||
+      "C:\\Program Files (x86)";
+
+    candidates.push(
+      path.join(programFiles, "LibreOffice", "program", "soffice.exe"),
+      path.join(programFilesX86, "LibreOffice", "program", "soffice.exe"),
+      "soffice.exe",
+      "soffice"
+    );
+  } else if (process.platform === "darwin") {
+    candidates.push(
+      "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+      "soffice"
+    );
+  } else {
+    candidates.push(
+      "/usr/bin/libreoffice",
+      "/usr/bin/soffice",
+      "/snap/bin/libreoffice",
+      "/opt/libreoffice/program/soffice",
+      "/opt/libreoffice7.6/program/soffice",
+      "soffice",
+      "libreoffice"
+    );
+  }
+
+  const seen = new Set();
+
+  return candidates.filter((candidate) => {
+    const key = String(candidate || "").trim();
+
+    if (!key || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function pathExists(candidate) {
+  try {
+    fs.accessSync(candidate, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveSofficeExecCommands() {
+  const commands = [];
+  const seen = new Set();
+
+  const addCommand = (binary, cwd) => {
+    const key = `${binary}@@${cwd || ""}`;
+
+    if (!binary || seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    commands.push({ binary, cwd: cwd || undefined });
+  };
+
+  for (const candidate of resolveSofficeBinaryCandidates()) {
+    const isPathLike = candidate.includes("/") || candidate.includes("\\");
+
+    if (!isPathLike) {
+      addCommand(candidate, undefined);
+      continue;
+    }
+
+    if (pathExists(candidate)) {
+      addCommand(candidate, path.dirname(candidate));
+    }
+  }
+
+  return commands;
+}
+
+function buildLibreOfficeConvertOptions() {
+  const sofficeBinaryPaths = getConfiguredSofficePaths();
+
+  if (!sofficeBinaryPaths.length) {
+    return undefined;
+  }
+
+  return { sofficeBinaryPaths };
+}
+
 async function convertWithLibreOfficeConvert(docxBuffer) {
   let libre;
 
@@ -21,13 +131,15 @@ async function convertWithLibreOfficeConvert(docxBuffer) {
     return null;
   }
 
+  const convertOptions = buildLibreOfficeConvertOptions();
+
   try {
     if (typeof libre.convertAsync === "function") {
-      return await libre.convertAsync(docxBuffer, ".pdf", undefined);
+      return await libre.convertAsync(docxBuffer, ".pdf", convertOptions);
     }
 
     return await new Promise((resolve, reject) => {
-      libre.convert(docxBuffer, ".pdf", undefined, (error, pdfBuffer) => {
+      libre.convert(docxBuffer, ".pdf", convertOptions, (error, pdfBuffer) => {
         if (error) {
           reject(error);
           return;
@@ -41,9 +153,13 @@ async function convertWithLibreOfficeConvert(docxBuffer) {
   }
 }
 
-function resolveSofficeCommands(inputPath, tempDir) {
-  const programDir = "C:\\Program Files\\LibreOffice\\program";
-  const programDirX86 = "C:\\Program Files (x86)\\LibreOffice\\program";
+async function convertWithSoffice(docxBuffer) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "optalynx-offer-pdf-"));
+  const inputPath = path.join(tempDir, "offer-letter.docx");
+  const outputPath = path.join(tempDir, "offer-letter.pdf");
+
+  fs.writeFileSync(inputPath, docxBuffer);
+
   const convertArgs = [
     "--headless",
     "--invisible",
@@ -54,31 +170,16 @@ function resolveSofficeCommands(inputPath, tempDir) {
     inputPath
   ];
 
-  return [
-    { binary: "soffice", args: convertArgs, cwd: programDir },
-    { binary: path.join(programDir, "soffice.exe"), args: convertArgs, cwd: programDir },
-    {
-      binary: path.join(programDirX86, "soffice.exe"),
-      args: convertArgs,
-      cwd: programDirX86
-    }
-  ];
-}
-
-async function convertWithSoffice(docxBuffer) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "optalynx-offer-pdf-"));
-  const inputPath = path.join(tempDir, "offer-letter.docx");
-  const outputPath = path.join(tempDir, "offer-letter.pdf");
-
-  fs.writeFileSync(inputPath, docxBuffer);
-
-  const commands = resolveSofficeCommands(inputPath, tempDir);
+  const commands = resolveSofficeExecCommands();
 
   let lastError = null;
 
-  for (const { binary, args, cwd } of commands) {
+  for (const { binary, cwd } of commands) {
     try {
-      await execFileAsync(binary, args, { timeout: 120000, cwd });
+      await execFileAsync(binary, convertArgs, {
+        timeout: 120000,
+        cwd: cwd || undefined
+      });
 
       if (fs.existsSync(outputPath)) {
         const pdfBuffer = fs.readFileSync(outputPath);
@@ -99,10 +200,33 @@ async function convertWithSoffice(docxBuffer) {
   return null;
 }
 
+function buildConversionFailureMessage(lastError) {
+  const platformHint =
+    process.platform === "win32"
+      ? "Install LibreOffice or set LIBREOFFICE_PATH to soffice.exe."
+      : "Install LibreOffice (soffice) on the server or set LIBREOFFICE_PATH to the soffice binary.";
+
+  if (lastError?.message) {
+    const isMissingBinary =
+      lastError.code === "ENOENT" ||
+      /could not find soffice/i.test(String(lastError.message));
+
+    if (isMissingBinary) {
+      return `PDF conversion failed: LibreOffice (soffice) is not available. ${platformHint}`;
+    }
+
+    return `PDF conversion failed: ${lastError.message}`;
+  }
+
+  return `PDF conversion requires LibreOffice (soffice) on the server. ${platformHint}`;
+}
+
 async function generatePdfFromDocx(docxBuffer) {
   if (!Buffer.isBuffer(docxBuffer) || !docxBuffer.length) {
     throw httpError("Merged offer letter DOCX buffer is empty.", 400);
   }
+
+  let lastError = null;
 
   try {
     const libreOfficePdf = await convertWithLibreOfficeConvert(docxBuffer);
@@ -117,18 +241,14 @@ async function generatePdfFromDocx(docxBuffer) {
       return sofficePdf;
     }
   } catch (error) {
-    throw httpError(
-      `PDF conversion failed: ${error.message || "LibreOffice conversion error."}`,
-      500
-    );
+    lastError = error;
   }
 
-  throw httpError(
-    "PDF conversion requires LibreOffice (soffice) on the server. Install LibreOffice and retry.",
-    500
-  );
+  throw httpError(buildConversionFailureMessage(lastError), 500);
 }
 
 module.exports = {
-  generatePdfFromDocx
+  generatePdfFromDocx,
+  resolveSofficeBinaryCandidates,
+  resolveSofficeExecCommands
 };
