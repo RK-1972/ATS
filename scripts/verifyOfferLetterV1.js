@@ -3,10 +3,17 @@
  * SalaryCalculationService = persisted breakup = Offer Summary aggregation = Annexure mapping
  * compared against uploaded Salary Calculation Excel reference values.
  */
+const PizZip = require("pizzip");
+
 const salaryCalculationService = require("../services/salaryCalculationService");
 const offerTemplateMergeService = require("../services/offerTemplateMergeService");
+const {
+  ANNEXURE_LABEL_ROWS,
+  resolveAnnexureRowByLabel
+} = require("../services/offerAnnexureMergeMapping");
 
 const EXCEL_REFERENCE_CTC = 1550884.6153846153;
+const LOW_CTC_CASE = 300000;
 
 const EXCEL_REFERENCE = {
   basicMonthly: 49720,
@@ -42,13 +49,35 @@ const EXCEL_REFERENCE = {
 const ANNEXURE_FIELDS = [
   ["basicMonthly", "basicAnnual"],
   ["hraMonthly", "hraAnnual"],
+  ["conveyanceMonthly", "conveyanceAnnual"],
+  ["medicalMonthly", "medicalAnnual"],
+  ["educationMonthly", "educationAnnual"],
+  ["specialAllowanceMonthly", "specialAllowanceAnnual"],
   ["grossMonthly", "grossAnnual"],
   ["employerPF", "employerPFAnnual"],
   ["gratuity", "gratuityAnnual"],
+  ["mediclaimMonthly", "mediclaimAnnual"],
   ["esicMonthly", "esicAnnual"],
   ["statutoryBonusMonthly", "statutoryBonusAnnual"],
   ["employerContribution", "employerContributionAnnual"],
   ["totalCTCMonthly", "totalCTC"]
+];
+
+const DOCX_ANNEXURE_ROW_IDS = [
+  "basic",
+  "hra",
+  "conveyance",
+  "medical-reimbursement",
+  "education",
+  "special-allowance",
+  "gross-salary",
+  "provident-fund",
+  "gratuity",
+  "mediclaim-insurance",
+  "esic",
+  "statutory-bonus",
+  "company-contribution-total",
+  "total-ctc"
 ];
 
 function assertClose(actual, expected, label, tolerance = 0.02) {
@@ -121,6 +150,114 @@ function compareOfferSummary(aggregated, excel) {
   return results;
 }
 
+function getCellText(cellXml) {
+  return [...cellXml.matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join("")
+    .trim();
+}
+
+function parseIndianAmount(value) {
+  const normalized = String(value || "")
+    .replace(/,/g, "")
+    .replace(/[^\d.-]/g, "")
+    .trim();
+
+  if (!normalized) {
+    return 0;
+  }
+
+  return Number(normalized);
+}
+
+function extractAnnexureRowsFromDocx(docxBuffer) {
+  const zip = new PizZip(docxBuffer);
+  const documentXml = zip.file("word/document.xml")?.asText() || "";
+  const rows = [];
+
+  for (const match of documentXml.matchAll(/<w:tr[\s\S]*?<\/w:tr>/g)) {
+    const cells = [...match[0].matchAll(/<w:tc[\s\S]*?<\/w:tc>/g)].map((cellMatch) => ({
+      xml: cellMatch[0],
+      text: getCellText(cellMatch[0])
+    }));
+
+    if (cells.length < 3) {
+      continue;
+    }
+
+    const mapping = resolveAnnexureRowByLabel(cells[0].text, cells);
+
+    if (!mapping) {
+      continue;
+    }
+
+    rows.push({
+      id: mapping.id,
+      label: cells[0].text,
+      monthly: parseIndianAmount(cells[1].text),
+      annual: parseIndianAmount(cells[2].text)
+    });
+  }
+
+  return rows;
+}
+
+function compareMergedDocxAnnexure(docxBuffer, salaryBreakup, prefix) {
+  const extractedRows = extractAnnexureRowsFromDocx(docxBuffer);
+  const byId = new Map(extractedRows.map((row) => [row.id, row]));
+  const results = [];
+
+  DOCX_ANNEXURE_ROW_IDS.forEach((rowId) => {
+    const mapping = ANNEXURE_LABEL_ROWS.find((item) => item.id === rowId);
+    const row = byId.get(rowId);
+
+    if (!mapping) {
+      results.push({
+        ok: false,
+        label: `${prefix}.mapping.${rowId}`,
+        expected: "mapping",
+        actual: "missing"
+      });
+      return;
+    }
+
+    if (!row) {
+      results.push({
+        ok: false,
+        label: `${prefix}.row.${rowId}`,
+        expected: "present in merged DOCX",
+        actual: "missing"
+      });
+      return;
+    }
+
+    const expectedMonthly = mapping.monthly(salaryBreakup);
+    const expectedAnnual = mapping.annual(salaryBreakup);
+
+    results.push(
+      assertClose(row.monthly, expectedMonthly, `${prefix}.${rowId}.monthly`)
+    );
+    results.push(
+      assertClose(row.annual, expectedAnnual, `${prefix}.${rowId}.annual`)
+    );
+  });
+
+  return results;
+}
+
+function mergeOfferLetterForBreakup(salaryBreakup, offeredCtc) {
+  return offerTemplateMergeService.mergeOfferLetterTemplate({
+    offerRow: {
+      candidate_name: "Verification Candidate",
+      position_title: "Verification Role",
+      offered_ctc: offeredCtc,
+      valid_until: "2026-07-01"
+    },
+    organizationRow: { organization_name: "IGS Engineering Quality" },
+    salaryBreakup
+  });
+}
+
 function printResults(title, results) {
   const failures = results.filter((item) => !item.ok);
 
@@ -144,16 +281,7 @@ async function main() {
   const offerSummary = salaryCalculationService.aggregatePersistedRows(persistedRows);
   const annexureBreakup = offerSummary.salaryBreakup;
 
-  const mergedDocx = offerTemplateMergeService.mergeOfferLetterTemplate({
-    offerRow: {
-      candidate_name: "Verification Candidate",
-      position_title: "Verification Role",
-      offered_ctc: EXCEL_REFERENCE_CTC,
-      valid_until: "2026-07-01"
-    },
-    organizationRow: { organization_name: "IGS Engineering Quality" },
-    salaryBreakup: annexureBreakup
-  });
+  const mergedDocx = mergeOfferLetterForBreakup(annexureBreakup, EXCEL_REFERENCE_CTC);
 
   const calcOk = printResults(
     "1. SalaryCalculationService vs Excel",
@@ -186,9 +314,43 @@ async function main() {
     ])
   );
 
+  const docxOk = printResults(
+    "5. Merged DOCX Annexure-A rows vs salaryBreakup (reference CTC)",
+    compareMergedDocxAnnexure(mergedDocx, annexureBreakup, "DocxAnnexure")
+  );
+
+  const lowCalculated = salaryCalculationService.calculateSalaryBreakup(LOW_CTC_CASE);
+  const lowPersisted = salaryCalculationService.mapBreakupToPersistedRows(lowCalculated);
+  const lowSummary = salaryCalculationService.aggregatePersistedRows(lowPersisted);
+  const lowMergedDocx = mergeOfferLetterForBreakup(
+    lowSummary.salaryBreakup,
+    LOW_CTC_CASE
+  );
+
+  const lowZeroOk = printResults(
+    "6. Low CTC zero-valued optional earnings in salaryBreakup",
+    [
+      assertClose(lowCalculated.conveyanceMonthly, 0, "LowCtc.conveyanceMonthly"),
+      assertClose(lowCalculated.medicalMonthly, 0, "LowCtc.medicalMonthly"),
+      assertClose(lowCalculated.educationMonthly, 0, "LowCtc.educationMonthly")
+    ]
+  );
+
+  const lowDocxOk = printResults(
+    `7. Merged DOCX Annexure-A rows vs salaryBreakup (low CTC ${LOW_CTC_CASE})`,
+    compareMergedDocxAnnexure(lowMergedDocx, lowSummary.salaryBreakup, "LowCtcDocx")
+  );
+
   console.log(`\nMerged DOCX size: ${mergedDocx.length} bytes`);
 
-  const allOk = calcOk && summaryOk && annexureOk && parityOk;
+  const allOk =
+    calcOk &&
+    summaryOk &&
+    annexureOk &&
+    parityOk &&
+    docxOk &&
+    lowZeroOk &&
+    lowDocxOk;
 
   if (!allOk) {
     process.exitCode = 1;
@@ -198,7 +360,7 @@ async function main() {
 
   console.log("\nVERIFICATION RESULT: PASSED");
   console.log(
-    "Offer Summary = Offer Letter Annexure = Salary Calculation Excel for all checked components."
+    "Offer Summary, salaryBreakup, and merged DOCX Annexure-A match for reference and low CTC cases."
   );
 }
 

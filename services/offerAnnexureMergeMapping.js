@@ -60,6 +60,12 @@ const ANNEXURE_LABEL_ROWS = [
     annual: (breakup) => breakup.gratuityAnnual
   },
   {
+    id: "mediclaim-insurance",
+    labels: ["Mediclaim Insurance"],
+    monthly: (breakup) => breakup.mediclaimMonthly,
+    annual: (breakup) => breakup.mediclaimAnnual
+  },
+  {
     id: "esic",
     labels: ["ESIC"],
     monthly: (breakup) => breakup.esicMonthly,
