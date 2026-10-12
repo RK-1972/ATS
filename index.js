@@ -1,9 +1,6 @@
 require("dotenv").config();
 const axios = require("axios");
 
-const {
-  ConfidentialClientApplication
-} = require("@azure/msal-node");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -42,6 +39,10 @@ const {
   respondClassicCandidateRouteDeprecated
 } = require("./utils/classicCandidateRouteDeprecation");
 const candidateRegistrationValidation = require("./services/candidateRegistrationValidation");
+const {
+  getConfidentialClientApplication,
+  isMicrosoftGraphAuthConfigured
+} = require("./utils/graphMsalClient");
 
 const app = express();
 
@@ -92,27 +93,11 @@ app.get(
 // Microsoft Graph Configuration
 // =====================================================
 
-const msalConfig = {
-
-  auth: {
-
-    clientId:
-      process.env.CLIENT_ID,
-
-    authority:
-      `https://login.microsoftonline.com/${process.env.TENANT_ID}`,
-
-    clientSecret:
-      process.env.CLIENT_SECRET
-
-  }
-
-};
-
-const cca =
-  new ConfidentialClientApplication(
-    msalConfig
+if (!isMicrosoftGraphAuthConfigured()) {
+  console.warn(
+    "⚠️ Microsoft Graph credentials not set; Graph email/Teams features unavailable until CLIENT_ID, TENANT_ID, and CLIENT_SECRET are configured."
   );
+}
 
   // =====================================================
 // Get Microsoft Graph Token
@@ -121,6 +106,8 @@ const cca =
 async function getGraphToken() {
 
   try {
+
+    const cca = getConfidentialClientApplication();
 
     const tokenRequest = {
 

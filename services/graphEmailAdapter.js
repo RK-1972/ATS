@@ -4,19 +4,10 @@
  */
 
 const axios = require("axios");
-const { ConfidentialClientApplication } = require("@azure/msal-node");
-
-const msalConfig = {
-  auth: {
-    clientId: process.env.CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${process.env.TENANT_ID}`,
-    clientSecret: process.env.CLIENT_SECRET
-  }
-};
-
-const cca = new ConfidentialClientApplication(msalConfig);
+const { getConfidentialClientApplication } = require("../utils/graphMsalClient");
 
 async function getGraphToken() {
+  const cca = getConfidentialClientApplication();
   const response = await cca.acquireTokenByClientCredential({
     scopes: ["https://graph.microsoft.com/.default"]
   });
