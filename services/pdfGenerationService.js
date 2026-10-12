@@ -24,9 +24,60 @@ function getConfiguredSofficePaths() {
   return trimmed ? [trimmed] : [];
 }
 
+function resolvePortableLibreOfficeCandidates() {
+  if (process.platform === "win32" || process.platform === "darwin") {
+    return [];
+  }
+
+  const candidates = [];
+  const portableOptRoot = path.join(process.cwd(), ".libreoffice", "root", "opt");
+
+  if (!pathExists(portableOptRoot)) {
+    return candidates;
+  }
+
+  let entries = [];
+
+  try {
+    entries = fs.readdirSync(portableOptRoot);
+  } catch {
+    return candidates;
+  }
+
+  for (const entry of entries) {
+    if (!String(entry).startsWith("libreoffice")) {
+      continue;
+    }
+
+    const sofficePath = path.join(portableOptRoot, entry, "program", "soffice");
+
+    if (pathExists(sofficePath)) {
+      candidates.push(sofficePath);
+    }
+  }
+
+  return candidates;
+}
+
 function resolveSofficeBinaryCandidates() {
   const configured = getConfiguredSofficePaths();
-  const candidates = [...configured];
+
+  if (process.env.OPTALYNX_LIMIT_SOFFICE_TO_CONFIGURED === "1") {
+    const seen = new Set();
+
+    return configured.filter((candidate) => {
+      const key = String(candidate || "").trim();
+
+      if (!key || seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+  }
+
+  const candidates = [...configured, ...resolvePortableLibreOfficeCandidates()];
 
   if (process.platform === "win32") {
     const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
@@ -81,6 +132,18 @@ function pathExists(candidate) {
   }
 }
 
+function buildSofficeExecEnv(binary) {
+  const env = { ...process.env };
+  const programDir = path.dirname(binary);
+
+  if (programDir.endsWith(`${path.sep}program`)) {
+    const existing = env.LD_LIBRARY_PATH || "";
+    env.LD_LIBRARY_PATH = existing ? `${programDir}:${existing}` : programDir;
+  }
+
+  return env;
+}
+
 function resolveSofficeExecCommands() {
   const commands = [];
   const seen = new Set();
@@ -113,13 +176,29 @@ function resolveSofficeExecCommands() {
 }
 
 function buildLibreOfficeConvertOptions() {
-  const sofficeBinaryPaths = getConfiguredSofficePaths();
+  const sofficeBinaryPaths =
+    process.env.OPTALYNX_LIMIT_SOFFICE_TO_CONFIGURED === "1"
+      ? getConfiguredSofficePaths()
+      : [...getConfiguredSofficePaths(), ...resolvePortableLibreOfficeCandidates()];
 
-  if (!sofficeBinaryPaths.length) {
+  const seen = new Set();
+
+  const uniquePaths = sofficeBinaryPaths.filter((candidate) => {
+    const key = String(candidate || "").trim();
+
+    if (!key || seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+
+  if (!uniquePaths.length) {
     return undefined;
   }
 
-  return { sofficeBinaryPaths };
+  return { sofficeBinaryPaths: uniquePaths };
 }
 
 async function convertWithLibreOfficeConvert(docxBuffer) {
@@ -132,14 +211,30 @@ async function convertWithLibreOfficeConvert(docxBuffer) {
   }
 
   const convertOptions = buildLibreOfficeConvertOptions();
+  const libreOptions = convertOptions || {};
 
   try {
-    if (typeof libre.convertAsync === "function") {
-      return await libre.convertAsync(docxBuffer, ".pdf", convertOptions);
+    if (typeof libre.convertWithOptions === "function") {
+      return await new Promise((resolve, reject) => {
+        libre.convertWithOptions(
+          docxBuffer,
+          ".pdf",
+          undefined,
+          libreOptions,
+          (error, pdfBuffer) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve(pdfBuffer);
+          }
+        );
+      });
     }
 
     return await new Promise((resolve, reject) => {
-      libre.convert(docxBuffer, ".pdf", convertOptions, (error, pdfBuffer) => {
+      libre.convert(docxBuffer, ".pdf", undefined, (error, pdfBuffer) => {
         if (error) {
           reject(error);
           return;
@@ -178,7 +273,8 @@ async function convertWithSoffice(docxBuffer) {
     try {
       await execFileAsync(binary, convertArgs, {
         timeout: 120000,
-        cwd: cwd || undefined
+        cwd: cwd || undefined,
+        env: buildSofficeExecEnv(binary)
       });
 
       if (fs.existsSync(outputPath)) {
