@@ -224,6 +224,17 @@ async function notifyClarificationRequested(queryable, event, req) {
     );
   }
 
+  if (isOfferEvent(event)) {
+    return offerWorkflowCompletionService.handleOfferClarificationRequested(
+      queryable,
+      {
+        ...event,
+        executionContext: event.executionContext || parseContext(event.executionContext)
+      },
+      req
+    );
+  }
+
   if (workflowCode === "REQUISITION") {
     return talentDemandWorkflowCompletionService.handleRequisitionClarificationRequested(
       queryable,
@@ -261,6 +272,14 @@ async function notifyClarificationSubmitted(queryable, event, req) {
 
   if (workflowCode === "REQUISITION" && isBudgetChangeEvent(event)) {
     return requisitionBudgetChangeService.handleBudgetChangeClarificationSubmitted(
+      queryable,
+      event,
+      req
+    );
+  }
+
+  if (isOfferEvent(event)) {
+    return offerWorkflowCompletionService.handleOfferClarificationSubmitted(
       queryable,
       event,
       req

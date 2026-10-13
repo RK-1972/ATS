@@ -181,9 +181,17 @@ async function cancelPendingOfferApprovalWork(
     `SELECT task_id, status
      FROM wf_tasks
      WHERE instance_id = $1
-       AND task_type = 'approval'
-       AND title LIKE 'Approval Step %'
-       AND LOWER(status) IN ('pending', 'waiting')
+       AND (
+         (
+           task_type = 'approval'
+           AND title LIKE 'Approval Step %'
+           AND LOWER(status) IN ('pending', 'waiting')
+         )
+         OR (
+           LOWER(COALESCE(task_type, '')) = 'clarification'
+           AND LOWER(status) IN ('pending', 'waiting', 'waiting for clarification')
+         )
+       )
      ORDER BY task_id ASC
      FOR UPDATE`,
     [instanceId]

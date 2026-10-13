@@ -661,6 +661,81 @@ function assertInstanceRunning(instance) {
   }
 }
 
+function parseInstanceExecutionContext(instance) {
+  const raw = instance?.execution_context;
+  if (raw && typeof raw === "object") {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function isOfferWorkflowInstance(instance) {
+  const workflowCode = String(instance?.workflow_code || "").toUpperCase();
+  if (workflowCode === "OFFER" || workflowCode.includes("OFFER")) {
+    return true;
+  }
+
+  const context = parseInstanceExecutionContext(instance);
+  const meta = context.meta && typeof context.meta === "object" ? context.meta : {};
+  const documentType = String(meta.document_type || "").toUpperCase();
+
+  return documentType === "OFFER" || Boolean(meta.offer_id);
+}
+
+/**
+ * Reject during clarification hold: approver assignment is inactive but hold records assignment_id.
+ */
+async function assertHeldClarificationApproverRejectAuthorized(
+  client,
+  taskId,
+  clarificationHold,
+  req
+) {
+  const { employeeCode } = resolveAssigneeIdentity(req, {
+    requireEmployeeCode: true
+  });
+
+  const heldTaskId = Number(clarificationHold?.task_id);
+  if (!heldTaskId || heldTaskId !== Number(taskId)) {
+    throw httpError("Clarification hold does not match this approval task.", 400);
+  }
+
+  const assignmentId = clarificationHold?.assignment_id
+    ? Number(clarificationHold.assignment_id)
+    : null;
+
+  if (!assignmentId) {
+    throw httpError("Clarification hold is missing approver assignment.", 400);
+  }
+
+  const result = await client.query(
+    `SELECT a.assignee, a.assignment_id
+     FROM wf_assignments a
+     WHERE a.assignment_id = $1
+       AND a.task_id = $2`,
+    [assignmentId, taskId]
+  );
+
+  if (!result.rows.length) {
+    throw httpError("Clarification hold assignment not found.", 404);
+  }
+
+  const assignee = String(result.rows[0].assignee || "").trim();
+  if (!assignee || assignee !== employeeCode) {
+    throw httpError(
+      "No active approval assignment found for this task and user.",
+      403
+    );
+  }
+}
+
 /**
  * Ensure exactly one active assignment for a task (and none elsewhere on the instance).
  */
@@ -945,8 +1020,6 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
 
     const task = taskResult.rows[0];
 
-    assertTaskStatusPending(task);
-
     // 1b. Lock workflow instance
     const instanceResult = await client.query(
       "SELECT * FROM wf_instances WHERE instance_id = $1 FOR UPDATE",
@@ -959,11 +1032,29 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
 
     const instance = instanceResult.rows[0];
     const instanceStatus = String(instance.status || "");
+    const executionContext = parseInstanceExecutionContext(instance);
+    const clarificationHold = executionContext.clarification || null;
+    const taskStatus = String(task.status || "");
+    const rejectDuringClarificationHold =
+      isOfferWorkflowInstance(instance)
+      && instanceStatus === INSTANCE_STATUS.PAUSED
+      && taskStatus === TASK_STATUS.CLARIFICATION
+      && clarificationHold
+      && Number(clarificationHold.task_id) === Number(taskId);
 
-    assertInstanceRunning(instance);
-
-    // Re-validate active assignee under the same locks (employee_code authoritative)
-    await assertActiveAssignee(client, taskId, req, { forUpdate: true });
+    if (rejectDuringClarificationHold) {
+      await assertHeldClarificationApproverRejectAuthorized(
+        client,
+        taskId,
+        clarificationHold,
+        req
+      );
+    } else {
+      assertTaskStatusPending(task);
+      assertInstanceRunning(instance);
+      // Re-validate active assignee under the same locks (employee_code authoritative)
+      await assertActiveAssignee(client, taskId, req, { forUpdate: true });
+    }
 
     // 2. Mark current task Completed (outcome = Rejected in history/audit)
     await client.query(
@@ -996,12 +1087,33 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
 
     const cancelledTaskIds = waitingResult.rows.map((row) => row.task_id);
 
-    if (cancelledTaskIds.length > 0) {
+    const clarificationCancelResult = await client.query(
+      `SELECT task_id
+       FROM wf_tasks
+       WHERE instance_id = $1
+         AND task_id <> $2
+         AND LOWER(COALESCE(task_type, '')) = 'clarification'
+         AND LOWER(TRIM(status)) = 'pending'
+       ORDER BY task_id ASC
+       FOR UPDATE`,
+      [task.instance_id, taskId]
+    );
+
+    const cancelledClarificationTaskIds = clarificationCancelResult.rows.map(
+      (row) => row.task_id
+    );
+
+    const allCancelledTaskIds = [
+      ...cancelledTaskIds,
+      ...cancelledClarificationTaskIds
+    ];
+
+    if (allCancelledTaskIds.length > 0) {
       await client.query(
         `UPDATE wf_tasks
          SET status = $2, completed_on = NOW()
          WHERE task_id = ANY($1::int[])`,
-        [cancelledTaskIds, TASK_STATUS.CANCELLED]
+        [allCancelledTaskIds, TASK_STATUS.CANCELLED]
       );
     }
 
@@ -1045,18 +1157,28 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
       outcome: "Rejected"
     });
 
+    const nextExecutionContext = rejectDuringClarificationHold
+      ? (() => {
+          const cleared = { ...executionContext };
+          delete cleared.clarification;
+          return cleared;
+        })()
+      : executionContext;
+
     await client.query(
       `UPDATE wf_instances
        SET status = $2,
            instance_payload = $3,
+           execution_context = $4,
            completed_on = NOW(),
-           modified_by = $4,
+           modified_by = $5,
            modified_on = NOW()
        WHERE instance_id = $1`,
       [
         task.instance_id,
         INSTANCE_STATUS.REJECTED,
         JSON.stringify(payload),
+        JSON.stringify(nextExecutionContext),
         user.name
       ]
     );
@@ -1067,25 +1189,29 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
       stageKey: task.stage_key,
       actor: user.name,
       actorRole: user.role,
-      action: "Approval rejected",
+      action: rejectDuringClarificationHold
+        ? "Approval rejected during outstanding clarification"
+        : "Approval rejected",
       comments: comments || "",
       metadata: {
         taskId,
         outcome: "Rejected",
-        previousStatus: task.status
+        previousStatus: task.status,
+        rejectDuringClarificationHold
       }
     });
 
-    if (cancelledTaskIds.length > 0) {
+    if (allCancelledTaskIds.length > 0) {
       await appendHistory(client, task.instance_id, {
         eventType: "TasksCancelled",
         stageKey: task.stage_key,
         actor: user.name,
         actorRole: user.role,
-        action: "Remaining waiting approval tasks cancelled",
+        action: "Remaining workflow tasks cancelled after rejection",
         comments: comments || "",
         metadata: {
-          cancelledTaskIds,
+          cancelledTaskIds: allCancelledTaskIds,
+          cancelledClarificationTaskIds,
           outcome: "Cancelled",
           rejectedTaskId: taskId
         }
@@ -1101,9 +1227,11 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
       comments: comments || "",
       metadata: {
         rejectedTaskId: taskId,
-        cancelledTaskIds,
+        cancelledTaskIds: allCancelledTaskIds,
+        cancelledClarificationTaskIds,
         outcome: "Rejected",
-        instanceStatus: INSTANCE_STATUS.REJECTED
+        instanceStatus: INSTANCE_STATUS.REJECTED,
+        rejectDuringClarificationHold
       }
     });
 
@@ -1136,7 +1264,9 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
       metadata: {
         taskId,
         outcome: "Rejected",
-        cancelledTaskIds,
+        cancelledTaskIds: allCancelledTaskIds,
+        cancelledClarificationTaskIds,
+        rejectDuringClarificationHold,
         comments: comments || "",
         businessActionCompleted: Boolean(
           businessAction?.businessActionCompleted
@@ -1152,7 +1282,9 @@ async function rejectMyActiveApproval(pool, taskId, comments, req) {
       outcome: "Rejected",
       instanceId: task.instance_id,
       instanceStatus: INSTANCE_STATUS.REJECTED,
-      cancelledTaskIds,
+      cancelledTaskIds: allCancelledTaskIds,
+      cancelledClarificationTaskIds,
+      rejectDuringClarificationHold,
       workflowRejected: true,
       businessActionCompleted: Boolean(
         businessAction?.businessActionCompleted
@@ -1375,7 +1507,9 @@ async function requestClarificationMyActiveApproval(pool, taskId, comments, req)
         ? `Clarify Budget — ${domainClarification.budget_request_id}`
         : domainClarification.requisition_code
           ? `Clarify Requisition — ${domainClarification.requisition_code}`
-          : `Clarify — ${task.instance_id}`;
+          : domainClarification.offer_id
+            ? `Clarify Offer — ${domainClarification.offer_id}`
+            : `Clarify — ${task.instance_id}`;
 
       requestorTaskId = await createTask(client, task.instance_id, {
         stageKey: stageKey || "clarification",
@@ -2001,6 +2135,13 @@ async function assertClarificationSubmitAuthorized(pool, req, instance, options 
     return;
   }
 
+  if (isOfferWorkflowInstance(instance)) {
+    const { isTaLeadRole } = require("./offerCapabilityAuth");
+    if (isTaLeadRole(req)) {
+      return;
+    }
+  }
+
   const clarificationHold = options.clarificationHold || null;
   const actorCode = String(req.user?.employee_code || "").trim();
   const ownerKeys = await resolveWorkflowActorKeys(pool, req);
@@ -2091,6 +2232,17 @@ async function submitClarification(pool, instanceId, comments, req) {
 
     const instance = instanceResult.rows[0];
     const instanceStatus = String(instance.status || "");
+
+    if (
+      instanceStatus === INSTANCE_STATUS.REJECTED
+      || instanceStatus === INSTANCE_STATUS.COMPLETED
+    ) {
+      throw httpError(
+        "Workflow is no longer active; clarification cannot be submitted.",
+        409
+      );
+    }
+
     const priorContext =
       instance.execution_context && typeof instance.execution_context === "object"
         ? instance.execution_context

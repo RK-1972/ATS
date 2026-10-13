@@ -425,10 +425,183 @@ async function handleOfferWorkflowRejected(queryable, event, req) {
   };
 }
 
+async function resolveOfferRequestorEmployeeCode(queryable, offerRow) {
+  const keys = [offerRow.recruiter_id, offerRow.created_by].filter(Boolean);
+
+  for (const key of keys) {
+    const lookupKey = String(key).trim();
+    if (!lookupKey) {
+      continue;
+    }
+
+    const result = await queryable.query(
+      `SELECT employee_code
+       FROM user_mstr
+       WHERE (
+         employee_code = $1
+         OR email_id = $1
+         OR full_name = $1
+       )
+       AND COALESCE(is_active, TRUE) = TRUE
+       LIMIT 1`,
+      [lookupKey]
+    );
+
+    if (result.rows[0]?.employee_code) {
+      return String(result.rows[0].employee_code).trim();
+    }
+  }
+
+  return null;
+}
+
+const OFFER_CLARIFICATION_REQUESTOR_UNRESOLVED_MESSAGE =
+  "Cannot request clarification because the offer requester could not be resolved to an active user.";
+
+/**
+ * Fail before send-back when no authoritative requester employee_code exists.
+ */
+async function assertOfferClarificationRequestorResolvable(queryable, offerId) {
+  const offerRow = await lockOffer(queryable, offerId);
+  const requestorEmployeeCode = await resolveOfferRequestorEmployeeCode(queryable, offerRow);
+
+  if (!requestorEmployeeCode) {
+    throw httpError(OFFER_CLARIFICATION_REQUESTOR_UNRESOLVED_MESSAGE, 409);
+  }
+
+  return requestorEmployeeCode;
+}
+
+/**
+ * Clarification requested — mirrors requisition/budget domain hooks (operational audit only;
+ * offer_status stays Pending Approval).
+ */
+async function handleOfferClarificationRequested(queryable, event, req) {
+  if (!isOfferWorkflowEvent(event)) {
+    return { businessActionCompleted: false, reason: "not_offer" };
+  }
+
+  const user = userContext(req);
+  const offerId = resolveOfferId(event);
+  if (!offerId) {
+    throw httpError("Offer id missing from workflow context.", 400);
+  }
+
+  const offerRow = await lockOffer(queryable, offerId);
+  const priorStatus = offerRow.offer_status;
+  const requestorEmployeeCode = await resolveOfferRequestorEmployeeCode(queryable, offerRow);
+
+  if (!requestorEmployeeCode) {
+    throw httpError(OFFER_CLARIFICATION_REQUESTOR_UNRESOLVED_MESSAGE, 409);
+  }
+
+  await recordOfferHistory(
+    queryable,
+    offerId,
+    "ClarificationRequested",
+    user.name,
+    user.role,
+    priorStatus,
+    priorStatus,
+    event.comments || null,
+    {
+      workflow_instance_id: event.instanceId,
+      task_id: event.taskId || null,
+      source: "offer_clarification_requested"
+    }
+  );
+
+  await writeEnterpriseAudit(queryable, {
+    eventType: "ClarificationRequested",
+    module: "Offer Management",
+    entity: "Offer",
+    entityId: offerId,
+    action: "Clarification requested on offer approval",
+    previousValue: priorStatus,
+    newValue: priorStatus,
+    userName: user.name,
+    userRole: user.role,
+    metadata: {
+      workflow_instance_id: event.instanceId,
+      workflow_code: event.workflowCode,
+      task_id: event.taskId || null,
+      comments: event.comments || null,
+      source: "offer_clarification_requested"
+    }
+  });
+
+  return {
+    businessActionCompleted: true,
+    offer_id: offerId,
+    status: priorStatus,
+    requestor_employee_code: requestorEmployeeCode
+  };
+}
+
+async function handleOfferClarificationSubmitted(queryable, event, req) {
+  if (!isOfferWorkflowEvent(event)) {
+    return { businessActionCompleted: false, reason: "not_offer" };
+  }
+
+  const user = userContext(req);
+  const offerId = resolveOfferId(event);
+  if (!offerId) {
+    throw httpError("Offer id missing from workflow context.", 400);
+  }
+
+  const offerRow = await lockOffer(queryable, offerId);
+  const priorStatus = offerRow.offer_status;
+
+  await recordOfferHistory(
+    queryable,
+    offerId,
+    "ClarificationSubmitted",
+    user.name,
+    user.role,
+    priorStatus,
+    priorStatus,
+    event.comments || null,
+    {
+      workflow_instance_id: event.instanceId,
+      reactivated_task_id: event.reactivatedTaskId || null,
+      source: "offer_clarification_submitted"
+    }
+  );
+
+  await writeEnterpriseAudit(queryable, {
+    eventType: "ClarificationSubmitted",
+    module: "Offer Management",
+    entity: "Offer",
+    entityId: offerId,
+    action: "Clarification submitted — offer approval resumed",
+    previousValue: priorStatus,
+    newValue: priorStatus,
+    userName: user.name,
+    userRole: user.role,
+    metadata: {
+      workflow_instance_id: event.instanceId,
+      workflow_code: event.workflowCode,
+      reactivated_task_id: event.reactivatedTaskId || null,
+      comments: event.comments || null,
+      source: "offer_clarification_submitted"
+    }
+  });
+
+  return {
+    businessActionCompleted: true,
+    offer_id: offerId,
+    status: priorStatus
+  };
+}
+
 module.exports = {
   isOfferWorkflowEvent,
   resolveOfferId,
   handleOfferStepActivated,
   handleOfferWorkflowCompleted,
-  handleOfferWorkflowRejected
+  handleOfferWorkflowRejected,
+  handleOfferClarificationRequested,
+  handleOfferClarificationSubmitted,
+  assertOfferClarificationRequestorResolvable,
+  resolveOfferRequestorEmployeeCode
 };

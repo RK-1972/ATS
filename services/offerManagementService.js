@@ -311,6 +311,140 @@ async function resolvePendingApprovalTaskId(pool, workflowInstanceId, approvalSt
   return result.rows[0]?.task_id || null;
 }
 
+function parseWorkflowExecutionContext(raw) {
+  if (raw && typeof raw === "object") {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function buildOfferClarificationRounds(executionContext) {
+  const rounds = [];
+  const completed = Array.isArray(executionContext.clarification_history)
+    ? executionContext.clarification_history
+    : [];
+
+  completed.forEach((entry, index) => {
+    rounds.push({
+      round: index + 1,
+      requested_by: entry.requested_by || null,
+      requested_by_role: entry.requested_by_role || null,
+      requested_on: entry.requested_on || null,
+      request_comments: entry.comments || null,
+      responded_by: entry.submitted_by || null,
+      responded_by_role: entry.submitted_by_role || null,
+      responded_on: entry.submitted_on || null,
+      response_comments: entry.response_comments || null,
+      pending: false
+    });
+  });
+
+  const current = executionContext.clarification;
+  if (current && String(current.status || "").toLowerCase() === "requested") {
+    rounds.push({
+      round: rounds.length + 1,
+      requested_by: current.requested_by || null,
+      requested_by_role: current.requested_by_role || null,
+      requested_on: current.requested_on || null,
+      request_comments: current.comments || null,
+      responded_by: null,
+      responded_on: null,
+      response_comments: null,
+      pending: true
+    });
+  }
+
+  return rounds;
+}
+
+async function buildOfferClarificationFields(queryable, instanceRow, req = null) {
+  const emptyFields = {
+    clarificationRounds: [],
+    clarificationPending: null,
+    clarificationHeldApprovalTaskId: null,
+    workflowPausedForClarification: false,
+    canRejectDuringClarification: false
+  };
+
+  if (!instanceRow) {
+    return emptyFields;
+  }
+
+  const executionContext = parseWorkflowExecutionContext(instanceRow.execution_context);
+  const clarificationRounds = buildOfferClarificationRounds(executionContext);
+  const pendingRound = clarificationRounds.find((item) => item.pending);
+
+  const hold = executionContext.clarification || null;
+  const isPausedWithHold =
+    String(instanceRow.status || "") === "Paused" && Boolean(hold?.task_id);
+
+  let canRejectDuringClarification = false;
+
+  if (
+    isPausedWithHold
+    && hold?.assignment_id
+    && req?.user?.employee_code
+    && queryable
+  ) {
+    const assignmentResult = await queryable.query(
+      `SELECT assignee
+       FROM wf_assignments
+       WHERE assignment_id = $1
+         AND task_id = $2
+       LIMIT 1`,
+      [Number(hold.assignment_id), Number(hold.task_id)]
+    );
+    const heldAssignee = String(assignmentResult.rows[0]?.assignee || "").trim();
+    const actorCode = String(req.user.employee_code || "").trim();
+    canRejectDuringClarification = Boolean(
+      heldAssignee && actorCode && heldAssignee === actorCode
+    );
+  }
+
+  return {
+    clarificationRounds,
+    clarificationPending: pendingRound
+      ? {
+          ...pendingRound,
+          request_comments: pendingRound.request_comments
+        }
+      : null,
+    clarificationHeldApprovalTaskId: isPausedWithHold ? Number(hold.task_id) : null,
+    workflowPausedForClarification:
+      String(instanceRow.status || "") === "Paused" && Boolean(pendingRound),
+    canRejectDuringClarification
+  };
+}
+
+async function resolveActiveOfferApprovalTaskId(queryable, workflowInstanceId, req) {
+  const result = await queryable.query(
+    `SELECT t.task_id
+     FROM wf_tasks t
+     INNER JOIN wf_assignments a ON a.task_id = t.task_id AND a.active = TRUE
+     WHERE t.instance_id = $1
+       AND LOWER(TRIM(t.status)) = 'pending'
+       AND LOWER(TRIM(COALESCE(t.task_type, 'approval'))) IN ('approval', 'approve')
+     ORDER BY t.task_id ASC
+     LIMIT 1`,
+    [workflowInstanceId]
+  );
+
+  const taskId = result.rows[0]?.task_id;
+  if (!taskId) {
+    throw httpError("No active pending approval task found for this offer.", 404);
+  }
+
+  await workflowService.assertActiveAssignee(queryable, taskId, req);
+  return taskId;
+}
+
 async function getOffer(pool, offerId, req = null) {
   const result = await pool.query("SELECT * FROM om_offers WHERE offer_id = $1", [offerId]);
   if (!result.rows.length) {
@@ -321,7 +455,33 @@ async function getOffer(pool, offerId, req = null) {
     await assertOfferReadAccess(pool, req, offerId);
   }
 
-  return mapOfferRow(result.rows[0]);
+  const row = result.rows[0];
+  let clarificationFields = {
+    clarificationRounds: [],
+    clarificationPending: null,
+    clarificationHeldApprovalTaskId: null,
+    workflowPausedForClarification: false,
+    canRejectDuringClarification: false
+  };
+
+  if (row.workflow_instance_id) {
+    const instanceResult = await pool.query(
+      `SELECT status, execution_context
+       FROM wf_instances
+       WHERE instance_id = $1`,
+      [row.workflow_instance_id]
+    );
+    clarificationFields = await buildOfferClarificationFields(
+      pool,
+      instanceResult.rows[0],
+      req
+    );
+  }
+
+  return {
+    ...mapOfferRow(row),
+    ...clarificationFields
+  };
 }
 
 async function getOfferRowForApprovalResponse(pool, offerId) {
@@ -408,8 +568,36 @@ async function getOfferBundle(pool, req) {
     );
   }
 
+  const instanceIds = offerRows
+    .filter((row) => row.workflow_instance_id)
+    .map((row) => row.workflow_instance_id);
+  const instanceMap = new Map();
+
+  if (instanceIds.length) {
+    const instances = await pool.query(
+      `SELECT instance_id, status, execution_context
+       FROM wf_instances
+       WHERE instance_id = ANY($1::varchar[])`,
+      [instanceIds]
+    );
+    instances.rows.forEach((instanceRow) => {
+      instanceMap.set(instanceRow.instance_id, instanceRow);
+    });
+  }
+
+  const offers = await Promise.all(
+    offerRows.map(async (row) => ({
+      ...mapOfferRow(row),
+      ...(await buildOfferClarificationFields(
+        pool,
+        row.workflow_instance_id ? instanceMap.get(row.workflow_instance_id) : null,
+        req
+      ))
+    }))
+  );
+
   return {
-    offers: offerRows.map(mapOfferRow),
+    offers,
     approvals: approvals.rows,
     negotiations: negotiations.rows,
     summary: {
@@ -1970,26 +2158,81 @@ async function amendApprovedUnreleasedOffer(pool, offerId, payload, req) {
 }
 
 async function requestClarification(pool, offerId, comments, req) {
-  const offer = await getOffer(pool, offerId, req);
-  if (!offer.workflowInstanceId) {
+  const clarificationComments = String(comments || "").trim();
+  if (!clarificationComments) {
+    throw httpError("Clarification comments are required.", 400);
+  }
+
+  await assertOfferReadAccess(pool, req, offerId);
+
+  const offerRow = await pool.query(
+    `SELECT offer_id, workflow_instance_id, offer_status
+     FROM om_offers
+     WHERE offer_id = $1`,
+    [offerId]
+  );
+
+  if (!offerRow.rows[0]) {
+    throw httpError(`Offer not found: ${offerId}`, 404);
+  }
+
+  const workflowInstanceId = offerRow.rows[0].workflow_instance_id;
+  if (!workflowInstanceId) {
     throw httpError("No workflow instance linked to this offer.", 400);
   }
 
-  await workflowService.requestClarification(pool, offer.workflowInstanceId, comments, req);
+  const offerWorkflowCompletionService = require("./offerWorkflowCompletionService");
+  await offerWorkflowCompletionService.assertOfferClarificationRequestorResolvable(pool, offerId);
+
+  const taskId = await resolveActiveOfferApprovalTaskId(pool, workflowInstanceId, req);
+
+  await workflowService.requestClarificationMyActiveApproval(
+    pool,
+    taskId,
+    clarificationComments,
+    req
+  );
+
+  const offer = await getOffer(pool, offerId, req);
 
   return {
     offer,
-    toastMessage: "Clarification requested via Workflow Engine."
+    toastMessage: "Clarification request sent. Workflow paused."
   };
 }
 
 async function submitClarification(pool, offerId, comments, req) {
-  const offer = await getOffer(pool, offerId, req);
-  if (!offer.workflowInstanceId) {
+  const clarificationComments = String(comments || "").trim();
+  if (!clarificationComments) {
+    throw httpError("Clarification response is required.", 400);
+  }
+
+  await assertCanWriteOfferRecord(pool, req, offerId);
+
+  const offerRow = await pool.query(
+    `SELECT offer_id, workflow_instance_id
+     FROM om_offers
+     WHERE offer_id = $1`,
+    [offerId]
+  );
+
+  if (!offerRow.rows[0]) {
+    throw httpError(`Offer not found: ${offerId}`, 404);
+  }
+
+  const workflowInstanceId = offerRow.rows[0].workflow_instance_id;
+  if (!workflowInstanceId) {
     throw httpError("No workflow instance linked to this offer.", 400);
   }
 
-  await workflowService.submitClarification(pool, offer.workflowInstanceId, comments, req);
+  await workflowService.submitClarification(
+    pool,
+    workflowInstanceId,
+    clarificationComments,
+    req
+  );
+
+  const offer = await getOffer(pool, offerId, req);
 
   return {
     offer,
