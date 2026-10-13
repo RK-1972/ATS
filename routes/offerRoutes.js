@@ -133,6 +133,34 @@ function registerOfferRoutes(app, pool, verifyToken) {
     }
   });
 
+  app.post("/api/v1/offers/:offerId/amend-approved", offerGuard, async (req, res) => {
+    try {
+      const result = await offerManagementService.amendApprovedUnreleasedOffer(
+        pool,
+        req.params.offerId,
+        req.body || {},
+        req
+      );
+      res.json({ success: true, ...result });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/v1/offers/:offerId/correct-pending-approval", offerGuard, async (req, res) => {
+    try {
+      const result = await offerManagementService.correctAndResubmitPendingApproval(
+        pool,
+        req.params.offerId,
+        req.body || {},
+        req
+      );
+      res.json({ success: true, ...result });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
   app.post("/api/v1/offers/:offerId/withdraw", offerGuard, async (req, res) => {
     try {
       const result = await offerManagementService.withdrawOffer(

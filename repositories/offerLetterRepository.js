@@ -34,6 +34,8 @@ const BASE_OFFER_SELECT = `
     FROM om_offer_approvals a
     WHERE a.offer_id = o.offer_id
       AND LOWER(a.approval_status) = 'approved'
+      AND a.version_status = 'Published'
+      AND a.version = o.version
   ) AS approved_date,
   (
     SELECT u.full_name

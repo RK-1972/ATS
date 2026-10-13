@@ -6,6 +6,8 @@
 
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
+const MIRROR_VERSION_STATUS_PUBLISHED = "Published";
+
 function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
@@ -125,6 +127,8 @@ async function syncCompletedApprovalStep(queryable, offerId, completedTaskId, us
     return null;
   }
 
+  const offerRow = await lockOffer(queryable, offerId);
+
   const result = await queryable.query(
     `UPDATE om_offer_approvals
      SET approval_status = 'Approved',
@@ -134,8 +138,17 @@ async function syncCompletedApprovalStep(queryable, offerId, completedTaskId, us
      WHERE offer_id = $3
        AND approval_step = $4
        AND approval_status IN ('Pending', 'Waiting')
+       AND version_status = $5
+       AND version = $6
      RETURNING *`,
-    [user.name, comments || null, offerId, taskTitle]
+    [
+      user.name,
+      comments || null,
+      offerId,
+      taskTitle,
+      MIRROR_VERSION_STATUS_PUBLISHED,
+      Number(offerRow.version)
+    ]
   );
 
   return result.rows[0] || null;
@@ -147,14 +160,18 @@ async function syncActivatedApprovalStep(queryable, offerId, activatedTaskId) {
     return null;
   }
 
+  const offerRow = await lockOffer(queryable, offerId);
+
   const result = await queryable.query(
     `UPDATE om_offer_approvals
      SET approval_status = 'Pending'
      WHERE offer_id = $1
        AND approval_step = $2
        AND approval_status = 'Waiting'
+       AND version_status = $3
+       AND version = $4
      RETURNING *`,
-    [offerId, taskTitle]
+    [offerId, taskTitle, MIRROR_VERSION_STATUS_PUBLISHED, Number(offerRow.version)]
   );
 
   return result.rows[0] || null;
@@ -326,6 +343,7 @@ async function handleOfferWorkflowRejected(queryable, event, req) {
   const priorStatus = offerRow.offer_status;
   const comments = event.comments || null;
   const rejectedTaskTitle = await getTaskTitle(queryable, event.rejectedByTaskId);
+  const submissionVersion = Number(offerRow.version);
 
   if (rejectedTaskTitle) {
     await queryable.query(
@@ -335,8 +353,17 @@ async function handleOfferWorkflowRejected(queryable, event, req) {
            approved_on = NOW(),
            comments = COALESCE($2, comments)
        WHERE offer_id = $3
-         AND approval_step = $4`,
-      [user.name, comments || null, offerId, rejectedTaskTitle]
+         AND approval_step = $4
+         AND version_status = $5
+         AND version = $6`,
+      [
+        user.name,
+        comments || null,
+        offerId,
+        rejectedTaskTitle,
+        MIRROR_VERSION_STATUS_PUBLISHED,
+        submissionVersion
+      ]
     );
   }
 
@@ -344,8 +371,10 @@ async function handleOfferWorkflowRejected(queryable, event, req) {
     `UPDATE om_offer_approvals
      SET approval_status = 'Cancelled'
      WHERE offer_id = $1
-       AND approval_status = 'Waiting'`,
-    [offerId]
+       AND approval_status = 'Waiting'
+       AND version_status = $2
+       AND version = $3`,
+    [offerId, MIRROR_VERSION_STATUS_PUBLISHED, submissionVersion]
   );
 
   await queryable.query(

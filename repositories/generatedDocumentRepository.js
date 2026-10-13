@@ -5,7 +5,8 @@ const FILE_TYPES = {
 
 const DOCUMENT_STATUSES = {
   GENERATED: "Generated",
-  PENDING: "Pending"
+  PENDING: "Pending",
+  SUPERSEDED: "Superseded"
 };
 
 function mapGeneratedDocumentRow(row) {
@@ -93,8 +94,9 @@ async function findLatestVersionNo(pool, businessObjectType, businessObjectId) {
     `SELECT COALESCE(MAX(version_no), 0) AS latest_version_no
      FROM om_generated_documents
      WHERE business_object_type = $1
-       AND business_object_id = $2`,
-    [businessObjectType, businessObjectId]
+       AND business_object_id = $2
+       AND status = $3`,
+    [businessObjectType, businessObjectId, DOCUMENT_STATUSES.GENERATED]
   );
 
   return Number(result.rows[0]?.latest_version_no || 0);
@@ -116,11 +118,16 @@ async function findLatestVersionDocuments(
     return [];
   }
 
-  const params = [businessObjectType, businessObjectId, latestVersionNo];
+  const params = [
+    businessObjectType,
+    businessObjectId,
+    latestVersionNo,
+    DOCUMENT_STATUSES.GENERATED
+  ];
   let documentTypeClause = "";
 
   if (documentType) {
-    documentTypeClause = " AND document_type = $4";
+    documentTypeClause = " AND document_type = $5";
     params.push(documentType);
   }
 
@@ -130,6 +137,7 @@ async function findLatestVersionDocuments(
      WHERE business_object_type = $1
        AND business_object_id = $2
        AND version_no = $3
+       AND status = $4
        ${documentTypeClause}
      ORDER BY file_type ASC, generated_on DESC`,
     params
@@ -152,9 +160,16 @@ async function findLatestByBusinessObjectFileType(
        AND business_object_id = $2
        AND document_type = $3
        AND file_type = $4
+       AND status = $5
      ORDER BY version_no DESC, generated_on DESC
      LIMIT 1`,
-    [businessObjectType, businessObjectId, documentType, fileType]
+    [
+      businessObjectType,
+      businessObjectId,
+      documentType,
+      fileType,
+      DOCUMENT_STATUSES.GENERATED
+    ]
   );
 
   return result.rows[0] || null;
@@ -178,9 +193,10 @@ async function findByBusinessObject(pool, businessObjectType, businessObjectId) 
      FROM om_generated_documents
      WHERE business_object_type = $1
        AND business_object_id = $2
+       AND status = $3
      ORDER BY version_no DESC, generated_on DESC
      LIMIT 1`,
-    [businessObjectType, businessObjectId]
+    [businessObjectType, businessObjectId, DOCUMENT_STATUSES.GENERATED]
   );
 
   return result.rows[0] || null;
@@ -206,6 +222,30 @@ async function deleteByBusinessObject(pool, businessObjectType, businessObjectId
   );
 }
 
+async function supersedeGeneratedDocumentsForBusinessObject(
+  pool,
+  businessObjectType,
+  businessObjectId
+) {
+  const result = await pool.query(
+    `UPDATE om_generated_documents
+     SET status = $4,
+         modified_on = NOW()
+     WHERE business_object_type = $1
+       AND business_object_id = $2
+       AND status = $3
+     RETURNING document_id`,
+    [
+      businessObjectType,
+      businessObjectId,
+      DOCUMENT_STATUSES.GENERATED,
+      DOCUMENT_STATUSES.SUPERSEDED
+    ]
+  );
+
+  return result.rows;
+}
+
 module.exports = {
   FILE_TYPES,
   DOCUMENT_STATUSES,
@@ -217,5 +257,6 @@ module.exports = {
   findLatestByBusinessObjectFileType,
   findByBusinessObject,
   findById,
-  deleteByBusinessObject
+  deleteByBusinessObject,
+  supersedeGeneratedDocumentsForBusinessObject
 };

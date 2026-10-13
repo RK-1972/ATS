@@ -458,6 +458,13 @@ async function getGeneratedDocument(pool, documentId) {
     throw httpError(`Generated document not found: ${documentId}`, 404);
   }
 
+  if (row.status === generatedDocumentRepository.DOCUMENT_STATUSES.SUPERSEDED) {
+    throw httpError(
+      `Generated document is no longer current: ${documentId}`,
+      404
+    );
+  }
+
   if (String(row.business_object_type || "").trim().toUpperCase() === "OFFER") {
     const offerRow = await offerLetterRepository.findOfferLetterDetail(
       pool,
@@ -479,6 +486,13 @@ async function downloadGeneratedDocument(pool, documentId) {
 
   if (!row) {
     throw httpError(`Generated document not found: ${documentId}`, 404);
+  }
+
+  if (row.status === generatedDocumentRepository.DOCUMENT_STATUSES.SUPERSEDED) {
+    throw httpError(
+      `Generated document is no longer current: ${documentId}`,
+      404
+    );
   }
 
   if (String(row.business_object_type || "").trim().toUpperCase() === "OFFER") {

@@ -195,7 +195,7 @@ async function getTask(pool, taskId) {
   return mapTaskRow(result.rows[0]);
 }
 
-async function completeTask(pool, taskId, req, comments = "") {
+async function completeTask(pool, taskId, req, comments = "", options = {}) {
   const user = userContext(req);
   const task = await getTask(pool, taskId);
 
@@ -211,7 +211,20 @@ async function completeTask(pool, taskId, req, comments = "") {
   );
 
   if (task.workflowTaskId) {
-    await workflowService.completeTask(pool, task.workflowTaskId, req);
+    let shouldCompleteWorkflowTask = true;
+
+    if (options.skipIfWorkflowTaskAlreadyCompleted) {
+      const wfResult = await pool.query(
+        `SELECT status FROM wf_tasks WHERE task_id = $1`,
+        [task.workflowTaskId]
+      );
+      const wfStatus = String(wfResult.rows[0]?.status || "").toLowerCase();
+      shouldCompleteWorkflowTask = wfStatus === "pending";
+    }
+
+    if (shouldCompleteWorkflowTask) {
+      await workflowService.completeTask(pool, task.workflowTaskId, req);
+    }
   }
 
   await recordTaskHistory(

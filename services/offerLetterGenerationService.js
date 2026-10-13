@@ -1,4 +1,5 @@
 const offerLetterRepository = require("../repositories/offerLetterRepository");
+const offerApprovalWorkflowService = require("./offerApprovalWorkflowService");
 const generatedDocumentRepository = require("../repositories/generatedDocumentRepository");
 const offerLetterValidation = require("./offerLetterValidation");
 const salaryCalculationService = require("./salaryCalculationService");
@@ -125,6 +126,25 @@ async function generateOfferLetterDocument(pool, offerId, req) {
 
     if (!offerRow) {
       throw httpError(`Offer not found: ${offerId}`, 404);
+    }
+
+    const approvalClient = await pool.connect();
+    try {
+      await approvalClient.query("BEGIN");
+      await offerApprovalWorkflowService.assertCurrentSubmissionFullyApproved(
+        approvalClient,
+        offerId
+      );
+      await approvalClient.query("COMMIT");
+    } catch (error) {
+      try {
+        await approvalClient.query("ROLLBACK");
+      } catch (_rollbackError) {
+        // preserve original
+      }
+      throw error;
+    } finally {
+      approvalClient.release();
     }
 
     offerLetterValidation.assertAwaitingLetterOperations({

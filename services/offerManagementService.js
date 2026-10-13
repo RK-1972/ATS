@@ -6,6 +6,15 @@ const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const offerLetterService = require("./offerLetterService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
+const offerApprovalWorkflowService = require("./offerApprovalWorkflowService");
+const {
+  assertCanWriteOfferRecord,
+  isTaLeadRole
+} = require("./offerCapabilityAuth");
+const {
+  buildSubmissionVersionMetaPatch,
+  MIRROR_VERSION_STATUS_PUBLISHED
+} = offerApprovalWorkflowService;
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "offers.seed.json");
 
@@ -272,7 +281,7 @@ async function assertOfferReadAccess(pool, req, offerId) {
     throw httpError("Authentication required.", 401);
   }
 
-  if (isAdminUser(req)) {
+  if (isAdminUser(req) || isTaLeadRole(req)) {
     return;
   }
 
@@ -310,6 +319,15 @@ async function getOffer(pool, offerId, req = null) {
 
   if (req?.user) {
     await assertOfferReadAccess(pool, req, offerId);
+  }
+
+  return mapOfferRow(result.rows[0]);
+}
+
+async function getOfferRowForApprovalResponse(pool, offerId) {
+  const result = await pool.query("SELECT * FROM om_offers WHERE offer_id = $1", [offerId]);
+  if (!result.rows.length) {
+    throw httpError(`Offer not found: ${offerId}`, 404);
   }
 
   return mapOfferRow(result.rows[0]);
@@ -637,7 +655,9 @@ async function publishOfferWorkflowAssignments(pool, offer, req, approvalRouteId
       department: offer.department,
       position_title: offer.positionTitle,
       grade: offer.grade,
-      approval_route_id: approvalRouteId
+      approval_route_id: approvalRouteId,
+      offered_ctc_lpa: Number(offer.offeredCtc || 0) / 100000,
+      ...buildSubmissionVersionMetaPatch(offer.version)
     },
     department: offer.department,
     grade: offer.grade,
@@ -666,8 +686,16 @@ async function publishOfferWorkflowAssignments(pool, offer, req, approvalRouteId
 }
 
 /** Replace Offer workspace approval rows with route-expanded step titles. */
-async function syncOfferApprovalsFromRoute(pool, offerId, approvalRouteId) {
+async function syncOfferApprovalsFromRoute(pool, offerId, approvalRouteId, submissionVersion) {
   await pool.query("DELETE FROM om_offer_approvals WHERE offer_id = $1", [offerId]);
+
+  const versionRow = await pool.query(
+    `SELECT version FROM om_offers WHERE offer_id = $1`,
+    [offerId]
+  );
+  const version = Number(
+    submissionVersion ?? versionRow.rows[0]?.version ?? 1
+  );
 
   const steps = await approvalRouteRepository.getApprovalRouteSteps(
     pool,
@@ -685,14 +713,17 @@ async function syncOfferApprovalsFromRoute(pool, offerId, approvalRouteId) {
 
     await pool.query(
       `INSERT INTO om_offer_approvals (
-        offer_id, approval_step, approver_role, approval_status, sequence_order, effective_from
-      ) VALUES ($1,$2,$3,$4,$5,$6)`,
+        offer_id, approval_step, approver_role, approval_status, sequence_order,
+        version, version_status, effective_from
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [
         offerId,
         stepTitle,
         step.approval_type || "Approver",
         index === 0 ? "Pending" : "Waiting",
         sequence,
+        version,
+        MIRROR_VERSION_STATUS_PUBLISHED,
         new Date()
       ]
     );
@@ -839,106 +870,150 @@ async function submitOffer(pool, offerId, comment, req) {
 
 async function approveOffer(pool, offerId, approvalStep, comment, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId, req);
 
-  if (!offer.workflowInstanceId) {
-    throw httpError("Offer workflow instance is missing.", 400);
-  }
+  const offerApprovalWorkflowService = require("./offerApprovalWorkflowService");
+  const client = await pool.connect();
 
-  const taskId = await resolvePendingApprovalTaskId(
-    pool,
-    offer.workflowInstanceId,
-    approvalStep
-  );
+  try {
+    await client.query("BEGIN");
 
-  if (!taskId) {
-    throw httpError(`Pending approval task not found for step: ${approvalStep}`, 404);
-  }
+    const { offerRow } = await offerApprovalWorkflowService.assertOfferApprovalMayProceed(
+      client,
+      offerId
+    );
+    const workflowInstanceId = offerRow.workflow_instance_id;
 
-  await workflowService.assertActiveAssignee(pool, taskId, req);
+    const taskId = await resolvePendingApprovalTaskId(
+      client,
+      workflowInstanceId,
+      approvalStep
+    );
 
-  const approvalResult = await pool.query(
-    `UPDATE om_offer_approvals
-     SET approval_status = 'Approved', approver_name = $1, approved_on = NOW(), comments = $2
-     WHERE offer_id = $3 AND approval_step = $4 AND approval_status = 'Pending'
-     RETURNING *`,
-    [user.name, comment || null, offerId, approvalStep]
-  );
+    if (!taskId) {
+      throw httpError(`Pending approval task not found for step: ${approvalStep}`, 404);
+    }
 
-  if (!approvalResult.rows.length) {
-    throw httpError(`Pending approval step not found: ${approvalStep}`, 404);
-  }
+    await workflowService.assertActiveAssignee(client, taskId, req);
 
-  const stageKey = approvalStep.toLowerCase().includes("finance")
-    ? "finance"
-    : approvalStep.toLowerCase().includes("leadership")
-      ? "hm_review"
-      : "hm_review";
+    const approvalResult = await client.query(
+      `UPDATE om_offer_approvals
+       SET approval_status = 'Approved', approver_name = $1, approved_on = NOW(), comments = $2
+       WHERE offer_id = $3
+         AND approval_step = $4
+         AND approval_status = 'Pending'
+         AND version_status = $5
+         AND version = $6
+       RETURNING *`,
+      [
+        user.name,
+        comment || null,
+        offerId,
+        approvalStep,
+        MIRROR_VERSION_STATUS_PUBLISHED,
+        Number(offerRow.version)
+      ]
+    );
 
-  if (offer.workflowInstanceId) {
+    if (!approvalResult.rows.length) {
+      throw httpError(`Pending approval step not found: ${approvalStep}`, 404);
+    }
+
+    const routeCompletion = await workflowService.completeTask(client, taskId, req, {
+      comments: comment,
+      requireActiveAssignee: false
+    });
+    const workflowRouteCompleted = Boolean(routeCompletion?.workflowCompleted);
+
+    const stageKey = approvalStep.toLowerCase().includes("finance")
+      ? "finance"
+      : approvalStep.toLowerCase().includes("leadership")
+        ? "hm_review"
+        : "hm_review";
+
     await workflowService.advanceWorkflow(
-      pool,
-      offer.workflowInstanceId,
+      client,
+      workflowInstanceId,
       "approve",
       { stageKey, actor: user.name, comment },
       req
     );
-  }
 
-  const pending = await pool.query(
-    `SELECT COUNT(*) AS count FROM om_offer_approvals
-     WHERE offer_id = $1 AND approval_status = 'Pending'`,
-    [offerId]
-  );
-
-  const eventType = /finance/i.test(approvalStep)
-    ? "FinanceApproved"
-    : /leadership/i.test(approvalStep)
-      ? "LeadershipApproved"
-      : "StageApproved";
-
-  if (Number(pending.rows[0].count) === 0) {
-    await pool.query(
-      `UPDATE om_offers SET offer_status = 'Approved', modified_by = $1, modified_on = NOW()
-       WHERE offer_id = $2`,
-      [user.name, offerId]
+    const pending = await client.query(
+      `SELECT COUNT(*) AS count FROM om_offer_approvals
+       WHERE offer_id = $1
+         AND approval_status IN ('Pending', 'Waiting')
+         AND version_status = $2
+         AND version = $3`,
+      [offerId, MIRROR_VERSION_STATUS_PUBLISHED, Number(offerRow.version)]
     );
 
-    await offerLetterService.ensureAwaitingLetterForOffer(pool, offerId);
+    const eventType = /finance/i.test(approvalStep)
+      ? "FinanceApproved"
+      : /leadership/i.test(approvalStep)
+        ? "LeadershipApproved"
+        : "StageApproved";
 
-    if (offer.workflowInstanceId) {
+    if (Number(pending.rows[0].count) === 0 && !workflowRouteCompleted) {
+      await client.query(
+        `UPDATE om_offers SET offer_status = 'Approved', modified_by = $1, modified_on = NOW()
+         WHERE offer_id = $2`,
+        [user.name, offerId]
+      );
+
+      await offerLetterService.ensureAwaitingLetterForOffer(client, offerId);
+
       await workflowService.advanceWorkflow(
-        pool,
-        offer.workflowInstanceId,
+        client,
+        workflowInstanceId,
         "approve",
         { stageKey: "approved", actor: user.name, comment: "All approvals complete" },
         req
       );
     }
+
+    const linkedInboxTasks = await client.query(
+      `SELECT task_id
+       FROM et_tasks
+       WHERE module = 'Offer Management'
+         AND business_object_id = $1
+         AND status <> 'Completed'
+         AND (task_type = $2 OR workflow_task_id = $3)`,
+      [offerId, approvalStep, taskId]
+    );
+
+    for (const row of linkedInboxTasks.rows) {
+      await taskService.completeTask(client, row.task_id, req, comment, {
+        skipIfWorkflowTaskAlreadyCompleted: true
+      });
+    }
+
+    await writeEnterpriseAudit(client, {
+      eventType,
+      module: "Offer Management",
+      entity: "Offer",
+      entityId: offerId,
+      action: `${approvalStep} approved`,
+      userName: user.name,
+      userRole: user.role,
+      metadata: { comment }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      offer: await getOfferRowForApprovalResponse(pool, offerId),
+      toastMessage: `${approvalStep} approved.`
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
   }
-
-  const inboxTasks = await taskService.listInbox(pool, { module: "Offer Management" });
-  for (const task of inboxTasks.filter(
-    (item) => item.businessObjectId === offerId && item.taskType === approvalStep
-  )) {
-    await taskService.completeTask(pool, task.taskId, req, comment);
-  }
-
-  await writeEnterpriseAudit(pool, {
-    eventType,
-    module: "Offer Management",
-    entity: "Offer",
-    entityId: offerId,
-    action: `${approvalStep} approved`,
-    userName: user.name,
-    userRole: user.role,
-    metadata: { comment }
-  });
-
-  return {
-    offer: await getOffer(pool, offerId),
-    toastMessage: `${approvalStep} approved.`
-  };
 }
 
 async function negotiateOffer(pool, offerId, payload, req) {
@@ -1001,6 +1076,14 @@ async function reviseOffer(pool, offerId, payload, req) {
     throw httpError(`Offer not found: ${offerId}`, 404);
   }
 
+  const blockedStatuses = new Set(["Pending Approval", "Approved", "Withdrawn"]);
+  if (blockedStatuses.has(String(row.offer_status))) {
+    throw httpError(
+      `Offer cannot be revised in status ${row.offer_status}. Use pending-approval correction or post-release workflows.`,
+      409
+    );
+  }
+
   await saveRevision(pool, row, payload.reason, user.name);
 
   const offeredCtc = Number(payload.offered_ctc ?? row.offered_ctc);
@@ -1030,27 +1113,50 @@ async function reviseOffer(pool, offerId, payload, req) {
 
 async function releaseOffer(pool, offerId, payload, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId, req);
+  await getOffer(pool, offerId, req);
 
-  if (offer.offerStatus !== "Approved") {
-    throw httpError("Offer must be approved before release.", 400);
-  }
+  const client = await pool.connect();
 
-  if (offer.workflowInstanceId) {
-    await workflowService.advanceWorkflow(
-      pool,
-      offer.workflowInstanceId,
-      "approve",
-      { stageKey: "released", actor: user.name, comment: payload.comment || "" },
-      req
+  try {
+    await client.query("BEGIN");
+
+    await offerApprovalWorkflowService.assertCurrentSubmissionFullyApproved(client, offerId);
+
+    const offerLock = await client.query(
+      `SELECT workflow_instance_id FROM om_offers WHERE offer_id = $1`,
+      [offerId]
     );
+    const workflowInstanceId = offerLock.rows[0]?.workflow_instance_id;
+
+    if (workflowInstanceId) {
+      await workflowService.advanceWorkflow(
+        client,
+        workflowInstanceId,
+        "approve",
+        { stageKey: "released", actor: user.name, comment: payload.comment || "" },
+        req
+      );
+    }
+
+    await client.query(
+      `UPDATE om_offers SET offer_status = 'Released', modified_by = $1, modified_on = NOW()
+       WHERE offer_id = $2`,
+      [user.name, offerId]
+    );
+
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
   }
 
-  await pool.query(
-    `UPDATE om_offers SET offer_status = 'Released', modified_by = $1, modified_on = NOW()
-     WHERE offer_id = $2`,
-    [user.name, offerId]
-  );
+  const offer = await getOffer(pool, offerId, req);
 
   if (payload.template_code) {
     await pool.query(
@@ -1083,7 +1189,7 @@ async function releaseOffer(pool, offerId, payload, req) {
     await taskService.completeTask(pool, task.taskId, req);
   }
 
-  await recordOfferHistory(pool, offerId, "OfferReleased", user.name, user.role, offer.offerStatus, "Released");
+  await recordOfferHistory(pool, offerId, "OfferReleased", user.name, user.role, "Approved", "Released");
   await writeEnterpriseAudit(pool, {
     eventType: "OfferReleased",
     module: "Offer Management",
@@ -1262,35 +1368,605 @@ async function rejectOffer(pool, offerId, reason, req) {
 
 async function withdrawOffer(pool, offerId, reason, req) {
   const user = userContext(req);
-  const offer = await getOffer(pool, offerId, req);
+  const trimmedReason = String(reason || "").trim();
 
-  const terminalStatuses = new Set(["Accepted", "Declined", "Withdrawn"]);
-  if (terminalStatuses.has(offer.offerStatus)) {
-    throw httpError(`Offer cannot be withdrawn from status: ${offer.offerStatus}.`, 400);
+  if (!trimmedReason) {
+    throw httpError("A reason is required to withdraw or discard this offer.", 400);
   }
 
-  await pool.query(
-    `UPDATE om_offers SET offer_status = 'Withdrawn', modified_by = $1, modified_on = NOW()
-     WHERE offer_id = $2`,
-    [user.name, offerId]
+  await getOffer(pool, offerId, req);
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await assertCanWriteOfferRecord(client, req, offerId);
+
+    const offerLock = await client.query(
+      `SELECT offer_id, offer_status, workflow_instance_id, version
+       FROM om_offers
+       WHERE offer_id = $1
+       FOR UPDATE`,
+      [offerId]
+    );
+
+    if (!offerLock.rows[0]) {
+      throw httpError(`Offer not found: ${offerId}`, 404);
+    }
+
+    const locked = offerLock.rows[0];
+    const priorStatus = locked.offer_status;
+    const terminalStatuses = new Set(["Accepted", "Declined", "Withdrawn"]);
+
+    if (terminalStatuses.has(String(priorStatus))) {
+      throw httpError(`Offer cannot be withdrawn from status: ${priorStatus}.`, 409);
+    }
+
+    if (String(priorStatus) === "Pending Approval") {
+      await offerApprovalWorkflowService.assertNoOpenOfferClarification(
+        client,
+        locked.workflow_instance_id
+      );
+
+      await offerApprovalWorkflowService.terminateOfferWorkflowForRecruiterWithdrawal(
+        client,
+        { offerId, instanceId: locked.workflow_instance_id },
+        req,
+        { reason: trimmedReason }
+      );
+    }
+
+    await client.query(
+      `UPDATE om_offers SET offer_status = 'Withdrawn', modified_by = $1, modified_on = NOW()
+       WHERE offer_id = $2`,
+      [user.name, offerId]
+    );
+
+    await recordOfferHistory(
+      client,
+      offerId,
+      "OfferWithdrawn",
+      user.name,
+      user.role,
+      priorStatus,
+      "Withdrawn",
+      trimmedReason,
+      {
+        withdrawal_type: "recruiter_discard",
+        workflow_instance_id: locked.workflow_instance_id || null
+      }
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "OfferWithdrawn",
+      module: "Offer Management",
+      entity: "Offer",
+      entityId: offerId,
+      action: "Offer discarded by authorized user",
+      previousValue: priorStatus,
+      newValue: "Withdrawn",
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        reason: trimmedReason,
+        withdrawal_type: "recruiter_discard",
+        workflow_instance_id: locked.workflow_instance_id || null
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      offer: await getOffer(pool, offerId),
+      toastMessage: "Offer withdrawn."
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function invalidateOfferLetterForAmendment(queryable, offerId) {
+  const generatedDocumentRepository = require("../repositories/generatedDocumentRepository");
+
+  await generatedDocumentRepository.supersedeGeneratedDocumentsForBusinessObject(
+    queryable,
+    "OFFER",
+    offerId
   );
 
-  await recordOfferHistory(pool, offerId, "OfferWithdrawn", user.name, user.role, offer.offerStatus, "Withdrawn", reason);
-  await writeEnterpriseAudit(pool, {
-    eventType: "OfferWithdrawn",
-    module: "Offer Management",
-    entity: "Offer",
-    entityId: offerId,
-    action: "Offer withdrawn",
-    userName: user.name,
-    userRole: user.role,
-    metadata: { reason }
-  });
+  const letterResult = await queryable.query(
+    `SELECT letter_id FROM om_offer_letters WHERE offer_id = $1`,
+    [offerId]
+  );
 
-  return {
-    offer: await getOffer(pool, offerId),
-    toastMessage: "Offer withdrawn."
-  };
+  for (const row of letterResult.rows) {
+    await queryable.query(
+      `DELETE FROM om_offer_letter_ctc WHERE letter_id = $1`,
+      [row.letter_id]
+    );
+  }
+
+  await queryable.query(`DELETE FROM om_offer_letters WHERE offer_id = $1`, [offerId]);
+}
+
+async function correctAndResubmitPendingApproval(pool, offerId, payload, req) {
+  const user = userContext(req);
+  const correctionReason = String(payload?.reason || payload?.correction_reason || "").trim();
+
+  if (!correctionReason) {
+    throw httpError("A correction reason is required.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await assertCanWriteOfferRecord(client, req, offerId);
+
+    const { offerRow, instanceRow } =
+      await offerApprovalWorkflowService.assertOfferCorrectionMayProceed(client, offerId);
+
+    const priorSnapshot = {
+      offered_ctc: Number(offerRow.offered_ctc),
+      expected_joining_date: offerRow.expected_joining_date,
+      variable_pay: Number(offerRow.variable_pay ?? 0),
+      variable_pay_frequency: offerRow.variable_pay_frequency,
+      joining_bonus: Number(offerRow.joining_bonus ?? 0),
+      joining_bonus_frequency: offerRow.joining_bonus_frequency,
+      version: Number(offerRow.version)
+    };
+
+    const mergedCommercial = normalizeCommercialFields({
+      expected_joining_date:
+        payload.expected_joining_date ?? payload.expectedJoiningDate ?? offerRow.expected_joining_date,
+      variable_pay: payload.variable_pay ?? payload.variablePay ?? offerRow.variable_pay,
+      variable_pay_frequency:
+        payload.variable_pay_frequency
+        ?? payload.variablePayFrequency
+        ?? offerRow.variable_pay_frequency,
+      joining_bonus: payload.joining_bonus ?? payload.joiningBonus ?? offerRow.joining_bonus,
+      joining_bonus_frequency:
+        payload.joining_bonus_frequency
+        ?? payload.joiningBonusFrequency
+        ?? offerRow.joining_bonus_frequency
+    });
+
+    const offeredCtc = Number(
+      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc
+    );
+
+    if (!Number.isFinite(offeredCtc) || offeredCtc <= 0) {
+      throw httpError("Offered CTC is required.", 400);
+    }
+
+    const commercialErrors = validateCommercialOfferFields({
+      ...mergedCommercial,
+      offered_ctc: offeredCtc
+    });
+
+    if (commercialErrors.length) {
+      throw httpError(commercialErrors.join(" "), 400);
+    }
+
+    await saveRevision(client, offerRow, correctionReason, user.name);
+
+    const { varianceAmount, variancePct } = computeVariance(
+      offerRow.approved_budget,
+      offeredCtc
+    );
+    const nextVersion = Number((Number(offerRow.version) + 0.1).toFixed(1));
+
+    await client.query(
+      `UPDATE om_offers
+       SET offered_ctc = $1,
+           variance_amount = $2,
+           variance_pct = $3,
+           version = $4,
+           expected_joining_date = $5,
+           variable_pay = $6,
+           variable_pay_frequency = $7,
+           joining_bonus = $8,
+           joining_bonus_frequency = $9,
+           modified_by = $10,
+           modified_on = NOW()
+       WHERE offer_id = $11`,
+      [
+        offeredCtc,
+        varianceAmount,
+        variancePct,
+        nextVersion,
+        mergedCommercial.expected_joining_date,
+        mergedCommercial.variable_pay,
+        mergedCommercial.variable_pay_frequency,
+        mergedCommercial.joining_bonus,
+        mergedCommercial.joining_bonus_frequency,
+        user.name,
+        offerId
+      ]
+    );
+
+    await client.query(
+      `UPDATE om_offer_compensation
+       SET total_ctc = $1,
+           variable_pay = $2,
+           bonus = $3,
+           modified_on = NOW()
+       WHERE offer_id = $4`,
+      [
+        offeredCtc,
+        mergedCommercial.variable_pay,
+        mergedCommercial.joining_bonus,
+        offerId
+      ]
+    );
+
+    await offerApprovalWorkflowService.cancelPendingOfferApprovalWork(
+      client,
+      { offerId, instanceId: instanceRow.instance_id },
+      null
+    );
+    await offerApprovalWorkflowService.cancelPendingOfferInboxTasks(client, offerId);
+
+    const refreshedRow = (
+      await client.query(`SELECT * FROM om_offers WHERE offer_id = $1`, [offerId])
+    ).rows[0];
+    const updatedOffer = mapOfferRow(refreshedRow);
+
+    const approvalRouteId = await approvalRouteResolverService.resolveApprovalRoute(
+      client,
+      "OFFER",
+      {
+        department: updatedOffer.department,
+        designation: updatedOffer.positionTitle,
+        grade: updatedOffer.grade,
+        amount: updatedOffer.offeredCtc
+      }
+    );
+
+    await publishOfferWorkflowAssignments(client, updatedOffer, req, approvalRouteId);
+
+    const approvalTasks = await workflowService.createApprovalRouteWorkflowTasks(
+      client,
+      instanceRow.instance_id,
+      approvalRouteId,
+      {
+        stageKey: "approval",
+        assignedBy: req.user?.employee_code || user.name,
+        requisitionCode: offerId,
+        forceFreshRouteExpansion: true
+      }
+    );
+
+    if (!Array.isArray(approvalTasks) || approvalTasks.length === 0) {
+      throw httpError(
+        "Corrected offer approval route did not publish any workflow assignments.",
+        500
+      );
+    }
+
+    await offerApprovalWorkflowService.refreshOfferApprovalMirrorPreservingApproved(
+      client,
+      offerId,
+      approvalRouteId,
+      nextVersion
+    );
+
+    await client.query(
+      `UPDATE wf_instances
+       SET status = 'Running', modified_by = $1, modified_on = NOW()
+       WHERE instance_id = $2`,
+      [user.name, instanceRow.instance_id]
+    );
+
+    const nextSnapshot = {
+      offered_ctc: offeredCtc,
+      expected_joining_date: mergedCommercial.expected_joining_date,
+      variable_pay: mergedCommercial.variable_pay,
+      variable_pay_frequency: mergedCommercial.variable_pay_frequency,
+      joining_bonus: mergedCommercial.joining_bonus,
+      joining_bonus_frequency: mergedCommercial.joining_bonus_frequency,
+      version: nextVersion,
+      approval_route_id: approvalRouteId
+    };
+
+    await recordOfferHistory(
+      client,
+      offerId,
+      "OfferCorrectedResubmitted",
+      user.name,
+      user.role,
+      "Pending Approval",
+      "Pending Approval",
+      correctionReason,
+      {
+        prior: priorSnapshot,
+        next: nextSnapshot,
+        workflow_instance_id: instanceRow.instance_id
+      }
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "OfferCorrectedResubmitted",
+      module: "Offer Management",
+      entity: "Offer",
+      entityId: offerId,
+      action: "Pending approval offer corrected and resubmitted",
+      previousValue: JSON.stringify(priorSnapshot),
+      newValue: JSON.stringify(nextSnapshot),
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        reason: correctionReason,
+        approval_route_id: approvalRouteId,
+        cancelled_tasks: true
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      offer: await getOffer(pool, offerId),
+      toastMessage: "Offer corrected and resubmitted for approval."
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function amendApprovedUnreleasedOffer(pool, offerId, payload, req) {
+  const user = userContext(req);
+  const amendmentReason = String(payload?.reason || payload?.amendment_reason || "").trim();
+
+  if (!amendmentReason) {
+    throw httpError("An amendment reason is required.", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await assertCanWriteOfferRecord(client, req, offerId);
+
+    const { offerRow, instanceRow } =
+      await offerApprovalWorkflowService.assertOfferAmendmentMayProceed(client, offerId);
+
+    const priorSnapshot = {
+      offered_ctc: Number(offerRow.offered_ctc),
+      expected_joining_date: offerRow.expected_joining_date,
+      variable_pay: Number(offerRow.variable_pay ?? 0),
+      variable_pay_frequency: offerRow.variable_pay_frequency,
+      joining_bonus: Number(offerRow.joining_bonus ?? 0),
+      joining_bonus_frequency: offerRow.joining_bonus_frequency,
+      version: Number(offerRow.version),
+      offer_status: offerRow.offer_status
+    };
+
+    const mergedCommercial = normalizeCommercialFields({
+      expected_joining_date:
+        payload.expected_joining_date ?? payload.expectedJoiningDate ?? offerRow.expected_joining_date,
+      variable_pay: payload.variable_pay ?? payload.variablePay ?? offerRow.variable_pay,
+      variable_pay_frequency:
+        payload.variable_pay_frequency
+        ?? payload.variablePayFrequency
+        ?? offerRow.variable_pay_frequency,
+      joining_bonus: payload.joining_bonus ?? payload.joiningBonus ?? offerRow.joining_bonus,
+      joining_bonus_frequency:
+        payload.joining_bonus_frequency
+        ?? payload.joiningBonusFrequency
+        ?? offerRow.joining_bonus_frequency
+    });
+
+    const offeredCtc = Number(
+      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc
+    );
+
+    if (!Number.isFinite(offeredCtc) || offeredCtc <= 0) {
+      throw httpError("Offered CTC is required.", 400);
+    }
+
+    const commercialErrors = validateCommercialOfferFields({
+      ...mergedCommercial,
+      offered_ctc: offeredCtc
+    });
+
+    if (commercialErrors.length) {
+      throw httpError(commercialErrors.join(" "), 400);
+    }
+
+    await saveRevision(client, offerRow, amendmentReason, user.name);
+
+    const { varianceAmount, variancePct } = computeVariance(
+      offerRow.approved_budget,
+      offeredCtc
+    );
+    const nextVersion = Number((Number(offerRow.version) + 0.1).toFixed(1));
+
+    await client.query(
+      `UPDATE om_offers
+       SET offered_ctc = $1,
+           variance_amount = $2,
+           variance_pct = $3,
+           version = $4,
+           offer_status = 'Pending Approval',
+           expected_joining_date = $5,
+           variable_pay = $6,
+           variable_pay_frequency = $7,
+           joining_bonus = $8,
+           joining_bonus_frequency = $9,
+           modified_by = $10,
+           modified_on = NOW()
+       WHERE offer_id = $11`,
+      [
+        offeredCtc,
+        varianceAmount,
+        variancePct,
+        nextVersion,
+        mergedCommercial.expected_joining_date,
+        mergedCommercial.variable_pay,
+        mergedCommercial.variable_pay_frequency,
+        mergedCommercial.joining_bonus,
+        mergedCommercial.joining_bonus_frequency,
+        user.name,
+        offerId
+      ]
+    );
+
+    await client.query(
+      `UPDATE om_offer_compensation
+       SET total_ctc = $1,
+           variable_pay = $2,
+           bonus = $3,
+           modified_on = NOW()
+       WHERE offer_id = $4`,
+      [
+        offeredCtc,
+        mergedCommercial.variable_pay,
+        mergedCommercial.joining_bonus,
+        offerId
+      ]
+    );
+
+    await invalidateOfferLetterForAmendment(client, offerId);
+
+    await offerApprovalWorkflowService.cancelPendingOfferApprovalWork(
+      client,
+      { offerId, instanceId: instanceRow.instance_id },
+      null
+    );
+    await offerApprovalWorkflowService.cancelPendingOfferInboxTasks(client, offerId);
+
+    const refreshedRow = (
+      await client.query(`SELECT * FROM om_offers WHERE offer_id = $1`, [offerId])
+    ).rows[0];
+    const updatedOffer = mapOfferRow(refreshedRow);
+
+    const approvalRouteId = await approvalRouteResolverService.resolveApprovalRoute(
+      client,
+      "OFFER",
+      {
+        department: updatedOffer.department,
+        designation: updatedOffer.positionTitle,
+        grade: updatedOffer.grade,
+        amount: updatedOffer.offeredCtc
+      }
+    );
+
+    await publishOfferWorkflowAssignments(client, updatedOffer, req, approvalRouteId);
+
+    const approvalTasks = await workflowService.createApprovalRouteWorkflowTasks(
+      client,
+      instanceRow.instance_id,
+      approvalRouteId,
+      {
+        stageKey: "approval",
+        assignedBy: req.user?.employee_code || user.name,
+        requisitionCode: offerId,
+        forceFreshRouteExpansion: true
+      }
+    );
+
+    if (!Array.isArray(approvalTasks) || approvalTasks.length === 0) {
+      throw httpError(
+        "Amended offer approval route did not publish any workflow assignments.",
+        500
+      );
+    }
+
+    await offerApprovalWorkflowService.refreshOfferApprovalMirrorPreservingApproved(
+      client,
+      offerId,
+      approvalRouteId,
+      nextVersion
+    );
+
+    await client.query(
+      `UPDATE wf_instances
+       SET status = 'Running',
+           completed_on = NULL,
+           modified_by = $1,
+           modified_on = NOW()
+       WHERE instance_id = $2`,
+      [user.name, instanceRow.instance_id]
+    );
+
+    const nextSnapshot = {
+      offered_ctc: offeredCtc,
+      expected_joining_date: mergedCommercial.expected_joining_date,
+      variable_pay: mergedCommercial.variable_pay,
+      variable_pay_frequency: mergedCommercial.variable_pay_frequency,
+      joining_bonus: mergedCommercial.joining_bonus,
+      joining_bonus_frequency: mergedCommercial.joining_bonus_frequency,
+      version: nextVersion,
+      approval_route_id: approvalRouteId,
+      offer_status: "Pending Approval"
+    };
+
+    await recordOfferHistory(
+      client,
+      offerId,
+      "OfferAmendedResubmitted",
+      user.name,
+      user.role,
+      "Approved",
+      "Pending Approval",
+      amendmentReason,
+      {
+        prior: priorSnapshot,
+        next: nextSnapshot,
+        workflow_instance_id: instanceRow.instance_id
+      }
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "OfferAmendedResubmitted",
+      module: "Offer Management",
+      entity: "Offer",
+      entityId: offerId,
+      action: "Approved offer amended and resubmitted for approval",
+      previousValue: JSON.stringify(priorSnapshot),
+      newValue: JSON.stringify(nextSnapshot),
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        reason: amendmentReason,
+        approval_route_id: approvalRouteId,
+        cancelled_tasks: true
+      }
+    });
+
+    await client.query("COMMIT");
+
+    return {
+      offer: await getOffer(pool, offerId),
+      toastMessage: "Offer amended and resubmitted for approval."
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function requestClarification(pool, offerId, comments, req) {
@@ -1447,6 +2123,8 @@ module.exports = {
   acceptOffer,
   rejectOffer,
   withdrawOffer,
+  correctAndResubmitPendingApproval,
+  amendApprovedUnreleasedOffer,
   requestClarification,
   submitClarification,
   validateMasterDataReferences,

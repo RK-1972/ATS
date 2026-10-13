@@ -1513,6 +1513,8 @@ async function createApprovalRouteWorkflowTasks(
 
   // Idempotent expansion (Talent Demand / Budget concurrent submit safety):
   // if route-step tasks already exist for this instance, return them.
+  const forceFreshRouteExpansion = options.forceFreshRouteExpansion === true;
+
   const existingRouteTasks = await queryable.query(
     `SELECT
        t.task_id,
@@ -1530,7 +1532,7 @@ async function createApprovalRouteWorkflowTasks(
     [instanceId]
   );
 
-  if (existingRouteTasks.rows.length > 0) {
+  if (!forceFreshRouteExpansion && existingRouteTasks.rows.length > 0) {
     return existingRouteTasks.rows.map((row, index) => ({
       task_id: row.task_id,
       step_id: null,
@@ -1781,9 +1783,18 @@ async function advanceWorkflow(pool, instanceId, action, executionContext, req) 
     }
   }
 
+  const priorInstanceStatus = String(row.status || "");
+  const payloadDerivedStatus = payload.stages.every((item) => item.status === "Completed")
+    ? INSTANCE_STATUS.COMPLETED
+    : INSTANCE_STATUS.RUNNING;
+  const resolvedStatus =
+    priorInstanceStatus === INSTANCE_STATUS.COMPLETED
+      ? INSTANCE_STATUS.COMPLETED
+      : payloadDerivedStatus;
+
   const nextRow = {
     instance_id: instanceId,
-    status: payload.stages.every((item) => item.status === "Completed") ? "Completed" : "Running",
+    status: resolvedStatus,
     current_stage_key: nextStageKey,
     execution_context: {
       ...(row.execution_context || {}),
@@ -1791,9 +1802,10 @@ async function advanceWorkflow(pool, instanceId, action, executionContext, req) 
       current_stage: nextStageKey
     },
     instance_payload: payload,
-    completed_on: payload.stages.every((item) => item.status === "Completed")
-      ? new Date().toISOString()
-      : null
+    completed_on:
+      resolvedStatus === INSTANCE_STATUS.COMPLETED
+        ? row.completed_on || new Date().toISOString()
+        : null
   };
 
   await persistInstance(pool, nextRow, user.name);
@@ -2563,6 +2575,14 @@ async function completeTask(queryable, taskId, req, options = {}) {
     }
 
     const instance = instanceResult.rows[0];
+
+    const offerApprovalWorkflowService = require("./offerApprovalWorkflowService");
+    await offerApprovalWorkflowService.assertOfferApprovalTaskMayComplete(
+      client,
+      instance,
+      task
+    );
+
     assertInstanceRunning(instance);
 
     // Revalidate assignee after locks when called from My Approvals approve
