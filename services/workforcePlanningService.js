@@ -1,8 +1,15 @@
 const businessRulesService = require("./businessRulesService");
 const workflowService = require("./workflowService");
 const masterDataService = require("./masterDataService");
-const { REQUISITION_STATUS } = require("../constants/requisitionStatus");
-const { assertCanCreateRequisition, assertRequisitionApprovalParticipantAccess } = require("./requisitionCapabilityAuth");
+const {
+  REQUISITION_STATUS,
+  isClosedRequisitionStatus
+} = require("../constants/requisitionStatus");
+const {
+  assertCanCreateRequisition,
+  assertRequisitionApprovalParticipantAccess,
+  assertRequisitionRequestorOwnerAccess
+} = require("./requisitionCapabilityAuth");
 const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const userPermissionRepository = require("../repositories/userPermissionRepository");
@@ -339,11 +346,38 @@ function mapWorkforceRequisitionQueueRow(row) {
   };
 }
 
+function isRequisitionConsumedForCatalogue(requisitionRow) {
+  if (!requisitionRow) {
+    return false;
+  }
+
+  if (requisitionRow.requestor_submitted_on) {
+    return true;
+  }
+
+  const status = String(requisitionRow.req_status || "").trim();
+  if (
+    status === REQUISITION_STATUS.APPROVED ||
+    status === REQUISITION_STATUS.REJECTED ||
+    isClosedRequisitionStatus(status)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function requestorCanResumeRequisition(ownerKeySet, requisitionRow) {
+  const createdBy = String(requisitionRow?.created_by || "").trim();
+  return Boolean(createdBy && ownerKeySet.has(createdBy));
+}
+
 /**
- * Keep only approved positions still available for requisition creation.
- * Consumed positions are excluded using rm_requisitions.approved_position_id.
+ * Approved positions available for catalogue display.
+ * Hides only positions consumed by a submitted/closed requisition.
+ * Surfaces in-progress operational requisitions and talent-demand drafts for resume.
  */
-async function enrichApprovedPositionsCatalogue(pool, draft) {
+async function enrichApprovedPositionsCatalogue(pool, draft, req = null) {
   const next = clonePayload(draft);
   const positions = Array.isArray(next.approved_positions)
     ? next.approved_positions
@@ -354,21 +388,128 @@ async function enrichApprovedPositionsCatalogue(pool, draft) {
   }
 
   const positionIds = positions.map((item) => item.id).filter(Boolean);
+  const employeeCode = req?.user?.employee_code
+    ? String(req.user.employee_code).trim()
+    : null;
 
-  const result = await pool.query(
-    `SELECT approved_position_id
+  const requestorOwnerKeys = new Set(
+    employeeCode && req
+      ? await resolveRequisitionRequestorCreatedByKeys(pool, req)
+      : []
+  );
+
+  const requisitionResult = await pool.query(
+    `SELECT approved_position_id, requisition_code, requestor_submitted_on, req_status,
+            created_by
      FROM rm_requisitions
      WHERE approved_position_id = ANY($1::text[])`,
     [positionIds]
   );
 
-  const consumedIds = new Set(
-    result.rows.map((row) => String(row.approved_position_id || "").trim())
+  const requisitionByPosition = new Map();
+  for (const row of requisitionResult.rows) {
+    const key = String(row.approved_position_id || "").trim();
+    if (key && !requisitionByPosition.has(key)) {
+      requisitionByPosition.set(key, row);
+    }
+  }
+
+  let draftByPosition = new Map();
+  const submittedDraftCodeByPosition = new Map();
+
+  const draftStateResult = await pool.query(
+    `SELECT approved_position_id, draft_id, draft_code, status, result_requisition_code,
+            owner_employee_code
+     FROM td_draft_mstr
+     WHERE approved_position_id = ANY($1::text[])
+       AND is_deleted = FALSE
+       AND (
+         (status = 'SUBMITTED' AND result_requisition_code IS NOT NULL)
+         OR (
+           status = 'DRAFT'
+           AND ($2::text IS NOT NULL AND owner_employee_code = $2)
+           AND (result_requisition_code IS NULL OR BTRIM(result_requisition_code) = '')
+         )
+       )
+     ORDER BY updated_on DESC`,
+    [positionIds, employeeCode]
   );
 
-  next.approved_positions = positions.filter(
-    (position) => !consumedIds.has(String(position.id || "").trim())
-  );
+  for (const row of draftStateResult.rows) {
+    const key = String(row.approved_position_id || "").trim();
+    if (!key) {
+      continue;
+    }
+
+    if (row.status === "SUBMITTED" && row.result_requisition_code) {
+      if (!submittedDraftCodeByPosition.has(key)) {
+        submittedDraftCodeByPosition.set(
+          key,
+          String(row.result_requisition_code).trim()
+        );
+      }
+      continue;
+    }
+
+    if (
+      row.status === "DRAFT" &&
+      employeeCode &&
+      String(row.owner_employee_code || "") === employeeCode &&
+      !draftByPosition.has(key)
+    ) {
+      draftByPosition.set(key, row);
+    }
+  }
+
+  next.approved_positions = positions
+    .map((position) => {
+      const positionId = String(position.id || "").trim();
+      if (!positionId) {
+        return null;
+      }
+
+      const linkedRequisition = requisitionByPosition.get(positionId);
+      if (linkedRequisition) {
+        if (isRequisitionConsumedForCatalogue(linkedRequisition)) {
+          return null;
+        }
+
+        const submittedDraftCode = submittedDraftCodeByPosition.get(positionId);
+        if (
+          submittedDraftCode &&
+          submittedDraftCode ===
+            String(linkedRequisition.requisition_code || "").trim()
+        ) {
+          return null;
+        }
+
+        if (!requestorCanResumeRequisition(requestorOwnerKeys, linkedRequisition)) {
+          return null;
+        }
+
+        return {
+          ...position,
+          resume_mode: "requisition",
+          open_requisition_code: linkedRequisition.requisition_code
+        };
+      }
+
+      const linkedDraft = draftByPosition.get(positionId);
+      if (linkedDraft) {
+        return {
+          ...position,
+          resume_mode: "draft",
+          open_draft_id: linkedDraft.draft_id,
+          open_draft_code: linkedDraft.draft_code
+        };
+      }
+
+      return {
+        ...position,
+        resume_mode: "create"
+      };
+    })
+    .filter(Boolean);
 
   return next;
 }
@@ -1012,7 +1153,7 @@ async function enrichApprovalQueueWithLatestActivity(pool, config) {
 async function getWorkforceBundle(pool, req = null) {
   const row = await ensureConfigState(pool);
   const bundle = buildBundle(row);
-  bundle.config = await enrichApprovedPositionsCatalogue(pool, bundle.config);
+  bundle.config = await enrichApprovedPositionsCatalogue(pool, bundle.config, req);
   bundle.config = await enrichApprovalQueueWithLatestActivity(pool, bundle.config);
 
   if (req?.user?.employee_code) {
@@ -2287,8 +2428,47 @@ async function getBudgetApprovalActionContext(pool, requestId, req) {
   };
 }
 
+async function findOpenRequisitionForPosition(pool, positionId) {
+  const result = await pool.query(
+    `SELECT requisition_code, requestor_submitted_on, req_status, created_by
+     FROM rm_requisitions
+     WHERE approved_position_id = $1
+     ORDER BY created_on ASC
+     LIMIT 1`,
+    [positionId]
+  );
+  return result.rows[0] || null;
+}
+
+async function findOpenTalentDemandDraftForPosition(pool, positionId, employeeCode) {
+  const result = await pool.query(
+    `SELECT draft_id, draft_code
+     FROM td_draft_mstr
+     WHERE approved_position_id = $1
+       AND owner_employee_code = $2
+       AND is_deleted = FALSE
+       AND status = 'DRAFT'
+       AND (result_requisition_code IS NULL OR BTRIM(result_requisition_code) = '')
+     ORDER BY updated_on DESC
+     LIMIT 1`,
+    [positionId, employeeCode]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Start or resume Talent Demand for an approved position.
+ * Does not create rm_requisitions until draft submit — avoids consuming the catalogue slot prematurely.
+ */
 async function createRequisition(pool, positionId, req) {
-  const user = userContext(req);
+  const employeeCode = req.user?.employee_code
+    ? String(req.user.employee_code).trim()
+    : null;
+
+  if (!employeeCode) {
+    throw httpError("Authenticated employee_code is required.", 401);
+  }
+
   const row = await ensureConfigState(pool);
   const draft = clonePayload(row.draft_payload);
   const position = draft.approved_positions.find((item) => item.id === positionId);
@@ -2297,34 +2477,59 @@ async function createRequisition(pool, positionId, req) {
     throw httpError(`Approved position not found: ${positionId}`, 404);
   }
 
-  const recruitmentService = require("./recruitmentService");
-  const result = await recruitmentService.createFromApprovedPosition(pool, positionId, {}, req);
+  const existingRequisition = await findOpenRequisitionForPosition(pool, positionId);
+  if (existingRequisition) {
+    if (isRequisitionConsumedForCatalogue(existingRequisition)) {
+      throw httpError(
+        `A requisition already exists for approved position ${positionId}: ${existingRequisition.requisition_code}.`,
+        409
+      );
+    }
 
-  draft.approved_positions = draft.approved_positions.map((item) =>
-    item.id === positionId
-      ? { ...item, requisitions_created: item.requisitions_created + 1 }
-      : item
+    await assertRequisitionRequestorOwnerAccess(pool, req, existingRequisition);
+
+    const enrichedDraft = await enrichApprovedPositionsCatalogue(
+      pool,
+      draft,
+      req
+    );
+
+    return {
+      workforce: enrichedDraft,
+      requisitionId: existingRequisition.requisition_code,
+      resumeMode: "requisition",
+      toastMessage: `Continue requisition ${existingRequisition.requisition_code}.`
+    };
+  }
+
+  const existingDraft = await findOpenTalentDemandDraftForPosition(
+    pool,
+    positionId,
+    employeeCode
   );
-  draft.meta.last_updated = nowIso();
-  await persistDraft(pool, draft, user.name);
 
-  const enrichedDraft = await enrichApprovedPositionsCatalogue(pool, draft);
+  const talentDemandDraftService = require("./talentDemandDraftService");
+  const talentDraft =
+    existingDraft ||
+    (await talentDemandDraftService.createDraft(
+      pool,
+      {
+        approved_position_id: positionId,
+        job_title: position.position || position.position_title || null
+      },
+      req.user
+    ));
 
-  await pool.query(
-    `INSERT INTO wp_position_lifecycle (position_id, event_type, from_status, to_status, actor, metadata)
-     VALUES ($1,'RequisitionCreated',$2,'Requisition Raised',$3,$4)`,
-    [
-      positionId,
-      position.status,
-      user.name,
-      JSON.stringify({ requisitionId: result.requisitionId })
-    ]
-  );
+  const enrichedDraft = await enrichApprovedPositionsCatalogue(pool, draft, req);
 
   return {
     workforce: enrichedDraft,
-    position: result.requisition,
-    requisitionId: result.requisitionId,
+    draftId: talentDraft.draft_id,
+    draftCode: talentDraft.draft_code,
+    resumeMode: existingDraft ? "draft" : "create",
+    toastMessage: existingDraft
+      ? `Resume draft ${talentDraft.draft_code}.`
+      : `Draft ${talentDraft.draft_code} created. Complete Talent Demand and submit when ready.`,
     approvedPosition: {
       id: positionId,
       department: position.department,
@@ -2332,13 +2537,10 @@ async function createRequisition(pool, positionId, req) {
       grade: position.grade,
       headcount: position.headcount,
       budget_approved: position.budget_approved,
-      requisitions_created: position.requisitions_created + 1,
+      requisitions_created: position.requisitions_created,
       status: position.status,
       source_request_id: position.source_request_id
-    },
-    request: null,
-    hiringProcessUpdate: result.hiringProcessUpdate,
-    toastMessage: result.toastMessage
+    }
   };
 }
 
@@ -2490,5 +2692,7 @@ module.exports = {
   validateMasterDataReferences,
   evaluateBudgetRules,
   seedConfiguration,
-  syncNormalizedTables
+  syncNormalizedTables,
+  isRequisitionConsumedForCatalogue,
+  enrichApprovedPositionsCatalogue
 };

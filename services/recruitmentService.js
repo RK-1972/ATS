@@ -4135,6 +4135,8 @@ async function submitRequisition(pool, code, payload, req) {
       throw httpError(`Requisition not found: ${code}`, 404);
     }
 
+    await assertRequisitionRequestorOwnerAccess(pool, req, existing);
+
     assertExistingRequisitionEditable(existing);
 
     if (existing.requestor_submitted_on) {
