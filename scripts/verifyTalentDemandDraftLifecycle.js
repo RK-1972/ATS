@@ -7,6 +7,7 @@ require("dotenv").config();
 const { Pool } = require("pg");
 const talentDemandDraftService = require("../services/talentDemandDraftService");
 const talentDemandSubmitService = require("../services/talentDemandSubmitService");
+const requisitionFieldResolutionService = require("../services/requisitionFieldResolutionService");
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -156,21 +157,23 @@ async function bootstrapVerificationApprovedPosition(client) {
   };
 }
 
-async function resolveRequisitionApprovalRoute(client) {
-  const route = await client.query(
-    `SELECT route_id
-     FROM approval_route_mstr
-     WHERE LOWER(TRIM(status)) = 'active'
-       AND (
-         LOWER(TRIM(applies_to)) LIKE '%requisition%'
-         OR LOWER(TRIM(applies_to)) LIKE '%talent%'
-         OR LOWER(TRIM(applies_to)) LIKE '%demand%'
-       )
-     ORDER BY route_id
-     LIMIT 1`
-  );
+async function resolveRequisitionApprovalRoute(client, positionId) {
+  if (!positionId) {
+    return null;
+  }
 
-  return route.rows[0]?.route_id || null;
+  try {
+    return await requisitionFieldResolutionService.resolveRequisitionApprovalRouteId(
+      client,
+      positionId
+    );
+  } catch (error) {
+    console.error(
+      "Requisition approval-route policy resolution failed:",
+      error.message
+    );
+    return null;
+  }
 }
 
 async function resolveSubmitDefaults(client) {
@@ -249,7 +252,6 @@ async function main() {
     );
 
     let position = await findAvailableApprovedPosition(client);
-    const approvalRouteId = await resolveRequisitionApprovalRoute(client);
 
     if (!position?.id) {
       position = await bootstrapVerificationApprovedPosition(client);
@@ -260,8 +262,16 @@ async function main() {
       pass(`fixtures: bootstrapped approved position ${position.id}`);
     }
 
+    const approvalRouteId = await resolveRequisitionApprovalRoute(
+      client,
+      position.id
+    );
+
     if (!approvalRouteId) {
-      fail("fixtures", "no active requisition approval route");
+      fail(
+        "fixtures",
+        "no REQUISITION approval-route policy resolves for verification position (configure approval_route_policy for Requisition routes)"
+      );
       return;
     }
 
@@ -297,7 +307,6 @@ async function main() {
 
     const payload = {
       approved_position_id: position.id,
-      approval_route_id: approvalRouteId,
       client_id: position.client_id || null,
       client_name: position.client_name || position.client || "Verification Client",
       project_id: position.project_id || null,

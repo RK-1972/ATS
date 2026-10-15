@@ -1,4 +1,5 @@
 const recruitmentService = require("../services/recruitmentService");
+const requisitionFieldResolutionService = require("../services/requisitionFieldResolutionService");
 const resumeMatchService = require("../services/resumeMatchService");
 const aiCandidateReviewService = require("../services/aiCandidateReviewService");
 const requisitionClosureService = require("../services/requisitionClosureService");
@@ -305,6 +306,31 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
       handleError(res, error);
     }
   });
+
+  app.get(
+    "/api/v1/recruitment/talent-demand-field-resolution",
+    requestorGuard,
+    async (req, res) => {
+      try {
+        const data =
+          await requisitionFieldResolutionService.buildTalentDemandFieldResolutionPreview(
+            pool,
+            {
+              approved_position_id: req.query?.approved_position_id,
+              requisition_code: req.query?.requisition_code
+            }
+          );
+
+        res.json({
+          success: true,
+          message: "Talent Demand field resolution preview.",
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.get(
     "/api/v1/recruitment/requisitions/:reqId/assigned-recruiters",

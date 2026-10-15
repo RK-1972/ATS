@@ -15,6 +15,7 @@ const {
   assertCanPublishToCandidatePortal,
   assertRequisitionRequestorOwnerAccess
 } = require("./requisitionCapabilityAuth");
+const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
 const candidateAccessService = require("./candidateAccessService");
 const candidateService = require("./candidateService");
 const legacyPipelineReadService = require("./legacyPipelineReadService");
@@ -4150,6 +4151,38 @@ async function submitRequisition(pool, code, payload, req) {
     }
 
     const requisition = await loadRequisitionByCode(client, code);
+
+    if (!blankToNull(requisition.approved_position_id)) {
+      throw httpError(
+        "approved_position_id is required to submit this requisition.",
+        400
+      );
+    }
+
+    await requisitionFieldResolutionService.assertApprovedPositionSelectable(
+      client,
+      requisition.approved_position_id,
+      { existingRequisitionCode: requisition.requisition_code }
+    );
+
+    const approvalRouteIdForSubmit =
+      await requisitionFieldResolutionService.resolveApprovalRouteIdForRequisitionSubmit(
+        client,
+        requisition
+      );
+
+    if (blankToNull(requisition.approval_route_id)) {
+      await client.query(
+        `UPDATE rm_requisitions
+         SET approval_route_id = $1,
+             modified_by = $2,
+             modified_on = NOW()
+         WHERE requisition_code = $3`,
+        [approvalRouteIdForSubmit, user.name, requisition.requisition_code]
+      );
+      requisition.approval_route_id = approvalRouteIdForSubmit;
+    }
+
     assertRequestorSubmitReadiness(requisition);
 
     const workflowInstanceId = requisition.workflow_instance_id;

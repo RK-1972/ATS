@@ -11,6 +11,7 @@ const talentDemandDraftService = require("./talentDemandDraftService");
 const talentDemandDraftRepository = require("../repositories/talentDemandDraftRepository");
 const recruitmentService = require("./recruitmentService");
 const workflowService = require("./workflowService");
+const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
 
 const { DRAFT_STATUS } = talentDemandDraftService;
 
@@ -191,17 +192,35 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
     const draft = preparation.draft;
 
     // ------------------------------------------------------------------
-    // 2. Validate submit readiness
+    // 2. Resolve approved position + approval route (authoritative server-side)
+    // ------------------------------------------------------------------
+    const resolvedFields =
+      await requisitionFieldResolutionService.resolveTalentDemandFields(client, {
+        requestedApprovedPositionId: draft.approved_position_id,
+        existingRequisitionCode: draft.result_requisition_code
+      });
+
+    draft.approved_position_id = resolvedFields.approved_position_id;
+    draft.approval_route_id = resolvedFields.approval_route_id;
+
+    await talentDemandDraftRepository.updateDraft(client, draftId, {
+      approved_position_id: resolvedFields.approved_position_id,
+      approval_route_id: resolvedFields.approval_route_id,
+      updated_by: employeeCode
+    });
+
+    // ------------------------------------------------------------------
+    // 3. Validate submit readiness
     // ------------------------------------------------------------------
     assertSubmitReadiness(draft, rowVersion);
 
     // ------------------------------------------------------------------
-    // 3. Prepare requisition payload from draft
+    // 4. Prepare requisition payload from draft
     // ------------------------------------------------------------------
     const requisitionPayload = prepareRequisitionPayload(draft);
 
     // ------------------------------------------------------------------
-    // 4. Invoke existing requisition creation service
+    // 5. Invoke existing requisition creation service
     //    (createFromApprovedPosition also starts the REQUISITION workflow)
     // ------------------------------------------------------------------
     const requisitionResult =
@@ -239,7 +258,7 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
       requisitionResult.requisition?.workflow_instance_id || null;
 
     // ------------------------------------------------------------------
-    // 5. Invoke existing workflow/approval service
+    // 6. Invoke existing workflow/approval service
     //    Resolve the instance started by requisition create; if absent,
     //    start REQUISITION workflow (idempotent when instance_id exists).
     // ------------------------------------------------------------------
@@ -273,7 +292,7 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
       workflow?.instanceId || workflowInstanceId || null;
 
     // ------------------------------------------------------------------
-    // 5b. Expand approval_route_step into workflow tasks/assignments
+    // 6b. Expand approval_route_step into workflow tasks/assignments
     //     (same client / transaction — no notifications)
     // ------------------------------------------------------------------
     let approvalTasks = [];
@@ -293,7 +312,7 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
     }
 
     // ------------------------------------------------------------------
-    // 6. Mark draft as SUBMITTED (existing repository method — no SQL here)
+    // 7. Mark draft as SUBMITTED (existing repository method — no SQL here)
     // ------------------------------------------------------------------
     const submittedDraft = await talentDemandDraftRepository.markDraftSubmitted(
       client,
@@ -316,7 +335,7 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
     await client.query("COMMIT");
 
     // ------------------------------------------------------------------
-    // 7. Unified result object
+    // 8. Unified result object
     // ------------------------------------------------------------------
     return {
       draft: submittedDraft,
