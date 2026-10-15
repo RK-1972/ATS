@@ -27,9 +27,13 @@ All normalized tables support versioning, draft/published/archived status, effec
 
 ```bash
 cd ats-backend
-npm run migrate:workforce
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:workforce
 ```
+
+Schema is applied via the Migration Manager (`migrate:up` runs pending files in order, including `005_workforce_planning_schema.sql`). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 Files:
 
@@ -142,11 +146,9 @@ VITE_API_BASE_URL=http://localhost:5000
 
 ```bash
 cd ats-backend
-npm run migrate:master-data
-npm run migrate:platform-config
-npm run migrate:business-rules
-npm run migrate:workflows
-npm run migrate:workforce
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:master-data
 npm run seed:platform-config
 npm run seed:business-rules
@@ -154,5 +156,7 @@ npm run seed:workflows
 npm run seed:workforce
 npm start
 ```
+
+Applies all pending schema migrations in filename order (Sprints 1–5 and workforce). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 See [Workforce Planning Verification Scenarios](./Workforce Planning Verification Scenarios.md).

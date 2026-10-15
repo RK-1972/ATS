@@ -1,3 +1,9 @@
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
+
+refuseLegacySchemaMigration(__filename, {
+  migrationFile: "022_td_draft_mstr.sql"
+});
+
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");

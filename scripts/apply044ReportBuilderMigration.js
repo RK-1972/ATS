@@ -1,3 +1,9 @@
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
+
+refuseLegacySchemaMigration(__filename, {
+  migrationFile: "044_report_builder_schema.sql"
+});
+
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");

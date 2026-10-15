@@ -1,3 +1,9 @@
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
+
+refuseLegacySchemaMigration(__filename, {
+  migrationFile: "059_candidate_registered_pan_unique.sql"
+});
+
 require("dotenv").config();
 
 const fs = require("fs");

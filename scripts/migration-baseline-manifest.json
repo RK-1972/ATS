@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "description": "Explicit fingerprint hints merged at runtime with SQL-derived object/shape checks and migrationSeedDataChecks.js data-tier checks. Each check documents proves/cannotProve in code; regclass alone does not prove seed data.",
+  "fingerprints": {
+    "000_schema_migration_ledger.sql": {
+      "checks": []
+    },
+    "004_workflow_engine_schema.sql": {
+      "checks": [
+        {
+          "type": "column",
+          "table": "wf_instances",
+          "column": "execution_context",
+          "expect": "present",
+          "tier": "shape",
+          "proves": "wf_instances.execution_context column exists (008+ workflow runtime).",
+          "cannotProve": "Full wf_instances DDL from 004."
+        }
+      ]
+    },
+    "008_offer_management_schema.sql": {
+      "checks": [
+        {
+          "type": "column",
+          "table": "om_offers",
+          "column": "offer_status",
+          "expect": "present",
+          "tier": "shape",
+          "proves": "om_offers.offer_status column exists.",
+          "cannotProve": "Offer workflow constraints and indexes."
+        }
+      ]
+    },
+    "059_candidate_registered_pan_unique.sql": {
+      "checks": [
+        {
+          "type": "index",
+          "index": "uq_cand_mstr_registered_pan_upper",
+          "expect": "present",
+          "tier": "shape",
+          "proves": "Registered PAN unique index from 059 exists by name.",
+          "cannotProve": "Partial index predicate and expression definition."
+        }
+      ]
+    }
+  }
+}

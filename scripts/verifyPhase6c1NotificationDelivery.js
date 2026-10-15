@@ -312,7 +312,7 @@ async function main() {
     if (!(await tableExists("notification_deliveries"))) {
       skip(
         "schema checks",
-        "notification_deliveries missing — run npm run migrate:notification-deliveries first"
+        "notification_deliveries missing — run OPTALYNX_DB_TARGET=local npm run migrate:verify then npm run migrate:up (see docs/database-migrations-runbook.md; applies 052_notification_deliveries_schema.sql when pending)"
       );
       return;
     }

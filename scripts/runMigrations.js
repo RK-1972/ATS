@@ -1,46 +1,10 @@
-require("dotenv").config();
+/**
+ * Legacy migration runner (disabled Phase 1.1).
+ * Use: OPTALYNX_DB_TARGET=local npm run migrate:up
+ * See docs/database-migrations-runbook.md
+ */
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
 
-const fs = require("fs");
-const path = require("path");
-const { Pool } = require("pg");
-
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
+refuseLegacySchemaMigration("scripts/runMigrations.js", {
+  migrationFile: "migrations/*.sql (full replay including 000_schema_migration_ledger.sql)"
 });
-
-async function runMigration(fileName) {
-  const filePath = path.join(__dirname, "..", "migrations", fileName);
-  const sql = fs.readFileSync(filePath, "utf8");
-  await pool.query(sql);
-  console.log(`✅ Applied ${fileName}`);
-}
-
-async function runAllMigrations() {
-  const migrationsDir = path.join(__dirname, "..", "migrations");
-  const files = fs
-    .readdirSync(migrationsDir)
-    .filter((file) => file.endsWith(".sql"))
-    .sort();
-
-  for (const file of files) {
-    await runMigration(file);
-  }
-}
-
-async function main() {
-  try {
-    await runAllMigrations();
-    console.log("All migrations applied.");
-  } catch (error) {
-    console.error("Migration failed:", error.message);
-    process.exit(1);
-  } finally {
-    await pool.end();
-  }
-}
-
-main();

@@ -276,7 +276,10 @@ async function scheduleInterviewFixture(fixture, panel, roundType, recruiter, re
 
 async function main() {
   if (!(await tableExists("notification_deliveries"))) {
-    skip("schema checks", "notification_deliveries missing — run migrate:notification-deliveries");
+    skip(
+      "schema checks",
+      "notification_deliveries missing — run OPTALYNX_DB_TARGET=local npm run migrate:verify then npm run migrate:up (see docs/database-migrations-runbook.md)"
+    );
     await pool.end();
     return;
   }

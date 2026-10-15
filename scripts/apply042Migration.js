@@ -1,3 +1,9 @@
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
+
+refuseLegacySchemaMigration(__filename, {
+  migrationFile: "042_approval_route_policy_multi_criteria.sql"
+});
+
 require("dotenv").config();
 
 const fs = require("fs");

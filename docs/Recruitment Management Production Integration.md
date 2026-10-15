@@ -24,9 +24,13 @@ Migration: `migrations/006_recruitment_management_schema.sql`
 
 ```bash
 cd ats-backend
-npm run migrate:recruitment
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:recruitment
 ```
+
+Schema is applied via the Migration Manager (`migrate:up` runs pending files in order, including `006_recruitment_management_schema.sql`). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 Seed file `seed/recruitment.seed.json` includes `REQ-2026-1187` linked to `AP-2026-0076` (aligned with Hiring Control Tower mock).
 
@@ -111,10 +115,14 @@ Requires Sprints 1–5 migrations/seeds, then:
 
 ```bash
 cd ats-backend
-npm run migrate:recruitment
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:recruitment
 npm start
 ```
+
+Schema via Migration Manager — see [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 ```env
 VITE_API_MODE=live

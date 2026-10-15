@@ -38,9 +38,13 @@ Audit events reuse `md_enterprise_audit` from Sprint 1.
 
 ```bash
 cd ats-backend
-npm run migrate:platform-config
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:platform-config
 ```
+
+Schema is applied via the Migration Manager (`migrate:up` runs pending files in order, including `002_platform_config_schema.sql`). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 Files:
 

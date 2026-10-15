@@ -29,9 +29,13 @@ Migration: `migrations/008_offer_management_schema.sql`
 
 ```bash
 cd ats-backend
-npm run migrate:offers
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:offers
 ```
+
+Schema is applied via the Migration Manager (`migrate:up` runs pending files in order, including `008_offer_management_schema.sql`). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 Seed `OFF-2026-00482` aligns with Hiring Control Tower: 21 LPA offer vs 18 LPA budget (16.7% variance).
 

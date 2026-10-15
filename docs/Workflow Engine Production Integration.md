@@ -28,9 +28,13 @@ The Workflow Engine replaces mock workflow configuration and in-memory hiring pr
 
 ```bash
 cd ats-backend
-npm run migrate:workflows
+export OPTALYNX_DB_TARGET=local
+npm run migrate:verify
+npm run migrate:up
 npm run seed:workflows
 ```
+
+Schema is applied via the Migration Manager (`migrate:up` runs pending files in order, including `004_workflow_engine_schema.sql`). See [database-migrations-runbook.md](./database-migrations-runbook.md). For Neon, set `OPTALYNX_MIGRATE_CONFIRM=I_UNDERSTAND_PRODUCTION`.
 
 Files:
 

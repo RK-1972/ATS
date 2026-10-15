@@ -1,3 +1,9 @@
+const { refuseLegacySchemaMigration } = require("./lib/legacyMigrationGuard");
+
+refuseLegacySchemaMigration(__filename, {
+  migrationFile: "043_candidate_portal_account_schema.sql"
+});
+
 require("dotenv").config();
 
 const fs = require("fs");
