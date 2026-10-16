@@ -16,6 +16,12 @@ const {
   assertRequisitionRequestorOwnerAccess
 } = require("./requisitionCapabilityAuth");
 const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
+const {
+  collectExperienceRangeErrors
+} = require("../utils/experienceRangeValidation");
+const {
+  assertApprovedPositionUpdateIntegrity
+} = require("../utils/approvedPositionUpdateIntegrity");
 const candidateAccessService = require("./candidateAccessService");
 const candidateService = require("./candidateService");
 const legacyPipelineReadService = require("./legacyPipelineReadService");
@@ -3793,13 +3799,12 @@ function assertRequestorSubmitReadiness(requisition) {
   if (!blankToNull(requisition.target_date)) {
     errors.push("target_date is required before submit.");
   }
-  if (
-    requisition.experience_min != null &&
-    requisition.experience_max != null &&
-    Number(requisition.experience_min) > Number(requisition.experience_max)
-  ) {
-    errors.push("experience_min cannot be greater than experience_max.");
-  }
+  errors.push(
+    ...collectExperienceRangeErrors(
+      requisition.experience_min,
+      requisition.experience_max
+    )
+  );
 
   if (errors.length > 0) {
     throw httpError(errors.join(" "), 400);
@@ -3835,23 +3840,17 @@ function assertRequisitionEditorFieldValidation(payload = {}, existing = {}) {
     const min = expMinInPayload
       ? payload.experience_min === "" || payload.experience_min === null
         ? null
-        : Number(payload.experience_min)
-      : existing.experience_min != null
-        ? Number(existing.experience_min)
-        : null;
+        : payload.experience_min
+      : existing.experience_min;
     const max = expMaxInPayload
       ? payload.experience_max === "" || payload.experience_max === null
         ? null
-        : Number(payload.experience_max)
-      : existing.experience_max != null
-        ? Number(existing.experience_max)
-        : null;
+        : payload.experience_max
+      : existing.experience_max;
 
-    if (min != null && max != null && min > max) {
-      throw httpError(
-        "experience_min cannot be greater than experience_max.",
-        400
-      );
+    const experienceErrors = collectExperienceRangeErrors(min, max);
+    if (experienceErrors.length > 0) {
+      throw httpError(experienceErrors.join(" "), 400);
     }
   }
 }
@@ -3978,6 +3977,14 @@ async function updateRequisition(pool, code, payload, req) {
   assertExistingRequisitionEditable(existing);
 
   assertRequisitionEditorFieldValidation(payload || {}, existing);
+
+  if (blankToNull(existing.approved_position_id)) {
+    await assertApprovedPositionUpdateIntegrity(pool, {
+      existingApprovedPositionId: existing.approved_position_id,
+      payload: payload || {},
+      existingRequisitionCode: existing.requisition_code
+    });
+  }
 
   const fields = buildRequisitionUpdateFields(payload || {});
 
@@ -4173,7 +4180,7 @@ async function submitRequisition(pool, code, payload, req) {
         requisition
       );
 
-    if (blankToNull(requisition.approval_route_id)) {
+    if (!blankToNull(requisition.approval_route_id)) {
       await client.query(
         `UPDATE rm_requisitions
          SET approval_route_id = $1,

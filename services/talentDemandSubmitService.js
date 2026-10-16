@@ -8,6 +8,9 @@
  */
 
 const talentDemandDraftService = require("./talentDemandDraftService");
+const {
+  collectExperienceRangeErrors
+} = require("../utils/experienceRangeValidation");
 const talentDemandDraftRepository = require("../repositories/talentDemandDraftRepository");
 const recruitmentService = require("./recruitmentService");
 const workflowService = require("./workflowService");
@@ -102,13 +105,12 @@ function assertSubmitReadiness(draft, rowVersion) {
     errors.push("target_date is required before submit.");
   }
 
-  if (
-    draft.experience_min != null &&
-    draft.experience_max != null &&
-    Number(draft.experience_min) > Number(draft.experience_max)
-  ) {
-    errors.push("experience_min cannot be greater than experience_max.");
-  }
+  errors.push(
+    ...collectExperienceRangeErrors(
+      draft.experience_min,
+      draft.experience_max
+    )
+  );
 
   if (errors.length > 0) {
     throw httpError(errors.join(" "), 400);

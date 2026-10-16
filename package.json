@@ -66,8 +66,8 @@
     "verify:candidate-pool-segregation": "node scripts/verifyCandidatePoolSegregation.js",
     "verify:wave5-offers": "node scripts/verifyWave5OffersExecution.js",
     "regression:wave5": "node scripts/runWave5Regression.js",
-    "test": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js",
-    "test:requisition-resolution": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js"
+    "test": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js scripts/experienceRangeValidation.test.js scripts/talentDemandSubmitService.test.js scripts/approvedPositionUpdateIntegrity.test.js",
+    "test:requisition-resolution": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js scripts/experienceRangeValidation.test.js scripts/talentDemandSubmitService.test.js scripts/approvedPositionUpdateIntegrity.test.js"
   },
   "keywords": [],
   "author": "",

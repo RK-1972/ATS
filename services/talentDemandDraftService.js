@@ -5,6 +5,9 @@
  */
 
 const talentDemandDraftRepository = require("../repositories/talentDemandDraftRepository");
+const {
+  assertApprovedPositionUpdateIntegrity
+} = require("../utils/approvedPositionUpdateIntegrity");
 
 const DRAFT_STATUS = {
   DRAFT: "DRAFT",
@@ -117,6 +120,12 @@ async function updateDraft(pool, draftId, formData, actor) {
   if (String(existing.status).toUpperCase() !== DRAFT_STATUS.DRAFT) {
     throw httpError("Only drafts in DRAFT status can be updated.", 400);
   }
+
+  await assertApprovedPositionUpdateIntegrity(pool, {
+    existingApprovedPositionId: existing.approved_position_id,
+    payload: formData || {},
+    existingRequisitionCode: existing.result_requisition_code
+  });
 
   const payload = {
     ...formData,
