@@ -468,6 +468,16 @@ async function enrichApprovedPositionsCatalogue(pool, draft, req = null) {
         return null;
       }
 
+      const linkedDraft = draftByPosition.get(positionId);
+      if (linkedDraft) {
+        return {
+          ...position,
+          resume_mode: "draft",
+          open_draft_id: linkedDraft.draft_id,
+          open_draft_code: linkedDraft.draft_code
+        };
+      }
+
       const linkedRequisition = requisitionByPosition.get(positionId);
       if (linkedRequisition) {
         if (isRequisitionConsumedForCatalogue(linkedRequisition)) {
@@ -491,16 +501,6 @@ async function enrichApprovedPositionsCatalogue(pool, draft, req = null) {
           ...position,
           resume_mode: "requisition",
           open_requisition_code: linkedRequisition.requisition_code
-        };
-      }
-
-      const linkedDraft = draftByPosition.get(positionId);
-      if (linkedDraft) {
-        return {
-          ...position,
-          resume_mode: "draft",
-          open_draft_id: linkedDraft.draft_id,
-          open_draft_code: linkedDraft.draft_code
         };
       }
 
@@ -2478,14 +2478,48 @@ async function createRequisition(pool, positionId, req) {
   }
 
   const existingRequisition = await findOpenRequisitionForPosition(pool, positionId);
-  if (existingRequisition) {
-    if (isRequisitionConsumedForCatalogue(existingRequisition)) {
-      throw httpError(
-        `A requisition already exists for approved position ${positionId}: ${existingRequisition.requisition_code}.`,
-        409
+  const existingDraft = await findOpenTalentDemandDraftForPosition(
+    pool,
+    positionId,
+    employeeCode
+  );
+
+  const talentDemandDraftService = require("./talentDemandDraftService");
+
+  if (existingRequisition && isRequisitionConsumedForCatalogue(existingRequisition)) {
+    throw httpError(
+      `A requisition already exists for approved position ${positionId}: ${existingRequisition.requisition_code}.`,
+      409
+    );
+  }
+
+  if (existingDraft) {
+    if (
+      existingRequisition &&
+      !String(existingDraft.result_requisition_code || "").trim()
+    ) {
+      await talentDemandDraftService.linkDraftToOpenRequisition(
+        pool,
+        existingDraft.draft_id,
+        existingRequisition.requisition_code,
+        req.user,
+        req
       );
     }
 
+    const enrichedDraft = await enrichApprovedPositionsCatalogue(pool, draft, req);
+
+    return {
+      workforce: enrichedDraft,
+      draftId: existingDraft.draft_id,
+      draftCode: existingDraft.draft_code,
+      requisitionId: existingRequisition?.requisition_code || null,
+      resumeMode: "draft",
+      toastMessage: `Resume draft ${existingDraft.draft_code}.`
+    };
+  }
+
+  if (existingRequisition) {
     await assertRequisitionRequestorOwnerAccess(pool, req, existingRequisition);
 
     const enrichedDraft = await enrichApprovedPositionsCatalogue(
@@ -2501,24 +2535,14 @@ async function createRequisition(pool, positionId, req) {
       toastMessage: `Continue requisition ${existingRequisition.requisition_code}.`
     };
   }
-
-  const existingDraft = await findOpenTalentDemandDraftForPosition(
+  const talentDraft = await talentDemandDraftService.createDraft(
     pool,
-    positionId,
-    employeeCode
+    {
+      approved_position_id: positionId,
+      job_title: position.position || position.position_title || null
+    },
+    req.user
   );
-
-  const talentDemandDraftService = require("./talentDemandDraftService");
-  const talentDraft =
-    existingDraft ||
-    (await talentDemandDraftService.createDraft(
-      pool,
-      {
-        approved_position_id: positionId,
-        job_title: position.position || position.position_title || null
-      },
-      req.user
-    ));
 
   const enrichedDraft = await enrichApprovedPositionsCatalogue(pool, draft, req);
 
@@ -2526,10 +2550,8 @@ async function createRequisition(pool, positionId, req) {
     workforce: enrichedDraft,
     draftId: talentDraft.draft_id,
     draftCode: talentDraft.draft_code,
-    resumeMode: existingDraft ? "draft" : "create",
-    toastMessage: existingDraft
-      ? `Resume draft ${talentDraft.draft_code}.`
-      : `Draft ${talentDraft.draft_code} created. Complete Talent Demand and submit when ready.`,
+    resumeMode: "create",
+    toastMessage: `Draft ${talentDraft.draft_code} created. Complete Talent Demand and submit when ready.`,
     approvedPosition: {
       id: positionId,
       department: position.department,

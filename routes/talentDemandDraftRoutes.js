@@ -37,12 +37,16 @@ function registerTalentDemandDraftRoutes(app, pool, verifyToken) {
   // GET /api/v1/talent-demand/drafts — List My Drafts
   app.get("/api/v1/talent-demand/drafts", requestorGuard, async (req, res) => {
     try {
-      const drafts = await talentDemandDraftService.listMyDrafts(pool, req.user);
+      const work = await talentDemandDraftService.listMyTalentDemandWork(
+        pool,
+        req.user,
+        req
+      );
 
       res.status(200).json({
         success: true,
-        message: "Drafts retrieved successfully.",
-        data: drafts
+        message: "Talent Demand work in progress retrieved successfully.",
+        data: work
       });
     } catch (error) {
       handleError(res, error);

@@ -8,6 +8,12 @@ const talentDemandDraftRepository = require("../repositories/talentDemandDraftRe
 const {
   assertApprovedPositionUpdateIntegrity
 } = require("../utils/approvedPositionUpdateIntegrity");
+const {
+  resolveRequisitionRequestorCreatedByKeys,
+  assertRequisitionRequestorOwnerAccess
+} = require("./requisitionCapabilityAuth");
+const { loadRequisitionByCode } = require("./recruitmentService");
+const { REQUISITION_STATUS, isClosedRequisitionStatus } = require("../constants/requisitionStatus");
 
 const DRAFT_STATUS = {
   DRAFT: "DRAFT",
@@ -160,13 +166,186 @@ async function getDraft(pool, draftId, actor) {
 }
 
 async function listMyDrafts(pool, actor) {
+  const work = await listMyTalentDemandWork(pool, actor);
+  return work.drafts;
+}
+
+/**
+ * Link an in-progress draft to an existing operational requisition (legacy catalogue row).
+ * Does not submit for approval or create workflow tasks.
+ */
+async function linkDraftToOpenRequisition(
+  pool,
+  draftId,
+  requisitionCode,
+  actor,
+  req
+) {
+  const { employeeCode, actorName } = resolveActor(actor);
+
+  if (!employeeCode) {
+    throw httpError("Authenticated employee_code is required.", 401);
+  }
+
+  const code = String(requisitionCode || "").trim();
+  if (!code) {
+    return null;
+  }
+
+  const existing = await talentDemandDraftRepository.getDraftById(pool, draftId);
+  assertOwner(existing, employeeCode);
+
+  if (String(existing.status || "").toUpperCase() !== DRAFT_STATUS.DRAFT) {
+    throw httpError("Only drafts in DRAFT status can be linked.", 400);
+  }
+
+  const currentLink = String(existing.result_requisition_code || "").trim();
+  if (currentLink && currentLink !== code) {
+    throw httpError(
+      "Draft is already linked to a different requisition.",
+      409
+    );
+  }
+
+  const requisition = await loadRequisitionByCode(pool, code);
+  if (!requisition) {
+    throw httpError(`Requisition not found: ${code}`, 404);
+  }
+
+  if (!req) {
+    throw httpError(
+      "Authenticated request context is required to link a draft to a requisition.",
+      401
+    );
+  }
+  await assertRequisitionRequestorOwnerAccess(pool, req, requisition);
+
+  const draftPositionId = String(existing.approved_position_id || "").trim();
+  const requisitionPositionId = String(requisition.approved_position_id || "").trim();
+  if (
+    !draftPositionId ||
+    !requisitionPositionId ||
+    draftPositionId !== requisitionPositionId
+  ) {
+    throw httpError(
+      "approved_position_id on the draft must match the requisition before linking.",
+      400
+    );
+  }
+
+  if (currentLink === code) {
+    return existing;
+  }
+
+  const updated = await talentDemandDraftRepository.linkDraftToRequisitionCode(
+    pool,
+    draftId,
+    code,
+    actorName || employeeCode
+  );
+
+  if (updated) {
+    return updated;
+  }
+
+  const refreshed = await talentDemandDraftRepository.getDraftById(pool, draftId);
+  if (
+    refreshed &&
+    String(refreshed.result_requisition_code || "").trim() === code
+  ) {
+    return refreshed;
+  }
+
+  throw httpError("Draft could not be linked to the requisition.", 400);
+}
+
+async function listLegacyInProgressRequisitions(pool, actor, req) {
   const { employeeCode } = resolveActor(actor);
 
   if (!employeeCode) {
-    throw httpError("Authenticated employee_code is required to list drafts.", 401);
+    throw httpError("Authenticated employee_code is required to list work.", 401);
   }
 
-  return talentDemandDraftRepository.listDraftsByOwner(pool, employeeCode);
+  const ownerKeys = req
+    ? await resolveRequisitionRequestorCreatedByKeys(pool, req)
+    : [employeeCode];
+
+  if (!ownerKeys.length) {
+    return [];
+  }
+
+  const result = await pool.query(
+    `SELECT
+       r.requisition_code,
+       r.approved_position_id,
+       r.position_title,
+       r.business_unit AS client_name,
+       r.req_status,
+       r.modified_on,
+       r.created_by
+     FROM rm_requisitions r
+     WHERE r.requestor_submitted_on IS NULL
+       AND r.created_by = ANY($1::text[])
+       AND LOWER(COALESCE(r.req_status, '')) NOT IN ('approved', 'rejected')
+       AND NOT EXISTS (
+         SELECT 1
+         FROM td_draft_mstr d
+         WHERE d.approved_position_id = r.approved_position_id
+           AND d.owner_employee_code = $2
+           AND d.is_deleted = FALSE
+           AND UPPER(COALESCE(d.status, 'DRAFT')) = 'DRAFT'
+       )
+     ORDER BY r.modified_on DESC NULLS LAST, r.requisition_code ASC`,
+    [ownerKeys, employeeCode]
+  );
+
+  return result.rows
+    .filter((row) => !isClosedRequisitionStatus(String(row.req_status || "").trim()))
+    .filter(
+      (row) =>
+        String(row.req_status || "").trim() !== REQUISITION_STATUS.APPROVED &&
+        String(row.req_status || "").trim() !== REQUISITION_STATUS.REJECTED
+    )
+    .map((row) => ({
+      work_item_type: "requisition",
+      requisition_code: row.requisition_code,
+      approved_position_id: row.approved_position_id,
+      job_title: row.position_title,
+      client_name: row.client_name,
+      status: row.req_status || REQUISITION_STATUS.OPEN,
+      updated_on: row.modified_on,
+      updated_by: row.created_by
+    }));
+}
+
+/**
+ * Draft documents plus legacy unsubmitted requisitions for the current requestor.
+ */
+async function listMyTalentDemandWork(pool, actor, req = null) {
+  const { employeeCode } = resolveActor(actor);
+
+  if (!employeeCode) {
+    throw httpError("Authenticated employee_code is required to list work.", 401);
+  }
+
+  const draftRows = await talentDemandDraftRepository.listDraftsByOwner(
+    pool,
+    employeeCode
+  );
+
+  const drafts = draftRows.map((row) => ({
+    ...row,
+    work_item_type: "draft"
+  }));
+
+  const requisitionsInProgress = req
+    ? await listLegacyInProgressRequisitions(pool, actor, req)
+    : [];
+
+  return {
+    drafts,
+    requisitions_in_progress: requisitionsInProgress
+  };
 }
 
 async function deleteDraft(pool, draftId, actor) {
@@ -255,6 +434,8 @@ module.exports = {
   updateDraft,
   getDraft,
   listMyDrafts,
+  listMyTalentDemandWork,
+  linkDraftToOpenRequisition,
   deleteDraft,
   submitDraftPreparation
 };

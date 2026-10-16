@@ -174,6 +174,24 @@ async function updateDraft(pool, draftId, draftData) {
   return result.rows[0] || null;
 }
 
+async function linkDraftToRequisitionCode(pool, draftId, requisitionCode, updatedBy) {
+  const result = await pool.query(
+    `UPDATE td_draft_mstr
+     SET
+       result_requisition_code = $2,
+       updated_by = $3,
+       updated_on = NOW(),
+       row_version = row_version + 1
+     WHERE draft_id = $1
+       AND is_deleted = FALSE
+       AND (result_requisition_code IS NULL OR BTRIM(result_requisition_code) = '')
+     RETURNING ${DRAFT_COLUMNS}`,
+    [draftId, requisitionCode, updatedBy ?? null]
+  );
+
+  return result.rows[0] || null;
+}
+
 /**
  * @param {object} queryable - pg Pool or Client (shared TX handle)
  * @param {string|number} draftId
@@ -275,6 +293,7 @@ async function markDraftSubmitted(queryable, draftId, submitData) {
 module.exports = {
   createDraft,
   updateDraft,
+  linkDraftToRequisitionCode,
   getDraftById,
   getDraftByCode,
   listDraftsByOwner,
