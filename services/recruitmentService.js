@@ -1030,6 +1030,12 @@ function mergeReqPeriodMetrics(rows) {
   return byReq;
 }
 
+async function listOfferRaiseEligibleMappings(pool, req) {
+  const employeeCode = recruiterEmployeeCode(req);
+  const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");
+  return offerRaiseEligibilityService.listOfferRaiseEligibleMappings(pool, employeeCode);
+}
+
 async function getMyRecruiterDashboard(pool, req) {
   const employeeCode = recruiterEmployeeCode(req);
   const { fromDate, toDate } = resolveDashboardDateRange(req);
@@ -4283,6 +4289,7 @@ module.exports = {
   getDefaultSeedPayload,
   getRecruitmentBundle,
   getMyRecruiterDashboard,
+  listOfferRaiseEligibleMappings,
   createFromApprovedPosition,
   approveRequisition,
   assignRecruiter,

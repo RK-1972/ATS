@@ -41,6 +41,19 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
+  app.get("/api/v1/recruitment/offer-raise-eligible-mappings", verifyToken, async (req, res) => {
+    try {
+      const data = await recruitmentService.listOfferRaiseEligibleMappings(pool, req);
+      res.status(200).json({
+        success: true,
+        count: data.length,
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
   app.get("/api/v1/recruitment/candidates", operatorGuard, async (req, res) => {
     try {
       const view = String(req.query.view || "").trim().toLowerCase();

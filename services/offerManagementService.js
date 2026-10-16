@@ -641,9 +641,22 @@ async function createOffer(pool, payload, req) {
     assertRequisitionOpenForRecruiting(requisition);
   }
 
-  const mappingRef = payload.mapping_id ?? payload.map_id ?? context.mapping_id;
+  const mappingRef =
+    payload.mapping_id ?? payload.map_id ?? context.mapping_id ?? context.map_id;
   if (mappingRef) {
-    await recruitmentService.assertAuthorizedMappingAccess(pool, req, mappingRef);
+    const mappingAccess = await recruitmentService.assertAuthorizedMappingAccess(
+      pool,
+      req,
+      mappingRef
+    );
+    const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");
+    await offerRaiseEligibilityService.assertMappingEligibleForOfferRaise(
+      pool,
+      mappingAccess.mapping,
+      mappingAccess.legacyRow
+    );
+  } else {
+    throw httpError("Offer must link to a candidate mapping.", 400);
   }
 
   const offeredCtc = Number(context.offered_ctc || context.total_ctc || 0);
