@@ -530,6 +530,20 @@ async function handleOfferClarificationRequested(queryable, event, req) {
     }
   });
 
+  const offerClarificationNotificationService = require("./offerClarificationNotificationService");
+  await offerClarificationNotificationService.notifyOfferClarificationRequested(
+    queryable,
+    {
+      offerId,
+      requestorEmployeeCode,
+      approverTaskId: event.taskId,
+      comments: event.comments,
+      candidateName: offerRow.candidate_name,
+      requisitionCode: offerRow.requisition_code,
+      positionTitle: offerRow.position_title
+    }
+  );
+
   return {
     businessActionCompleted: true,
     offer_id: offerId,
@@ -586,6 +600,22 @@ async function handleOfferClarificationSubmitted(queryable, event, req) {
       source: "offer_clarification_submitted"
     }
   });
+
+  const approverEmployeeCode = String(event.reactivatedAssignee || "").trim();
+  if (approverEmployeeCode && event.reactivatedTaskId) {
+    const offerClarificationNotificationService = require("./offerClarificationNotificationService");
+    await offerClarificationNotificationService.notifyOfferClarificationSubmitted(
+      queryable,
+      {
+        offerId,
+        approverEmployeeCode,
+        approverTaskId: event.reactivatedTaskId,
+        requestorName: user.name,
+        candidateName: offerRow.candidate_name,
+        requisitionCode: offerRow.requisition_code
+      }
+    );
+  }
 
   return {
     businessActionCompleted: true,

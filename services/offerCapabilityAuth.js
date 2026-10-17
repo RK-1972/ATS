@@ -119,11 +119,55 @@ function requireOfferWorkspace(pool) {
   };
 }
 
+const SUBMIT_CLARIFICATION_DENIED_MESSAGE =
+  "Enterprise Access Denied. Only the original offer requestor may submit clarification.";
+
+/**
+ * Offer clarification response — original requester (from persisted offer record),
+ * Admin, or TA Lead. Does not use recruiter-assignment rules.
+ */
+async function assertCanSubmitOfferClarification(pool, req, offerId) {
+  if (!req?.user) {
+    throw authError(DENIED_MESSAGE);
+  }
+
+  if (isAdminUser(req) || isTaLeadRole(req)) {
+    return;
+  }
+
+  const actorCode = String(req.user?.employee_code || "").trim();
+  if (!actorCode) {
+    throw authError(SUBMIT_CLARIFICATION_DENIED_MESSAGE);
+  }
+
+  const offerResult = await pool.query(
+    `SELECT offer_id, recruiter_id, created_by
+     FROM om_offers
+     WHERE offer_id = $1`,
+    [offerId]
+  );
+
+  if (!offerResult.rows[0]) {
+    throw authError(SUBMIT_CLARIFICATION_DENIED_MESSAGE);
+  }
+
+  const { resolveOfferRequestorEmployeeCode } = require("./offerWorkflowCompletionService");
+  const requestorCode = await resolveOfferRequestorEmployeeCode(
+    pool,
+    offerResult.rows[0]
+  );
+
+  if (!requestorCode || requestorCode !== actorCode) {
+    throw authError(SUBMIT_CLARIFICATION_DENIED_MESSAGE);
+  }
+}
+
 module.exports = {
   OFFER_WORKSPACE_FLAG,
   assertCanAccessOfferWorkspace,
   requireOfferWorkspace,
   assertCanWriteOfferRecord,
+  assertCanSubmitOfferClarification,
   isAdminUser,
   isTaLeadRole,
   TA_LEAD_ROLES

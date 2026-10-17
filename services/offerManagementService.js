@@ -2219,7 +2219,8 @@ async function submitClarification(pool, offerId, comments, req) {
     throw httpError("Clarification response is required.", 400);
   }
 
-  await assertCanWriteOfferRecord(pool, req, offerId);
+  const { assertCanSubmitOfferClarification } = require("./offerCapabilityAuth");
+  await assertCanSubmitOfferClarification(pool, req, offerId);
 
   const offerRow = await pool.query(
     `SELECT offer_id, workflow_instance_id
@@ -2382,6 +2383,7 @@ module.exports = {
   amendApprovedUnreleasedOffer,
   requestClarification,
   submitClarification,
+  buildOfferClarificationRounds,
   validateMasterDataReferences,
   evaluateOfferRules,
   seedConfiguration
