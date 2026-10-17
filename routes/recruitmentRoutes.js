@@ -13,6 +13,7 @@ const {
   requireRequisitionRequestor,
   requireRecruiterAssignmentOperator
 } = require("../services/requisitionCapabilityAuth");
+const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Recruitment API Error:", error.message);
@@ -41,18 +42,22 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/offer-raise-eligible-mappings", verifyToken, async (req, res) => {
-    try {
-      const data = await recruitmentService.listOfferRaiseEligibleMappings(pool, req);
-      res.status(200).json({
-        success: true,
-        count: data.length,
-        data
-      });
-    } catch (error) {
-      handleError(res, error);
+  app.get(
+    "/api/v1/recruitment/offer-raise-eligible-mappings",
+    [verifyToken, requireOfferWorkspace(pool)],
+    async (req, res) => {
+      try {
+        const data = await recruitmentService.listOfferRaiseEligibleMappings(pool, req);
+        res.status(200).json({
+          success: true,
+          count: data.length,
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
     }
-  });
+  );
 
   app.get("/api/v1/recruitment/candidates", operatorGuard, async (req, res) => {
     try {

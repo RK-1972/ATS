@@ -644,9 +644,8 @@ async function createOffer(pool, payload, req) {
   const mappingRef =
     payload.mapping_id ?? payload.map_id ?? context.mapping_id ?? context.map_id;
   if (mappingRef) {
-    const mappingAccess = await recruitmentService.assertAuthorizedMappingAccess(
+    const mappingAccess = await recruitmentService.resolveMappingContextForOfferRaise(
       pool,
-      req,
       mappingRef
     );
     const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");

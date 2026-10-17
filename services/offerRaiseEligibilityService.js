@@ -69,15 +69,11 @@ const OFFER_RAISE_ELIGIBLE_SQL = `
     c.candidate_code,
     CONCAT(c.first_name, ' ', c.last_name) AS candidate_name
   FROM rm_candidate_mappings m
-  INNER JOIN rm_recruiter_assignments a
-    ON a.requisition_code = m.requisition_code
-   AND a.recruiter_code = $1
-   AND a.is_active = TRUE
   INNER JOIN im_interviews i
     ON i.candidate_id = m.candidate_id
    AND i.requisition_code = m.requisition_code
-   AND i.round_type = $2
-   AND i.final_outcome = $3
+   AND i.round_type = $1
+   AND i.final_outcome = $2
    AND i.feedback_submitted = TRUE
    AND (
      (m.map_id IS NOT NULL AND i.map_id = m.map_id)
@@ -93,9 +89,8 @@ const OFFER_RAISE_ELIGIBLE_SQL = `
   ORDER BY COALESCE(m.mapping_id, m.map_id), m.modified_on DESC NULLS LAST
 `;
 
-async function listOfferRaiseEligibleMappings(pool, employeeCode) {
+async function listOfferRaiseEligibleMappings(pool) {
   const result = await pool.query(OFFER_RAISE_ELIGIBLE_SQL, [
-    employeeCode,
     FINAL_HR_INTERVIEW_ROUND_TYPE,
     FINAL_HR_INTERVIEW_OUTCOME_SELECTED
   ]);

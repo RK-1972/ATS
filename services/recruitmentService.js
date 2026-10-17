@@ -1031,9 +1031,25 @@ function mergeReqPeriodMetrics(rows) {
 }
 
 async function listOfferRaiseEligibleMappings(pool, req) {
-  const employeeCode = recruiterEmployeeCode(req);
+  const { assertCanAccessOfferWorkspace } = require("./offerCapabilityAuth");
+  await assertCanAccessOfferWorkspace(pool, req);
   const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");
-  return offerRaiseEligibilityService.listOfferRaiseEligibleMappings(pool, employeeCode);
+  return offerRaiseEligibilityService.listOfferRaiseEligibleMappings(pool);
+}
+
+/**
+ * Resolve candidate–requisition mapping for offer raise without recruiter-assignment checks.
+ * Caller must enforce Offer Workspace capability (showOfferWorkspace / OFFER_RECRUITER).
+ */
+async function resolveMappingContextForOfferRaise(pool, mapId) {
+  const context = await resolveMappingContext(pool, mapId);
+  const candidateId = context.mapping?.candidate_id || context.legacyRow?.candidate_id;
+
+  if (!candidateId) {
+    throw httpError("Mapping not found.", 404);
+  }
+
+  return context;
 }
 
 async function getMyRecruiterDashboard(pool, req) {
@@ -4290,6 +4306,7 @@ module.exports = {
   getRecruitmentBundle,
   getMyRecruiterDashboard,
   listOfferRaiseEligibleMappings,
+  resolveMappingContextForOfferRaise,
   createFromApprovedPosition,
   approveRequisition,
   assignRecruiter,
