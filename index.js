@@ -28,6 +28,8 @@ const candidateAccessService = require("./services/candidateAccessService");
 const recruitmentService = require("./services/recruitmentService");
 const legacyPipelineReadService = require("./services/legacyPipelineReadService");
 const workAssignmentService = require("./services/workAssignmentService");
+const applicationSessionService = require("./services/applicationSessionService");
+const { isTrustProxyEnabled } = require("./utils/clientIpResolver");
 const workspaceResolverService = require("./services/workspaceResolverService");
 const hiringManagerIdentityService = require("./services/hiringManagerIdentityService");
 const approvalRouteRepository = require("./repositories/approvalRouteRepository");
@@ -44,6 +46,10 @@ const {
 const candidateRegistrationValidation = require("./services/candidateRegistrationValidation");
 
 const app = express();
+
+if (isTrustProxyEnabled()) {
+  app.set("trust proxy", 1);
+}
 
 // =====================================================
 // Runtime Environment
@@ -4551,6 +4557,8 @@ app.post("/login", async (req, res) => {
 
     console.log("[login] Generating JWT");
 
+    const sessionId = crypto.randomUUID();
+
     const token = jwt.sign(
 
   {
@@ -4559,7 +4567,8 @@ app.post("/login", async (req, res) => {
     employee_code: user.employee_code,
     email_id: user.email_id,
     role_name: user.role_name,
-    secondary_role: user.secondary_role
+    secondary_role: user.secondary_role,
+    session_id: sessionId
 
   },
 
@@ -4574,8 +4583,23 @@ app.post("/login", async (req, res) => {
     );
 
     console.log("[login] JWT generated", {
-      user_id: user.user_id
+      user_id: user.user_id,
+      session_id: sessionId
     });
+
+    try {
+      await applicationSessionService.recordLogin(pool, {
+        sessionId,
+        user,
+        req
+      });
+    } catch (sessionAuditError) {
+      console.error("[login] Session audit record failed", {
+        user_id: user.user_id,
+        session_id: sessionId,
+        message: sessionAuditError.message
+      });
+    }
 
     let workAssignments = [];
     let workAssignmentStatus = "NO_ASSIGNMENTS";
@@ -4690,6 +4714,34 @@ app.post("/login", async (req, res) => {
   }
 
 });
+
+// =====================================================
+// Auth — explicit logout (session audit; JWT remains stateless)
+// =====================================================
+
+app.post("/api/v1/auth/logout", verifyToken, async (req, res) => {
+  try {
+    const sessionId = req.user?.session_id;
+
+    if (sessionId) {
+      await applicationSessionService.confirmLogout(pool, sessionId, {
+        reason: "USER_LOGOUT"
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Logged out successfully."
+    });
+  } catch (error) {
+    console.error("[logout] Session update failed", error.message);
+    res.status(200).json({
+      success: true,
+      message: "Logged out successfully."
+    });
+  }
+});
+
 // =====================================================
 // API 21 - Map Candidate To Requisition
 // =====================================================
@@ -7688,6 +7740,9 @@ const {
   registerReportBuilderRoutes
 } = require("./routes/reportBuilderRoutes");
 const { registerAuditRoutes } = require("./routes/auditRoutes");
+const {
+  registerApplicationAuditRoutes
+} = require("./routes/applicationAuditRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -7717,6 +7772,7 @@ const { registerTaLeadRoutes } = require("./routes/taLeadRoutes");
 registerTaLeadRoutes(app, pool, verifyToken);
 registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
 registerAuditRoutes(app, pool, verifyToken, verifyAdmin);
+registerApplicationAuditRoutes(app, pool, verifyToken);
 registerReportBuilderRoutes(app, pool, verifyToken);
 registerCandidatePortalRoutes(
   app,

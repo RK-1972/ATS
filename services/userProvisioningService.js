@@ -1177,6 +1177,14 @@ async function changeUserStatus(pool, req, employeeCode, payload = {}) {
 
     await client.query("COMMIT");
 
+    if (!targetActive) {
+      const applicationSessionService = require("./applicationSessionService");
+      await applicationSessionService.onEmployeeAccountDeactivated(
+        pool,
+        targetEmployeeCode
+      );
+    }
+
     if (targetActive) {
       await recordLifecycleAudit(pool, req, {
         action: "Employee reactivated",

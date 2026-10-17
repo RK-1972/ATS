@@ -1017,6 +1017,34 @@ describe("phase 1.5 safety hardening", () => {
     );
   });
 
+  it("does not block migrate:up for suspected_orphan when ledger table is missing", () => {
+    assertMigrateUpAllowedForPending({
+      ledgerTablePresent: false,
+      suspectedOrphans: [
+        {
+          filename: "001_master_data_schema.sql",
+          pendingKind: "suspected_orphan",
+          reasons: ["manifest fingerprint checks passed while ledger row is missing"]
+        }
+      ]
+    });
+  });
+
+  it("scopes migrate:up orphan blocks to the pending slice being applied", () => {
+    assertMigrateUpAllowedForPending(
+      {
+        suspectedOrphans: [
+          {
+            filename: "061_application_audit_session_history.sql",
+            pendingKind: "uncertain_partial",
+            reasons: ["partial evidence"]
+          }
+        ]
+      },
+      { pendingFilenames: ["000_schema_migration_ledger.sql"] }
+    );
+  });
+
   it("allows retry override only for uncertain_partial with confirmation env", () => {
     const prev = process.env[ALLOW_RETRY_CONFIRM_ENV];
     process.env[ALLOW_RETRY_CONFIRM_ENV] = ALLOW_RETRY_CONFIRM_VALUE;

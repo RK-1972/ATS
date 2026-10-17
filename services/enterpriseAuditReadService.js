@@ -24,6 +24,7 @@ function normalizeMetadata(value) {
 
 function mapAuditRow(row) {
   const createdOn = row.created_on;
+  const metadata = normalizeMetadata(row.metadata);
 
   return {
     id: row.audit_id,
@@ -31,6 +32,7 @@ function mapAuditRow(row) {
     user: row.user_name,
     role: row.user_role,
     userId: null,
+    employeeCode: metadata.employee_code || null,
     module: row.module,
     entity: row.entity,
     entityId: row.entity_id,
@@ -39,13 +41,51 @@ function mapAuditRow(row) {
     previousValue: row.previous_value,
     newValue: row.new_value,
     correlationId: row.correlation_id,
-    metadata: normalizeMetadata(row.metadata)
+    outcome: metadata.outcome || null,
+    changeSummary: metadata.change_summary || metadata.changes || null,
+    metadata
   };
 }
 
 function buildFilters(query = {}) {
   const conditions = [];
   const values = [];
+
+  const userSearch =
+    query.search || query.q || query.user || query.employee_code || query.employeeCode;
+  if (userSearch) {
+    const pattern = `%${String(userSearch).trim()}%`;
+    values.push(pattern);
+    const idx = values.length;
+    conditions.push(
+      `(user_name ILIKE $${idx}
+        OR metadata->>'employee_code' ILIKE $${idx}
+        OR entity_id ILIKE $${idx}
+        OR action ILIKE $${idx}
+        OR event_type ILIKE $${idx}
+        OR module ILIKE $${idx}
+        OR entity ILIKE $${idx}
+        OR COALESCE(correlation_id, '') ILIKE $${idx})`
+    );
+  }
+
+  const from = query.date_from || query.from;
+  if (from) {
+    values.push(from);
+    conditions.push(`created_on >= $${values.length}`);
+  }
+
+  const to = query.date_to || query.to;
+  if (to) {
+    values.push(to);
+    conditions.push(`created_on <= $${values.length}`);
+  }
+
+  const outcome = query.outcome;
+  if (outcome) {
+    values.push(String(outcome).trim().toLowerCase());
+    conditions.push(`LOWER(COALESCE(metadata->>'outcome', '')) = $${values.length}`);
+  }
 
   if (query.module) {
     values.push(query.module);

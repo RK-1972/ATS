@@ -406,10 +406,6 @@ async function commandUp(pool, migrationsDir, target, flags) {
 
   assertRecoveryPersistenceForMutate(enriched);
 
-  assertMigrateUpAllowedForPending(enriched, {
-    allowRetryFilename: flags.allowRetryFilename
-  });
-
   const pending = filterPendingUpTo(inventory.pending, flags.to);
   let pendingFilenames = pending.map((item) => item.filename);
 
@@ -435,6 +431,11 @@ async function commandUp(pool, migrationsDir, target, flags) {
       );
     }
   }
+
+  assertMigrateUpAllowedForPending(enriched, {
+    allowRetryFilename: flags.allowRetryFilename,
+    pendingFilenames
+  });
 
   if (pendingIncludes059(pendingFilenames)) {
     const preflight059 = await runRegisteredPanDuplicatePreflight(pool);

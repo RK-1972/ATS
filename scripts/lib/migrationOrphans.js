@@ -622,15 +622,34 @@ function formatOrphanBlockMessage(assessment) {
 
 function assertMigrateUpAllowedForPending(enrichedInventory, options = {}) {
 
-  const { allowRetryFilename = null } = options;
+  const { allowRetryFilename = null, pendingFilenames = null } = options;
 
   const blocked = enrichedInventory.suspectedOrphans || [];
 
   const retryFilename = String(allowRetryFilename || "").trim();
 
+  const ledgerTablePresent = enrichedInventory.ledgerTablePresent !== false;
+
+  const scope =
+    Array.isArray(pendingFilenames) && pendingFilenames.length > 0
+      ? new Set(pendingFilenames.map((name) => String(name).trim()))
+      : null;
+
 
 
   const stillBlocked = blocked.filter((item) => {
+
+    if (scope && !scope.has(item.filename)) {
+
+      return false;
+
+    }
+
+    if (!ledgerTablePresent && item.pendingKind === "suspected_orphan") {
+
+      return false;
+
+    }
 
     if (
 

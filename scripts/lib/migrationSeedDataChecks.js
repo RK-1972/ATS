@@ -434,6 +434,17 @@ const SEED_DATA_CHECKS = {
       "Alias-to-stage_id mapping correctness."
     )
   ],
+  "061_application_audit_session_history.sql": [
+    existsCheck(
+      `SELECT EXISTS (
+         SELECT 1 FROM work_assignment_mstr
+         WHERE assignment_code = 'APPLICATION_AUDIT_OBSERVER'
+           AND workspace_flag = 'showApplicationAuditWorkspace'
+       ) AS exists`,
+      "APPLICATION_AUDIT_OBSERVER workspace metadata from 061 is present.",
+      "Prior seed without 061 workspace metadata."
+    )
+  ],
   "054_ta_lead_workspace_flag.sql": [
     existsCheck(
       `SELECT EXISTS (
