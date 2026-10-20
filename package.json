@@ -66,7 +66,7 @@
     "verify:candidate-pool-segregation": "node scripts/verifyCandidatePoolSegregation.js",
     "verify:wave5-offers": "node scripts/verifyWave5OffersExecution.js",
     "regression:wave5": "node scripts/runWave5Regression.js",
-    "test": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js scripts/experienceRangeValidation.test.js scripts/talentDemandSubmitService.test.js scripts/approvedPositionUpdateIntegrity.test.js scripts/talentDemandWorkInProgress.test.js scripts/offerRaiseEligibility.test.js scripts/offerClarificationLoop.test.js scripts/applicationAuditSession.test.js",
+    "test": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js scripts/experienceRangeValidation.test.js scripts/talentDemandSubmitService.test.js scripts/approvedPositionUpdateIntegrity.test.js scripts/talentDemandWorkInProgress.test.js scripts/offerRaiseEligibility.test.js scripts/offerClarificationLoop.test.js scripts/applicationAuditSession.test.js scripts/userAgentSummary.test.js",
     "test:requisition-resolution": "node --test scripts/requisitionFieldResolutionService.test.js scripts/workforceApprovedPositionCatalogue.test.js scripts/workforceLegacyRequisitionRequestorAuth.test.js scripts/experienceRangeValidation.test.js scripts/talentDemandSubmitService.test.js scripts/approvedPositionUpdateIntegrity.test.js scripts/talentDemandWorkInProgress.test.js"
   },
   "keywords": [],
@@ -92,6 +92,7 @@
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.19.1",
     "pg": "^8.20.0",
-    "pizzip": "^3.2.0"
+    "pizzip": "^3.2.0",
+    "ua-parser-js": "1.0.41"
   }
 }

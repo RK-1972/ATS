@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 
 const { resolveClientIp, normalizeIp } = require("../utils/clientIpResolver");
+const { formatUserAgentSummary, resolveUserAgentSummaryForDisplay } = require("../utils/userAgentSummary");
 
 const SESSION_STATUS = Object.freeze({
   ACTIVE: "ACTIVE",
@@ -19,12 +20,7 @@ function httpError(message, status = 400) {
 }
 
 function summarizeUserAgent(value) {
-  const ua = String(value || "").trim();
-  if (!ua) {
-    return null;
-  }
-
-  return ua.length > 255 ? `${ua.slice(0, 252)}...` : ua;
+  return formatUserAgentSummary(value);
 }
 
 async function recordLogin(pool, { sessionId, user, req }) {
@@ -341,6 +337,7 @@ function mapSessionRow(row) {
         ? row.last_seen_at.toISOString()
         : row.last_seen_at,
     source_ip: normalizeIp(row.source_ip) || row.source_ip,
+    user_agent_summary: resolveUserAgentSummaryForDisplay(row.user_agent_summary),
     status: row.status,
     termination_reason: row.termination_reason,
     duration_seconds: computeDurationSeconds(row)

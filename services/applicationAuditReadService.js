@@ -129,7 +129,7 @@ async function listSessions(pool, query = {}) {
 
   const result = await pool.query(
     `SELECT s.session_id, s.employee_code, s.user_id, s.email_id, s.login_at, s.logout_at,
-            s.last_seen_at, s.source_ip, s.status, s.termination_reason,
+            s.last_seen_at, s.source_ip, s.user_agent_summary, s.status, s.termination_reason,
             u.full_name
      FROM app_user_session s
      LEFT JOIN user_mstr u ON u.employee_code = s.employee_code
@@ -155,7 +155,7 @@ async function getSessionById(pool, sessionId) {
 
   const result = await pool.query(
     `SELECT s.session_id, s.employee_code, s.user_id, s.email_id, s.login_at, s.logout_at,
-            s.last_seen_at, s.source_ip, s.status, s.termination_reason,
+            s.last_seen_at, s.source_ip, s.user_agent_summary, s.status, s.termination_reason,
             u.full_name
      FROM app_user_session s
      LEFT JOIN user_mstr u ON u.employee_code = s.employee_code
