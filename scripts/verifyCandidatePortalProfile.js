@@ -46,6 +46,8 @@ async function main() {
 
   const portalService = createCandidatePortalService(pool);
   const uniqueSuffix = Date.now();
+  const testPan = `ABCPH${String(uniqueSuffix).slice(-4)}F`;
+  const syncTestPan = `ABCSY${String(uniqueSuffix + 1).slice(-4)}G`;
   const emailId = `portal.phase2.${uniqueSuffix}@example.com`;
   const password = "TestPass1!";
 
@@ -144,6 +146,7 @@ async function main() {
     last_name: "Two",
     email: emailId,
     mobile: "9876501234",
+    pan_number: testPan,
     current_company: "Optalynx",
     designation: "Engineer",
     experience: 5,
@@ -192,6 +195,103 @@ async function main() {
   } else {
     pass("profile completion calculated");
   }
+
+  const syncEmailId = `portal.sync.${uniqueSuffix}@example.com`;
+  const syncRegisterResult = await portalService.registerCandidateAccount({
+    full_name: "Sync Resume Candidate",
+    mobile_number: "9876504321",
+    email_id: syncEmailId,
+    password,
+    confirm_password: password
+  });
+
+  if (!syncRegisterResult.ok) {
+    fail("register portal account for resume sync test", syncRegisterResult.message);
+  } else {
+    pass("register portal account for resume sync test");
+  }
+
+  const syncCandidateId = syncRegisterResult.data.account.candidate_id;
+  const syncIntakeResult = await profileService.createProfileIntake(syncCandidateId);
+  const syncIntakeId = syncIntakeResult.data.intake_id;
+
+  await profileService.processProfileIntake(syncCandidateId, syncIntakeId, {
+    originalname: "resume.pdf"
+  });
+
+  await pool.query(`UPDATE cand_mstr SET resume_path = NULL WHERE candidate_id = $1`, [
+    syncCandidateId
+  ]);
+
+  const syncSaveResult = await profileService.saveCandidateProfile(syncCandidateId, {
+    first_name: "Sync",
+    last_name: "Resume",
+    email: syncEmailId,
+    mobile: "9876504321",
+    pan_number: syncTestPan,
+    skills: "Java",
+    experience: "3"
+  });
+
+  if (!syncSaveResult.ok) {
+    fail("save profile syncs master resume from portal intake", syncSaveResult.message);
+  } else {
+    pass("save profile syncs master resume from portal intake");
+  }
+
+  const syncResumeRow = await pool.query(
+    `SELECT resume_path FROM cand_mstr WHERE candidate_id = $1`,
+    [syncCandidateId]
+  );
+
+  if (syncResumeRow.rows[0]?.resume_path !== "portal-test/resume.pdf") {
+    fail(
+      "save profile copies intake resume_path without re-upload",
+      syncResumeRow.rows[0]?.resume_path
+    );
+  } else {
+    pass("save profile copies intake resume_path without re-upload");
+  }
+
+  await pool.query(`UPDATE cand_mstr SET resume_path = 'keep-existing.pdf' WHERE candidate_id = $1`, [
+    syncCandidateId
+  ]);
+
+  const syncSaveAgain = await profileService.saveCandidateProfile(syncCandidateId, {
+    first_name: "Sync",
+    last_name: "Resume",
+    email: syncEmailId,
+    mobile: "9876504321",
+    pan_number: syncTestPan,
+    skills: "Java",
+    experience: "3"
+  });
+
+  if (!syncSaveAgain.ok) {
+    fail("second save preserves existing master resume_path", syncSaveAgain.message);
+  }
+
+  const keptResumeRow = await pool.query(
+    `SELECT resume_path FROM cand_mstr WHERE candidate_id = $1`,
+    [syncCandidateId]
+  );
+
+  if (keptResumeRow.rows[0]?.resume_path !== "keep-existing.pdf") {
+    fail(
+      "save profile does not overwrite existing master resume_path",
+      keptResumeRow.rows[0]?.resume_path
+    );
+  } else {
+    pass("save profile does not overwrite existing master resume_path");
+  }
+
+  await pool.query(`DELETE FROM rm_candidate_intake WHERE source_reference = $1`, [
+    `portal-candidate:${syncCandidateId}`
+  ]);
+  await pool.query(`DELETE FROM candidate_portal_account WHERE candidate_id = $1`, [
+    syncCandidateId
+  ]);
+  await pool.query(`DELETE FROM cand_mstr WHERE candidate_id = $1`, [syncCandidateId]);
 
   await pool.query(
     `DELETE FROM rm_candidate_intake WHERE intake_id = $1`,

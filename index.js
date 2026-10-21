@@ -38,7 +38,8 @@ const {
   allocateNextCandidateCode
 } = require("./utils/candidateCodeGenerator");
 const {
-  createDraftCandidateFromParsedIntake: createDraftCandidateFromParsedIntakeService
+  createDraftCandidateFromParsedIntake: createDraftCandidateFromParsedIntakeService,
+  parsePortalSourceReference
 } = require("./services/candidateDraftService");
 const {
   respondClassicCandidateRouteDeprecated
@@ -9629,6 +9630,58 @@ app.post(
           outcome: "CREATED",
           candidate_id: intake.created_draft_id
         };
+
+        const portalCandidateId =
+          parsePortalSourceReference(intake.source_reference);
+
+        if (
+          portalCandidateId &&
+          Number(portalCandidateId) === Number(intake.created_draft_id) &&
+          intake.resume_path
+        ) {
+
+          const masterResumeResult = await pool.query(
+
+            `
+
+            SELECT resume_path
+            FROM cand_mstr
+            WHERE candidate_id = $1
+
+            `,
+
+            [portalCandidateId]
+
+          );
+
+          const masterResumePath = String(
+            masterResumeResult.rows[0]?.resume_path || ""
+          ).trim();
+
+          if (!masterResumePath) {
+
+            await pool.query(
+
+              `
+
+              UPDATE cand_mstr
+              SET
+                resume_path = $1,
+                resume_uploaded_on = NOW(),
+                updated_on = NOW()
+              WHERE candidate_id = $2
+                AND UPPER(candidate_status) = 'DRAFT'
+                AND (resume_path IS NULL OR TRIM(resume_path) = '')
+
+              `,
+
+              [intake.resume_path, portalCandidateId]
+
+            );
+
+          }
+
+        }
 
       } else {
 

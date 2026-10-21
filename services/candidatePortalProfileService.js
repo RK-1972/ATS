@@ -109,12 +109,16 @@ async function listIntakeReviewQueue(pool) {
   const sourceSelect = hasSourceMaster
     ? `
       COALESCE(s.source_code, c.candidate_source_code) AS source_code,
-      COALESCE(s.source_name, 'Career Portal') AS source_name,
+      CASE
+        WHEN COALESCE(s.source_code, c.candidate_source_code) = 'PORTAL'
+          THEN 'Candidate portal'
+        ELSE COALESCE(s.source_name, 'Candidate Intake')
+      END AS source_name,
     `
     : `
       c.candidate_source_code AS source_code,
       CASE
-        WHEN c.candidate_source_code = 'PORTAL' THEN 'Career Portal'
+        WHEN c.candidate_source_code = 'PORTAL' THEN 'Candidate portal'
         ELSE COALESCE(c.candidate_source_code, 'Candidate Intake')
       END AS source_name,
     `;
@@ -136,7 +140,10 @@ async function listIntakeReviewQueue(pool) {
       c.email_id,
       c.mobile_number,
       c.profile_completion,
-      c.resume_path,
+      COALESCE(
+        NULLIF(TRIM(c.resume_path), ''),
+        NULLIF(TRIM(i.resume_path), '')
+      ) AS resume_path,
       c.candidate_status,
       c.candidate_source_code,
       c.pan_number,
@@ -336,6 +343,62 @@ function createCandidatePortalProfileService(pool, parserDeps) {
     );
 
     return result.rows[0] || null;
+  }
+
+  async function syncPortalMasterResumeFromIntake(client, candidateId) {
+    const normalizedId = Number(candidateId);
+
+    if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+      return;
+    }
+
+    const masterResult = await client.query(
+      `
+      SELECT resume_path
+      FROM cand_mstr
+      WHERE candidate_id = $1
+      FOR UPDATE
+      `,
+      [normalizedId]
+    );
+
+    const existingPath = String(masterResult.rows[0]?.resume_path || "").trim();
+
+    if (existingPath) {
+      return;
+    }
+
+    const intakeResult = await client.query(
+      `
+      SELECT resume_path
+      FROM rm_candidate_intake
+      WHERE source_reference = $1
+        AND resume_path IS NOT NULL
+        AND TRIM(resume_path) <> ''
+      ORDER BY created_on DESC
+      LIMIT 1
+      `,
+      [buildPortalSourceReference(normalizedId)]
+    );
+
+    const intakePath = String(intakeResult.rows[0]?.resume_path || "").trim();
+
+    if (!intakePath) {
+      return;
+    }
+
+    await client.query(
+      `
+      UPDATE cand_mstr
+      SET
+        resume_path = $1,
+        resume_uploaded_on = NOW(),
+        updated_on = NOW()
+      WHERE candidate_id = $2
+        AND (resume_path IS NULL OR TRIM(resume_path) = '')
+      `,
+      [intakePath, normalizedId]
+    );
   }
 
   async function getOwnedIntake(intakeId, candidateId) {
@@ -910,7 +973,21 @@ function createCandidatePortalProfileService(pool, parserDeps) {
         };
       }
 
-      const profileCompletion = calculateProfileCompletion(updateResult.rows[0]);
+      await syncPortalMasterResumeFromIntake(client, candidateId);
+
+      const candidateAfterSync = await client.query(
+        `
+        SELECT *
+        FROM cand_mstr
+        WHERE candidate_id = $1
+        LIMIT 1
+        `,
+        [candidateId]
+      );
+
+      const profileCompletion = calculateProfileCompletion(
+        candidateAfterSync.rows[0] || updateResult.rows[0]
+      );
 
       const finalCandidateResult = await client.query(
         `

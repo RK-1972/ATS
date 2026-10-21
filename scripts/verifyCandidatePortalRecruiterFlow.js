@@ -70,6 +70,7 @@ function signEmployeeToken(user) {
 
 async function main() {
   const uniqueSuffix = Date.now();
+  const testPan = `ABCRF${String(uniqueSuffix).slice(-4)}F`;
   const emailId = `portal.recruiter.${uniqueSuffix}@example.com`;
   const password = "TestPass1!";
 
@@ -136,11 +137,13 @@ async function main() {
     { originalname: "recruiter-flow.pdf", buffer: buildMinimalPdfBuffer() }
   );
   await profileService.parseProfileIntake(candidateId, intakeId);
+
   await profileService.saveCandidateProfile(candidateId, {
     first_name: "Recruiter",
     last_name: "Flow",
     email: emailId,
     mobile: "9876501111",
+    pan_number: testPan,
     skills: "Java",
     experience: "4"
   });
@@ -205,6 +208,176 @@ async function main() {
     pass("dashboard review_queue exposes portal candidate to recruiter");
   }
 
+  if (String(queueRow.source_name || "") !== "Candidate portal") {
+    fail(
+      "review queue displays Candidate portal source label",
+      queueRow.source_name
+    );
+  } else {
+    pass("review queue displays Candidate portal source label");
+  }
+
+  if (!String(queueRow.resume_path || "").trim()) {
+    fail("review queue exposes resume path for portal candidate");
+  } else {
+    pass("review queue exposes resume path for portal candidate");
+  }
+
+  const processFormData = new FormData();
+  const processPdfBlob = new Blob([buildMinimalPdfBuffer()], {
+    type: "application/pdf"
+  });
+  processFormData.append("resume", processPdfBlob, "recruiter-flow.pdf");
+
+  const processHttpResponse = await fetch(
+    `${API_BASE_URL}/candidate-intake/${intakeId}/process`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${recruiterToken}` },
+      body: processFormData
+    }
+  );
+  const processHttpBody = await processHttpResponse.json().catch(() => ({}));
+
+  if (!processHttpResponse.ok) {
+    fail(
+      "HTTP process resume seeds storage for idempotent parse test",
+      processHttpBody.message || String(processHttpResponse.status)
+    );
+    await pool.end();
+    return;
+  }
+
+  pass("HTTP process resume seeds storage for idempotent parse test");
+
+  const intakePathResult = await pool.query(
+    `SELECT resume_path FROM rm_candidate_intake WHERE intake_id = $1`,
+    [intakeId]
+  );
+  const expectedResumePath = String(intakePathResult.rows[0]?.resume_path || "").trim();
+
+  if (!expectedResumePath) {
+    fail("intake resume_path set after HTTP process");
+    await pool.end();
+    return;
+  }
+
+  const editedProfile = {
+    first_name: "EditedFirst",
+    last_name: "EditedLast",
+    mobile_number: "9999888777",
+    primary_skill: "RecruiterEditedSkill",
+    total_experience: "9"
+  };
+
+  await pool.query(
+    `
+    UPDATE cand_mstr
+    SET
+      first_name = $1,
+      last_name = $2,
+      mobile_number = $3,
+      primary_skill = $4,
+      total_experience = $5,
+      resume_path = NULL
+    WHERE candidate_id = $6
+    `,
+    [
+      editedProfile.first_name,
+      editedProfile.last_name,
+      editedProfile.mobile_number,
+      editedProfile.primary_skill,
+      editedProfile.total_experience,
+      candidateId
+    ]
+  );
+
+  const beforeRepairCount = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM cand_mstr WHERE email_id = $1`,
+    [emailId]
+  );
+
+  const parseRepairResponse = await fetch(
+    `${API_BASE_URL}/candidate-intake/${intakeId}/parse`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${recruiterToken}` }
+    }
+  );
+  const parseRepairBody = await parseRepairResponse.json().catch(() => ({}));
+
+  if (!parseRepairResponse.ok) {
+    fail(
+      "HTTP idempotent parse repairs missing master resume_path",
+      parseRepairBody.message || String(parseRepairResponse.status)
+    );
+  } else {
+    pass("HTTP idempotent parse repairs missing master resume_path");
+  }
+
+  const afterRepair = await pool.query(
+    `
+    SELECT
+      resume_path,
+      first_name,
+      last_name,
+      mobile_number,
+      primary_skill,
+      total_experience
+    FROM cand_mstr
+    WHERE candidate_id = $1
+    `,
+    [candidateId]
+  );
+  const afterRepairRow = afterRepair.rows[0];
+
+  const intakeAfterRepair = await pool.query(
+    `SELECT resume_path FROM rm_candidate_intake WHERE intake_id = $1`,
+    [intakeId]
+  );
+  const intakeResumeAfterRepair = String(
+    intakeAfterRepair.rows[0]?.resume_path || ""
+  ).trim();
+  const masterResumeAfterRepair = String(afterRepairRow?.resume_path || "").trim();
+
+  if (
+    !masterResumeAfterRepair ||
+    masterResumeAfterRepair !== intakeResumeAfterRepair
+  ) {
+    fail(
+      "HTTP idempotent parse sets master resume_path from intake",
+      `master=${masterResumeAfterRepair || "(empty)"} intake=${intakeResumeAfterRepair || "(empty)"}`
+    );
+  } else {
+    pass("HTTP idempotent parse sets master resume_path from intake");
+  }
+
+  if (
+    afterRepairRow?.first_name !== editedProfile.first_name ||
+    afterRepairRow?.last_name !== editedProfile.last_name ||
+    afterRepairRow?.mobile_number !== editedProfile.mobile_number ||
+    String(afterRepairRow?.primary_skill || "") !== editedProfile.primary_skill ||
+    Number(afterRepairRow?.total_experience) !== Number(editedProfile.total_experience)
+  ) {
+    fail("HTTP idempotent parse leaves recruiter-edited profile fields unchanged");
+  } else {
+    pass("HTTP idempotent parse leaves recruiter-edited profile fields unchanged");
+  }
+
+  const afterRepairCount = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM cand_mstr WHERE email_id = $1`,
+    [emailId]
+  );
+
+  if (afterRepairCount.rows[0]?.total !== beforeRepairCount.rows[0]?.total) {
+    fail(
+      "HTTP idempotent parse does not create duplicate candidate",
+      String(afterRepairCount.rows[0]?.total)
+    );
+  } else {
+    pass("HTTP idempotent parse does not create duplicate candidate");
+  }
+
   const secondRecruiterResult = await pool.query(
     `
     SELECT user_id, employee_code, email_id, role_name, secondary_role
@@ -243,6 +416,7 @@ async function main() {
   formData.append("mobile_number", "9876501111");
   formData.append("primary_skill", "Java");
   formData.append("total_experience", "4");
+  formData.append("pan_number", testPan);
   formData.append("candidate_container", "PIPELINE");
   formData.append("created_by", recruiter.employee_code);
 
@@ -290,6 +464,140 @@ async function main() {
     fail("no duplicate cand_mstr after registration", afterCount.rows[0]?.total);
   } else {
     pass("no duplicate cand_mstr after registration");
+  }
+
+  const registeredResumeRow = await pool.query(
+    `
+    SELECT resume_path, candidate_source_code
+    FROM cand_mstr
+    WHERE candidate_id = $1
+    `,
+    [candidateId]
+  );
+
+  const registeredResumePath = String(
+    registeredResumeRow.rows[0]?.resume_path || ""
+  ).trim();
+
+  if (!registeredResumePath) {
+    fail("registered candidate preserves resume_path");
+  } else if (registeredResumePath !== expectedResumePath) {
+    fail(
+      "registered candidate resume_path matches uploaded intake path",
+      `${registeredResumePath} !== ${expectedResumePath}`
+    );
+  } else {
+    pass("registered candidate resume_path matches uploaded intake path");
+  }
+
+  if (registeredResumeRow.rows[0]?.candidate_source_code !== "PORTAL") {
+    fail(
+      "registered candidate source remains PORTAL",
+      registeredResumeRow.rows[0]?.candidate_source_code
+    );
+  } else {
+    pass("registered candidate source remains PORTAL");
+  }
+
+  const resumeHttpResponse = await fetch(
+    `${API_BASE_URL}/candidate-resume/${candidateId}`,
+    {
+      headers: { Authorization: `Bearer ${recruiterToken}` }
+    }
+  );
+
+  if (resumeHttpResponse.status !== 200) {
+    const resumeHttpBody = await resumeHttpResponse.json().catch(() => ({}));
+    fail(
+      "GET /candidate-resume returns HTTP 200",
+      resumeHttpBody.message || String(resumeHttpResponse.status)
+    );
+  } else {
+    pass("GET /candidate-resume returns HTTP 200");
+  }
+
+  if (resumeHttpResponse.status === 200) {
+    const contentType = String(
+      resumeHttpResponse.headers.get("content-type") || ""
+    ).toLowerCase();
+
+    if (
+      !contentType.includes("pdf") &&
+      !contentType.includes("octet-stream")
+    ) {
+      fail("GET /candidate-resume content type is appropriate for PDF", contentType);
+    } else {
+      pass("GET /candidate-resume content type is appropriate for PDF");
+    }
+
+    const resumeBytes = Buffer.from(await resumeHttpResponse.arrayBuffer());
+
+    if (!resumeBytes.length) {
+      fail("GET /candidate-resume body is non-empty");
+    } else {
+      pass("GET /candidate-resume body is non-empty");
+    }
+
+    if (resumeBytes.slice(0, 5).toString("utf8") !== "%PDF-") {
+      fail("GET /candidate-resume body begins with PDF magic bytes");
+    } else {
+      pass("GET /candidate-resume body begins with PDF magic bytes");
+    }
+  }
+
+  const preservedPath = "existing-master-resume.pdf";
+
+  await pool.query(`UPDATE cand_mstr SET resume_path = $1 WHERE candidate_id = $2`, [
+    preservedPath,
+    candidateId
+  ]);
+
+  const parseNoOverwriteResponse = await fetch(
+    `${API_BASE_URL}/candidate-intake/${intakeId}/parse`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${recruiterToken}` }
+    }
+  );
+
+  if (!parseNoOverwriteResponse.ok) {
+    const parseNoOverwriteBody = await parseNoOverwriteResponse.json().catch(() => ({}));
+    fail(
+      "HTTP idempotent parse with existing master resume_path",
+      parseNoOverwriteBody.message || String(parseNoOverwriteResponse.status)
+    );
+  } else {
+    pass("HTTP idempotent parse with existing master resume_path");
+  }
+
+  const afterNoOverwrite = await pool.query(
+    `
+    SELECT resume_path, first_name, last_name, mobile_number, primary_skill
+    FROM cand_mstr
+    WHERE candidate_id = $1
+    `,
+    [candidateId]
+  );
+  const afterNoOverwriteRow = afterNoOverwrite.rows[0];
+
+  if (afterNoOverwriteRow?.resume_path !== preservedPath) {
+    fail(
+      "HTTP idempotent parse does not overwrite existing master resume_path",
+      afterNoOverwriteRow?.resume_path
+    );
+  } else {
+    pass("HTTP idempotent parse does not overwrite existing master resume_path");
+  }
+
+  if (
+    afterNoOverwriteRow?.first_name !== "Recruiter" ||
+    afterNoOverwriteRow?.last_name !== "Flow" ||
+    afterNoOverwriteRow?.mobile_number !== "9876501111" ||
+    String(afterNoOverwriteRow?.primary_skill || "") !== "Java"
+  ) {
+    fail("HTTP idempotent parse preserves profile fields when resume_path exists");
+  } else {
+    pass("HTTP idempotent parse preserves profile fields when resume_path exists");
   }
 
   await pool.query(`DELETE FROM candidate_portal_account WHERE candidate_id = $1`, [candidateId]);
