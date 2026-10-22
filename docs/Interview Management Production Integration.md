@@ -75,6 +75,7 @@ Auth: Bearer JWT
 | POST | `/api/v1/interviews/schedule` | Schedule interview |
 | POST | `/api/v1/interviews/:id/accept` | Accept panel assignment |
 | POST | `/api/v1/interviews/:id/reschedule` | Reschedule interview |
+| POST | `/api/v1/interviews/:id/cancel` | Cancel interview |
 | POST | `/api/v1/interviews/:id/complete` | Complete interview |
 | POST | `/api/v1/interviews/:id/feedback` | Submit feedback |
 | POST | `/api/v1/interviews/:id/panel` | Assign panel |

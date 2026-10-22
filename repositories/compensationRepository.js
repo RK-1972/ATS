@@ -57,14 +57,57 @@ async function findActiveStructures(pool) {
   return result.rows;
 }
 
-async function findDefaultStructure(pool) {
+async function findDefaultStructure(pool, asOfDate = null) {
+  const effectiveDate = asOfDate || new Date();
+
   const result = await pool.query(
     `SELECT *
      FROM cm_compensation_structures
      WHERE status = 'Active'
        AND is_default = TRUE
+       AND (effective_from IS NULL OR effective_from <= $1::date)
+       AND (effective_to IS NULL OR effective_to >= $1::date)
      ORDER BY structure_code ASC
-     LIMIT 1`
+     LIMIT 1`,
+    [effectiveDate]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function updateStructureComponent(pool, structureComponentId, patch) {
+  const result = await pool.query(
+    `UPDATE cm_compensation_structure_components
+     SET
+       formula_value = COALESCE($2, formula_value),
+       fixed_amount = COALESCE($3, fixed_amount),
+       editable = COALESCE($4, editable),
+       include_in_ctc = COALESCE($5, include_in_ctc),
+       status = COALESCE($6, status),
+       modified_on = NOW()
+     WHERE structure_component_id = $1
+     RETURNING *`,
+    [
+      structureComponentId,
+      patch.formulaValue,
+      patch.fixedAmount,
+      patch.editable,
+      patch.includeInCtc,
+      patch.status
+    ]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function findStructureComponentById(pool, structureComponentId) {
+  const result = await pool.query(
+    `SELECT sc.*, cm.component_code, cm.component_name, cm.component_category
+     FROM cm_compensation_structure_components sc
+     INNER JOIN cm_compensation_component_master cm
+       ON cm.component_id = sc.component_id
+     WHERE sc.structure_component_id = $1`,
+    [structureComponentId]
   );
 
   return result.rows[0] || null;
@@ -108,5 +151,7 @@ module.exports = {
   findActiveStructures,
   findDefaultStructure,
   findStructureById,
-  findStructureComponents
+  findStructureComponents,
+  updateStructureComponent,
+  findStructureComponentById
 };

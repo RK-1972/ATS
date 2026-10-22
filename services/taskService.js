@@ -58,6 +58,8 @@ function resolveTaskQueryable(pool, txOptions) {
   return txOptions?.client || pool;
 }
 
+const NON_ACTIONABLE_ET_TASK_STATUSES = ["Completed", "Cancelled"];
+
 async function createTask(pool, payload, req, txOptions = null) {
   const queryable = resolveTaskQueryable(pool, txOptions);
   const user = userContext(req);
@@ -140,7 +142,7 @@ async function createTask(pool, payload, req, txOptions = null) {
 }
 
 async function listInbox(pool, filters = {}) {
-  const conditions = ["status <> 'Completed'"];
+  const conditions = ["status NOT IN ('Completed', 'Cancelled')"];
   const values = [];
   let index = 1;
 
@@ -169,7 +171,7 @@ async function listMyTasks(pool, req) {
   const user = userContext(req);
   const result = await pool.query(
     `SELECT * FROM et_tasks
-     WHERE status <> 'Completed'
+     WHERE status NOT IN ('Completed', 'Cancelled')
        AND (
          assignee = $1
          OR assignee_role = $2
@@ -185,14 +187,21 @@ async function listMyTasks(pool, req) {
   return result.rows.map(mapTaskRow);
 }
 
-async function getTask(pool, taskId) {
-  const result = await pool.query("SELECT * FROM et_tasks WHERE task_id = $1", [taskId]);
+async function getTaskFromQueryable(queryable, taskId) {
+  const result = await queryable.query(
+    "SELECT * FROM et_tasks WHERE task_id = $1",
+    [taskId]
+  );
 
   if (!result.rows.length) {
     throw httpError(`Task not found: ${taskId}`, 404);
   }
 
   return mapTaskRow(result.rows[0]);
+}
+
+async function getTask(pool, taskId) {
+  return getTaskFromQueryable(pool, taskId);
 }
 
 async function completeTask(pool, taskId, req, comments = "", options = {}) {
@@ -294,6 +303,73 @@ async function reassignTask(pool, taskId, assignee, req, assigneeRole = null) {
   return getTask(pool, taskId);
 }
 
+async function cancelTask(pool, taskId, req, comments = "", txOptions = null) {
+  const queryable = resolveTaskQueryable(pool, txOptions);
+  const user = userContext(req);
+  const task = await getTaskFromQueryable(queryable, taskId);
+
+  if (task.status === "Completed" || task.status === "Cancelled") {
+    return task;
+  }
+
+  await queryable.query(
+    `UPDATE et_tasks
+     SET status = 'Cancelled', modified_on = NOW()
+     WHERE task_id = $1`,
+    [taskId]
+  );
+
+  if (task.workflowTaskId) {
+    const wfResult = await queryable.query(
+      `SELECT status FROM wf_tasks WHERE task_id = $1`,
+      [task.workflowTaskId]
+    );
+    const wfStatus = String(wfResult.rows[0]?.status || "").trim().toLowerCase();
+
+    if (wfStatus && wfStatus !== "completed" && wfStatus !== "cancelled") {
+      await queryable.query(
+        `UPDATE wf_tasks
+         SET status = $1, completed_on = NOW()
+         WHERE task_id = $2`,
+        [workflowService.TASK_STATUS.CANCELLED, task.workflowTaskId]
+      );
+
+      await queryable.query(
+        `UPDATE wf_assignments
+         SET active = FALSE
+         WHERE task_id = $1 AND active = TRUE`,
+        [task.workflowTaskId]
+      );
+    }
+  }
+
+  await recordTaskHistory(
+    queryable,
+    taskId,
+    "TaskCancelled",
+    user.name,
+    user.role,
+    task.status,
+    "Cancelled",
+    comments
+  );
+
+  await writeEnterpriseAudit(queryable, {
+    eventType: "TaskCancelled",
+    module: task.module,
+    entity: "Task",
+    entityId: String(taskId),
+    action: `Task cancelled: ${task.title}`,
+    previousValue: task.status,
+    newValue: "Cancelled",
+    userName: user.name,
+    userRole: user.role,
+    metadata: { comments }
+  });
+
+  return getTaskFromQueryable(queryable, taskId);
+}
+
 async function escalateTask(pool, taskId, escalateTo, req, reason = "") {
   const user = userContext(req);
   const task = await getTask(pool, taskId);
@@ -349,8 +425,10 @@ module.exports = {
   listMyTasks,
   getTask,
   completeTask,
+  cancelTask,
   reassignTask,
   escalateTask,
   getTaskBundle,
-  mapTaskRow
+  mapTaskRow,
+  NON_ACTIONABLE_ET_TASK_STATUSES
 };

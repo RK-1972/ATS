@@ -534,7 +534,7 @@ async function getInstanceById(queryable, instanceId) {
 async function getCurrentTasks(pool, instanceId) {
   const result = await pool.query(
     `SELECT task_id, stage_key, task_type, title, status, assignee, assignee_role, due_at, completed_on
-     FROM wf_tasks WHERE instance_id = $1 AND status <> 'Completed'
+     FROM wf_tasks WHERE instance_id = $1 AND status NOT IN ('Completed', 'Cancelled')
      ORDER BY created_on ASC`,
     [instanceId]
   );

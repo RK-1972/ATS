@@ -130,7 +130,13 @@ async function insertLetter(pool, letterRow) {
   return result.rows[0];
 }
 
-async function replaceCtcComponents(pool, letterId, components, calculatedBy = null) {
+async function replaceCtcComponents(
+  pool,
+  letterId,
+  components,
+  calculatedBy = null,
+  compensationMeta = null
+) {
   await pool.query(
     `DELETE FROM om_offer_letter_ctc WHERE letter_id = $1`,
     [letterId]
@@ -141,12 +147,14 @@ async function replaceCtcComponents(pool, letterId, components, calculatedBy = n
       `INSERT INTO om_offer_letter_ctc (
          letter_id,
          component_name,
+         component_code,
          amount,
          display_order
-       ) VALUES ($1, $2, $3, $4)`,
+       ) VALUES ($1, $2, $3, $4, $5)`,
       [
         letterId,
         component.component_name,
+        component.component_code || null,
         component.amount,
         component.display_order
       ]
@@ -165,17 +173,40 @@ async function replaceCtcComponents(pool, letterId, components, calculatedBy = n
     return null;
   }
 
+  const meta = compensationMeta || {};
+
   const result = await pool.query(
     `UPDATE om_offer_letters
      SET compensation_calculated_on = NOW(),
          compensation_calculated_by = $2,
+         compensation_structure_id = COALESCE($3, compensation_structure_id),
+         compensation_annual_ctc = COALESCE($4, compensation_annual_ctc),
+         compensation_snapshot = COALESCE($5::jsonb, compensation_snapshot),
+         compensation_locked = COALESCE($6, compensation_locked),
          modified_on = NOW()
      WHERE letter_id = $1
      RETURNING compensation_calculated_on, compensation_calculated_by`,
-    [letterId, calculatedBy || null]
+    [
+      letterId,
+      calculatedBy || null,
+      meta.structureId || null,
+      meta.annualCtc != null ? meta.annualCtc : null,
+      meta.snapshot ? JSON.stringify(meta.snapshot) : null,
+      meta.compensationLocked != null ? meta.compensationLocked : null
+    ]
   );
 
   return result.rows[0] || null;
+}
+
+async function lockCompensationSnapshot(pool, letterId) {
+  await pool.query(
+    `UPDATE om_offer_letters
+     SET compensation_locked = TRUE,
+         modified_on = NOW()
+     WHERE letter_id = $1`,
+    [letterId]
+  );
 }
 
 async function hasCalculatedBreakup(pool, offerId) {
@@ -211,6 +242,7 @@ async function markLetterGenerated(pool, letterId, generatedBy) {
          generated_by = $3,
          generated_on = NOW(),
          generation_in_progress = FALSE,
+         compensation_locked = TRUE,
          modified_on = NOW()
      WHERE letter_id = $1
      RETURNING *`,
@@ -269,6 +301,7 @@ module.exports = {
   findLetterByOfferId,
   insertLetter,
   replaceCtcComponents,
+  lockCompensationSnapshot,
   hasCalculatedBreakup,
   ensureAwaitingLetter,
   markLetterGenerated,

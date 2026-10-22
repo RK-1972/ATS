@@ -26,8 +26,8 @@ async function getStructureComponents(pool, structureId) {
   };
 }
 
-async function getDefaultStructureComponents(pool) {
-  const structure = await compensationRepository.findDefaultStructure(pool);
+async function getDefaultStructureComponents(pool, asOfDate = null) {
+  const structure = await compensationRepository.findDefaultStructure(pool, asOfDate);
 
   if (!structure) {
     throw httpError("Default compensation structure is not configured.", 404);

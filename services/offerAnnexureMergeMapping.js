@@ -42,6 +42,12 @@ const ANNEXURE_LABEL_ROWS = [
     annual: (breakup) => breakup.specialAllowanceAnnual
   },
   {
+    id: "monthly-fixed-incentive",
+    labels: ["Monthly Fixed Incentive", "Fixed Incentive"],
+    monthly: (breakup) => breakup.monthlyFixedIncentive,
+    annual: (breakup) => breakup.monthlyFixedIncentiveAnnual
+  },
+  {
     id: "gross-salary",
     labels: ["Gross Salary (Rs.)", "Gross Salary"],
     monthly: (breakup) => breakup.grossMonthly,

@@ -2,11 +2,13 @@ const offerLetterRepository = require("../repositories/offerLetterRepository");
 const offerApprovalWorkflowService = require("./offerApprovalWorkflowService");
 const generatedDocumentRepository = require("../repositories/generatedDocumentRepository");
 const offerLetterValidation = require("./offerLetterValidation");
-const salaryCalculationService = require("./salaryCalculationService");
+const compensationCalculationService = require("./compensationCalculationService");
+const compensationLetterBridgeService = require("./compensationLetterBridgeService");
 const offerTemplateMergeService = require("./offerTemplateMergeService");
 const pdfGenerationService = require("./pdfGenerationService");
 const offerDocumentStorageService = require("./offerDocumentStorageService");
 const { userContext } = require("./enterpriseAuditService");
+const { assertOfferReadAccess } = require("./offerManagementService");
 
 const OFFER_LETTER_DOCUMENT_TYPE = "Offer Letter";
 const OFFER_BUSINESS_OBJECT_TYPE = "OFFER";
@@ -27,7 +29,12 @@ async function loadPersistedSalaryBreakup(pool, letterId) {
     );
   }
 
-  return salaryCalculationService.aggregatePersistedRows(rows);
+  const aggregated = compensationLetterBridgeService.aggregatePersistedLetterRows(rows);
+
+  return {
+    ...aggregated,
+    salaryBreakup: aggregated.salaryBreakup
+  };
 }
 
 async function findOfferContext(pool, offerId) {
@@ -68,19 +75,6 @@ async function findOrganizationContext() {
   };
 }
 
-function mapSalaryBreakupToPersistedRows(breakup) {
-  return salaryCalculationService.mapBreakupToPersistedRows(breakup);
-}
-
-async function persistSalaryBreakup(pool, letterId, breakup) {
-  await offerLetterRepository.replaceCtcComponents(
-    pool,
-    letterId,
-    mapSalaryBreakupToPersistedRows(breakup),
-    "SalaryCalculationService"
-  );
-}
-
 function mapOfferLetterDocuments(rows) {
   return rows.map(generatedDocumentRepository.mapGeneratedDocumentRow);
 }
@@ -119,6 +113,8 @@ async function generateOfferLetterDocument(pool, offerId, req) {
   if (!offerId) {
     throw httpError("Offer id is required.", 400);
   }
+
+  await assertOfferReadAccess(pool, req, offerId);
 
   try {
     const offerRow = await findOfferContext(pool, offerId);
@@ -169,9 +165,18 @@ async function generateOfferLetterDocument(pool, offerId, req) {
       throw httpError("Approved offer CTC is required before generating the offer letter.", 400);
     }
 
-    const calculatedBreakup = salaryCalculationService.calculateSalaryBreakup(fixedAnnualCtc);
+    const persistedCompensation =
+      await compensationCalculationService.ensureOfferCompensationForGeneration(
+        pool,
+        offerId,
+        req
+      );
 
     let letter = existingLetter;
+
+    if (!letter?.letter_id) {
+      letter = await offerLetterRepository.findLetterByOfferId(pool, offerId);
+    }
 
     if (!letter?.letter_id) {
       letter = await offerLetterRepository.insertLetter(pool, {
@@ -181,10 +186,6 @@ async function generateOfferLetterDocument(pool, offerId, req) {
         status: "Awaiting Letter"
       });
     }
-
-    await persistSalaryBreakup(pool, letter.letter_id, calculatedBreakup);
-
-    const persistedCompensation = await loadPersistedSalaryBreakup(pool, letter.letter_id);
     const organizationRow = await findOrganizationContext();
 
     const mergedDocxBuffer = offerTemplateMergeService.mergeOfferLetterTemplate({

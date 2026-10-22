@@ -383,6 +383,7 @@ async function listLegacyOnlyInterviewSchedulesForLegacyApi(pool, recruiterCode)
   const result = await pool.query(
     `
     SELECT
+      ent.interview_id,
       ist.schedule_id,
       ist.req_id,
       cm.candidate_code,
@@ -404,6 +405,7 @@ async function listLegacyOnlyInterviewSchedulesForLegacyApi(pool, recruiterCode)
     INNER JOIN cand_mstr cm ON cm.candidate_id = crm.candidate_id
     LEFT JOIN req_mstr rm ON rm.req_id = ist.req_id
     INNER JOIN interview_panel_mstr ipm ON ipm.panel_id = ist.interviewer_id
+    LEFT JOIN im_interviews ent ON ent.schedule_id = ist.schedule_id
     ${recruiterFilter}
     WHERE ${LEGACY_SCHEDULE_NOT_IN_ENTERPRISE}
     ORDER BY ist.interview_date DESC, ist.interview_time DESC
@@ -438,6 +440,7 @@ async function listEnterpriseInterviewSchedulesForLegacyApi(pool, recruiterCode)
   const result = await pool.query(
     `
     SELECT
+      i.interview_id,
       i.schedule_id,
       i.req_id,
       cm.candidate_code,

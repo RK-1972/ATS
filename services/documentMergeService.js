@@ -11,6 +11,7 @@ const offerLetterGenerationService = require("./offerLetterGenerationService");
 const placeholderRegistry = require("./placeholderRegistry");
 const { resolvePlaceholder } = require("./placeholderResolver");
 const { userContext } = require("./enterpriseAuditService");
+const { assertOfferReadAccess } = require("./offerManagementService");
 
 const DOCX_MIME =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -444,6 +445,8 @@ async function generateDocument(pool, payload, req) {
     throw httpError(`Unsupported business object type: ${businessObjectType}`, 400);
   }
 
+  await assertOfferReadAccess(pool, req, businessObjectId);
+
   return offerLetterGenerationService.generateOfferLetterDocument(
     pool,
     businessObjectId,
@@ -481,7 +484,7 @@ async function getGeneratedDocument(pool, documentId) {
   return generatedDocumentRepository.mapGeneratedDocumentRow(row);
 }
 
-async function downloadGeneratedDocument(pool, documentId) {
+async function downloadGeneratedDocument(pool, documentId, req) {
   const row = await generatedDocumentRepository.findById(pool, documentId);
 
   if (!row) {
@@ -496,13 +499,18 @@ async function downloadGeneratedDocument(pool, documentId) {
   }
 
   if (String(row.business_object_type || "").trim().toUpperCase() === "OFFER") {
-    const offerRow = await offerLetterRepository.findOfferLetterDetail(
-      pool,
-      row.business_object_id
-    );
+    const offerId = row.business_object_id;
+
+    if (!req?.user) {
+      throw httpError("Authentication required.", 401);
+    }
+
+    await assertOfferReadAccess(pool, req, offerId);
+
+    const offerRow = await offerLetterRepository.findOfferLetterDetail(pool, offerId);
 
     if (!offerRow) {
-      throw httpError(`Offer not found: ${row.business_object_id}`, 404);
+      throw httpError(`Offer not found: ${offerId}`, 404);
     }
 
     offerLetterValidation.assertGeneratedLetterAccess(offerRow);
@@ -517,7 +525,13 @@ async function downloadGeneratedDocument(pool, documentId) {
   };
 }
 
-async function downloadGeneratedDocumentForOffer(pool, offerId) {
+async function downloadGeneratedDocumentForOffer(pool, offerId, req) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  await assertOfferReadAccess(pool, req, offerId);
+
   return offerLetterGenerationService.downloadOfferLetterPdf(pool, offerId);
 }
 

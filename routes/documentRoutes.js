@@ -1,4 +1,5 @@
 const documentMergeService = require("../services/documentMergeService");
+const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Document API Error:", error.message);
@@ -20,8 +21,9 @@ function verifyTokenOrQuery(verifyToken) {
 
 function registerDocumentRoutes(app, pool, verifyToken) {
   const authorize = verifyTokenOrQuery(verifyToken);
+  const offerGuard = [verifyToken, requireOfferWorkspace(pool)];
 
-  app.post("/api/v1/documents/generate", verifyToken, async (req, res) => {
+  app.post("/api/v1/documents/generate", offerGuard, async (req, res) => {
     try {
       const data = await documentMergeService.generateDocument(pool, req.body, req);
       res.status(201).json({
@@ -36,12 +38,13 @@ function registerDocumentRoutes(app, pool, verifyToken) {
 
   app.get(
     "/api/v1/documents/offer/:offerId/download",
-    authorize,
+    [authorize, requireOfferWorkspace(pool)],
     async (req, res) => {
       try {
         const file = await documentMergeService.downloadGeneratedDocumentForOffer(
           pool,
-          req.params.offerId
+          req.params.offerId,
+          req
         );
         const disposition =
           req.query.download === "1" ? "attachment" : "inline";
@@ -69,7 +72,8 @@ function registerDocumentRoutes(app, pool, verifyToken) {
     try {
       const file = await documentMergeService.downloadGeneratedDocument(
         pool,
-        req.params.id
+        req.params.id,
+        req
       );
       const disposition =
         req.query.download === "1" ? "attachment" : "inline";

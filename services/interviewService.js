@@ -89,6 +89,100 @@ function generateInterviewId() {
   return `INT-${Date.now()}`;
 }
 
+const INTERVIEW_STATUS = {
+  SCHEDULED: "Scheduled",
+  COMPLETED: "Completed",
+  CANCELLED: "Cancelled"
+};
+
+const INTERVIEW_OPEN_TASK_TYPES = [
+  "Accept Interview Assignment",
+  "Conduct Interview",
+  "Submit Interview Feedback"
+];
+
+function formatInterviewTimeValue(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return value.length >= 5 ? value.slice(0, 8) : value;
+  }
+
+  return String(value);
+}
+
+function formatInterviewDateValue(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  return String(value).slice(0, 10);
+}
+
+function assertInterviewMutableState(interview) {
+  if (interview.feedbackSubmitted) {
+    throw httpError("Interview cannot be changed after feedback has been submitted.", 400);
+  }
+
+  if (interview.interviewStatus === INTERVIEW_STATUS.CANCELLED) {
+    throw httpError("Interview is already cancelled.", 400);
+  }
+
+  if (interview.interviewStatus === INTERVIEW_STATUS.COMPLETED) {
+    throw httpError("Completed interviews cannot be rescheduled or cancelled.", 400);
+  }
+
+  if (interview.interviewStatus !== INTERVIEW_STATUS.SCHEDULED) {
+    throw httpError("Only scheduled interviews can be rescheduled or cancelled.", 400);
+  }
+}
+
+function assertFutureInterviewSlot(interviewDate, interviewTime) {
+  if (!interviewDate || !interviewTime) {
+    throw httpError("Interview date and time are required.", 400);
+  }
+
+  const selectedDate = new Date(interviewDate);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (Number.isNaN(selectedDate.getTime())) {
+    throw httpError("Interview date is invalid.", 400);
+  }
+
+  if (selectedDate < today) {
+    throw httpError("Interview date cannot be in the past.", 400);
+  }
+
+  const slotStart = new Date(`${formatInterviewDateValue(interviewDate)}T${formatInterviewTimeValue(interviewTime)}`);
+
+  if (!Number.isNaN(slotStart.getTime()) && slotStart < new Date()) {
+    throw httpError("Interview date and time must be in the future.", 400);
+  }
+}
+
+function addHoursToDate(date, hours) {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000);
+}
+
+function buildDueAtFromInterviewSlot(interviewDate, interviewTime, slaHours = 72) {
+  const start = new Date(
+    `${formatInterviewDateValue(interviewDate)}T${formatInterviewTimeValue(interviewTime)}`
+  );
+
+  if (Number.isNaN(start.getTime())) {
+    return addHoursToDate(new Date(), slaHours);
+  }
+
+  return addHoursToDate(start, slaHours);
+}
+
 function stageNameForRound(roundType) {
   switch (roundType) {
     case "L1 Technical":
@@ -139,7 +233,10 @@ function mapInterviewRow(row) {
     meetingLink: row.meeting_link,
     feedbackSubmitted: row.feedback_submitted,
     finalOutcome: row.final_outcome,
-    remarks: row.remarks
+    remarks: row.remarks,
+    cancelledAt: row.cancelled_at,
+    cancelledBy: row.cancelled_by,
+    cancellationReason: row.cancellation_reason
   };
 }
 
@@ -147,7 +244,11 @@ function buildInterviewBundleSummary(rows) {
   return {
     scheduled: rows.filter((row) => row.interview_status === "Scheduled").length,
     completed: rows.filter((row) => row.interview_status === "Completed").length,
-    pendingFeedback: rows.filter((row) => !row.feedback_submitted).length
+    pendingFeedback: rows.filter(
+      (row) =>
+        !row.feedback_submitted
+        && row.interview_status !== INTERVIEW_STATUS.CANCELLED
+    ).length
   };
 }
 
@@ -706,6 +807,154 @@ async function fetchInterviewRowByLookup(pool, interviewId) {
  * Same visibility rules as GET /api/v1/interviews bundle (listScopedInterviewRows).
  * Admin retains unrestricted read access.
  */
+async function assertInterviewScheduleMutateAccess(pool, req, interviewRow) {
+  if (!req?.user) {
+    throw httpError("Authentication required.", 401);
+  }
+
+  if (isAdminUser(req)) {
+    return;
+  }
+
+  const mapId = interviewRow.map_id;
+
+  if (!mapId) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to manage this interview.",
+      403
+    );
+  }
+
+  const recruitmentService = require("./recruitmentService");
+  await recruitmentService.assertAuthorizedMappingAccess(pool, req, mapId);
+}
+
+async function syncLegacyScheduleMirror(
+  pool,
+  scheduleId,
+  { interviewDate, interviewTime, interviewStatus }
+) {
+  if (!scheduleId || !(await tableExists(pool, "interview_schedule_trn"))) {
+    return;
+  }
+
+  const sets = [];
+  const values = [];
+  let index = 1;
+
+  if (interviewDate != null) {
+    sets.push(`interview_date = $${index++}`);
+    values.push(interviewDate);
+  }
+
+  if (interviewTime != null) {
+    sets.push(`interview_time = $${index++}`);
+    values.push(interviewTime);
+  }
+
+  if (interviewStatus != null) {
+    sets.push(`interview_status = $${index++}`);
+    values.push(interviewStatus);
+  }
+
+  if (!sets.length) {
+    return;
+  }
+
+  values.push(scheduleId);
+  await pool.query(
+    `UPDATE interview_schedule_trn SET ${sets.join(", ")} WHERE schedule_id = $${index}`,
+    values
+  );
+}
+
+async function listOpenInterviewTasks(pool, interviewId) {
+  const result = await pool.query(
+    `SELECT task_id, task_type, status
+     FROM et_tasks
+     WHERE module = 'Interview Management'
+       AND business_object_type = 'Interview'
+       AND business_object_id = $1
+       AND status NOT IN ('Completed', 'Cancelled')
+     ORDER BY created_on ASC`,
+    [interviewId]
+  );
+
+  return result.rows;
+}
+
+async function cancelOpenInterviewTasks(
+  pool,
+  interviewId,
+  req,
+  comments = "",
+  txOptions = null
+) {
+  const queryable = txOptions?.client || pool;
+  const openTasks = await listOpenInterviewTasks(queryable, interviewId);
+
+  for (const row of openTasks) {
+    if (!INTERVIEW_OPEN_TASK_TYPES.includes(row.task_type)) {
+      continue;
+    }
+
+    await taskService.cancelTask(pool, row.task_id, req, comments, txOptions);
+  }
+}
+
+async function syncRescheduleConductInterviewTask(
+  pool,
+  interview,
+  interviewDate,
+  interviewTime,
+  req
+) {
+  const dueAt = buildDueAtFromInterviewSlot(interviewDate, interviewTime, 72);
+  const title = `Conduct ${interview.roundType} interview`;
+  const metadata = {
+    interviewDate,
+    interviewTime,
+    rescheduled: true
+  };
+
+  const openConduct = await pool.query(
+    `SELECT task_id
+     FROM et_tasks
+     WHERE module = 'Interview Management'
+       AND task_type = 'Conduct Interview'
+       AND business_object_type = 'Interview'
+       AND business_object_id = $1
+       AND status NOT IN ('Completed', 'Cancelled')
+     ORDER BY created_on DESC
+     LIMIT 1`,
+    [interview.interviewId]
+  );
+
+  if (openConduct.rows.length) {
+    await pool.query(
+      `UPDATE et_tasks
+       SET title = $1, due_at = $2, metadata = $3::jsonb, modified_on = NOW()
+       WHERE task_id = $4`,
+      [title, dueAt, JSON.stringify(metadata), openConduct.rows[0].task_id]
+    );
+    return;
+  }
+
+  await taskService.createTask(pool, {
+    module: "Interview Management",
+    taskType: "Conduct Interview",
+    title,
+    assigneeRole: "Interviewer",
+    slaHours: 72,
+    dueAt: dueAt.toISOString(),
+    workflowInstanceId: interview.workflowInstanceId,
+    stageKey: "scheduled",
+    businessObjectType: "Interview",
+    businessObjectId: interview.interviewId,
+    metadata
+  }, req);
+}
+
 async function assertInterviewReadAccess(pool, req, interviewRow) {
   if (!req?.user) {
     throw httpError("Authentication required.", 401);
@@ -844,16 +1093,18 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     throw httpError(`Interview not found: ${interviewId}`, 404);
   }
 
-  await assertInterviewReadAccess(pool, req, row);
+  await assertInterviewScheduleMutateAccess(pool, req, row);
   const interview = mapInterviewRow(row);
   const platformConfig = await loadPlatformConfig(pool);
   await assertInterviewModuleEnabled(platformConfig);
 
-  const { interview_date: interviewDate, interview_time: interviewTime, remarks } = payload;
+  assertInterviewMutableState(interview);
 
-  if (!interviewDate || !interviewTime) {
-    throw httpError("Interview date and time are required.", 400);
-  }
+  const { interview_date: interviewDate, interview_time: interviewTime, remarks } = payload;
+  assertFutureInterviewSlot(interviewDate, interviewTime);
+
+  const previousDate = formatInterviewDateValue(interview.interviewDate);
+  const previousTime = formatInterviewTimeValue(interview.interviewTime);
 
   await pool.query(
     `UPDATE im_interviews
@@ -863,27 +1114,25 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     [interviewDate, interviewTime, remarks, user.name, interview.interviewId]
   );
 
-  if (isLegacyDualWriteEnabled() && interview.scheduleId && (await tableExists(pool, "interview_schedule_trn"))) {
-    await pool.query(
-      `UPDATE interview_schedule_trn
-       SET interview_date = $1, interview_time = $2
-       WHERE schedule_id = $3`,
-      [interviewDate, interviewTime, interview.scheduleId]
-    );
-  }
+  await syncLegacyScheduleMirror(pool, interview.scheduleId, {
+    interviewDate,
+    interviewTime
+  });
 
-  await taskService.createTask(pool, {
-    module: "Interview Management",
-    taskType: "Conduct Interview",
-    title: `Rescheduled: ${interview.roundType} interview`,
-    assigneeRole: "Interviewer",
-    slaHours: 72,
-    workflowInstanceId: interview.workflowInstanceId,
-    stageKey: "scheduled",
-    businessObjectType: "Interview",
-    businessObjectId: interview.interviewId,
-    metadata: { interviewDate, interviewTime, rescheduled: true }
-  }, req);
+  await syncRescheduleConductInterviewTask(
+    pool,
+    interview,
+    interviewDate,
+    interviewTime,
+    req
+  );
+
+  const historyMetadata = {
+    previous_interview_date: previousDate,
+    previous_interview_time: previousTime,
+    interview_date: interviewDate,
+    interview_time: interviewTime
+  };
 
   await recordInterviewHistory(
     pool,
@@ -891,9 +1140,9 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     "InterviewRescheduled",
     user.name,
     interview.interviewStatus,
-    "Scheduled",
+    INTERVIEW_STATUS.SCHEDULED,
     remarks,
-    { interviewDate, interviewTime }
+    historyMetadata
   );
 
   await writeEnterpriseAudit(pool, {
@@ -904,12 +1153,108 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     action: "Interview rescheduled",
     userName: user.name,
     userRole: user.role,
-    metadata: { interviewDate, interviewTime }
+    metadata: historyMetadata
   });
 
   return {
     interview: await getInterview(pool, interview.interviewId),
     toastMessage: "Interview rescheduled successfully."
+  };
+}
+
+async function cancelInterview(pool, interviewId, payload, req) {
+  const user = userContext(req);
+  const row = await fetchInterviewRowByLookup(pool, interviewId);
+
+  if (!row) {
+    throw httpError(`Interview not found: ${interviewId}`, 404);
+  }
+
+  await assertInterviewScheduleMutateAccess(pool, req, row);
+  const interview = mapInterviewRow(row);
+  const platformConfig = await loadPlatformConfig(pool);
+  await assertInterviewModuleEnabled(platformConfig);
+
+  assertInterviewMutableState(interview);
+
+  const cancellationReason = String(
+    payload?.cancellation_reason || payload?.cancellationReason || ""
+  ).trim();
+  const notes = String(payload?.notes || "").trim();
+
+  if (!cancellationReason) {
+    throw httpError("Cancellation reason is required.", 400);
+  }
+
+  const reasonText = notes
+    ? `${cancellationReason} — ${notes}`
+    : cancellationReason;
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE im_interviews
+       SET interview_status = $1,
+           cancelled_at = NOW(),
+           cancelled_by = $2,
+           cancellation_reason = $3,
+           modified_by = $2,
+           modified_on = NOW()
+       WHERE interview_id = $4`,
+      [INTERVIEW_STATUS.CANCELLED, user.name, reasonText, interview.interviewId]
+    );
+
+    await syncLegacyScheduleMirror(client, interview.scheduleId, {
+      interviewStatus: INTERVIEW_STATUS.CANCELLED
+    });
+
+    await cancelOpenInterviewTasks(
+      pool,
+      interview.interviewId,
+      req,
+      "Interview cancelled",
+      { client }
+    );
+
+    await recordInterviewHistory(
+      client,
+      interview.interviewId,
+      "InterviewCancelled",
+      user.name,
+      interview.interviewStatus,
+      INTERVIEW_STATUS.CANCELLED,
+      reasonText,
+      { cancellation_reason: cancellationReason, notes: notes || null }
+    );
+
+    await writeEnterpriseAudit(client, {
+      eventType: "InterviewCancelled",
+      module: "Interview Management",
+      entity: "Interview",
+      entityId: interview.interviewId,
+      action: "Interview cancelled",
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        cancellation_reason: cancellationReason,
+        notes: notes || null
+      }
+    });
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  return {
+    interview: await getInterview(pool, interview.interviewId),
+    toastMessage: "Interview cancelled successfully."
   };
 }
 
@@ -2037,6 +2382,7 @@ async function getInterviewProgressByMapId(pool, mapId, req) {
 
 module.exports = {
   getDefaultSeedPayload,
+  buildInterviewBundleSummary,
   getInterviewBundle,
   getFeedbackDetailsBySchedule,
   getInterviewProgressByMapId,
@@ -2049,7 +2395,12 @@ module.exports = {
   assertInterviewPanelActionAccess,
   acceptAssignment,
   rescheduleInterview,
+  cancelInterview,
   completeInterview,
+  assertInterviewScheduleMutateAccess,
+  INTERVIEW_STATUS,
+  assertInterviewMutableState,
+  assertFutureInterviewSlot,
   submitFeedback,
   getFeedbackBySchedule,
   assertInterviewFeedbackAccess,

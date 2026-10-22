@@ -1,5 +1,7 @@
 const compensationService = require("../services/compensationService");
 const compensationCalculationService = require("../services/compensationCalculationService");
+const compensationConfigService = require("../services/compensationConfigService");
+const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
 
 function handleError(res, error) {
   console.error("Compensation API Error:", error.message);
@@ -9,7 +11,7 @@ function handleError(res, error) {
   });
 }
 
-function registerCompensationRoutes(app, pool, verifyToken) {
+function registerCompensationRoutes(app, pool, verifyToken, verifyAdmin) {
   app.get("/api/v1/compensation-structures", verifyToken, async (req, res) => {
     try {
       const data = await compensationService.getActiveStructures(pool);
@@ -35,7 +37,34 @@ function registerCompensationRoutes(app, pool, verifyToken) {
     }
   );
 
-  app.post("/api/v1/compensation/calculate", verifyToken, async (req, res) => {
+  app.put(
+    "/api/v1/compensation-structures/:structureId/components/:structureComponentId",
+    verifyToken,
+    verifyAdmin,
+    async (req, res) => {
+      try {
+        const data = await compensationConfigService.updateStructureComponent(
+          pool,
+          req.params.structureId,
+          req.params.structureComponentId,
+          req.body,
+          req
+        );
+
+        res.json({
+          success: true,
+          message: "Compensation component updated successfully.",
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  const offerGuard = [verifyToken, requireOfferWorkspace(pool)];
+
+  app.post("/api/v1/compensation/calculate", offerGuard, async (req, res) => {
     try {
       const data = await compensationCalculationService.calculateOfferCompensation(
         pool,

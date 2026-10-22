@@ -7758,7 +7758,7 @@ registerInterviewRoutes(app, pool, verifyToken, {
 });
 registerOfferRoutes(app, pool, verifyToken);
 registerOfferLetterRoutes(app, pool, verifyToken);
-registerCompensationRoutes(app, pool, verifyToken);
+registerCompensationRoutes(app, pool, verifyToken, verifyAdmin);
 registerDocumentTemplateRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlaceholderRoutes(app, verifyToken);
 registerDocumentRoutes(app, pool, verifyToken);

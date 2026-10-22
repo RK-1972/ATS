@@ -1,6 +1,10 @@
 const compensationService = require("./compensationService");
-
-const ESI_MONTHLY_WAGE_THRESHOLD = 21000;
+const {
+  ESI_MONTHLY_WAGE_THRESHOLD,
+  PF_MONTHLY_WAGE_CEILING,
+  EMPLOYER_PF_RATE_PERCENT,
+  isIncludedInGrossCategory
+} = require("./compensationPayrollConstants");
 
 function httpError(message, status = 400) {
   const error = new Error(message);
@@ -20,7 +24,7 @@ function findBasicComponent(components) {
 }
 
 function isIncludedInGross(component) {
-  return component.componentCategory === "EARNINGS";
+  return isIncludedInGrossCategory(component.componentCategory);
 }
 
 function formatFormulaLabel(component, resolvedFormula) {
@@ -44,6 +48,18 @@ function formatFormulaLabel(component, resolvedFormula) {
     default:
       return component.formulaType || "—";
   }
+}
+
+function evaluateEmployerPf(component, context) {
+  const percent = Number(component.formulaValue || EMPLOYER_PF_RATE_PERCENT);
+  const monthlyBasic = roundAmount((context.basicAmount || 0) / 12);
+  const pfWageBase = Math.min(monthlyBasic, PF_MONTHLY_WAGE_CEILING);
+  const annualAmount = roundAmount(pfWageBase * 12 * (percent / 100));
+
+  return {
+    amount: annualAmount,
+    formula: `${percent}% of PF wage base (min(Basic monthly, ₹${PF_MONTHLY_WAGE_CEILING.toLocaleString("en-IN")}) × 12)`
+  };
 }
 
 function evaluateEmployerEsi(component, context) {
@@ -123,6 +139,10 @@ function evaluateComponentAmount(component, context) {
       };
 
     case "PERCENT_OF_BASIC":
+      if (component.componentCode === "EMPLOYER_PF") {
+        return evaluateEmployerPf(component, context);
+      }
+
       return {
         amount: roundAmount(
           (context.basicAmount * Number(component.formulaValue || 0)) / 100
@@ -344,5 +364,7 @@ module.exports = {
   evaluateStructure,
   evaluateStructureForOffer,
   isEvaluationEnabled,
-  ESI_MONTHLY_WAGE_THRESHOLD
+  ESI_MONTHLY_WAGE_THRESHOLD,
+  PF_MONTHLY_WAGE_CEILING,
+  EMPLOYER_PF_RATE_PERCENT
 };

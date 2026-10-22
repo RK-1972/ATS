@@ -4,7 +4,7 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/clien
 
 const offerLetterRepository = require("../repositories/offerLetterRepository");
 const offerLetterValidation = require("./offerLetterValidation");
-const salaryCalculationService = require("./salaryCalculationService");
+const compensationLetterBridgeService = require("./compensationLetterBridgeService");
 const offerLetterGenerationService = require("./offerLetterGenerationService");
 const { userContext } = require("./enterpriseAuditService");
 
@@ -142,7 +142,8 @@ async function aggregateDetailTotalsFromPersistedCtc(persistedRows) {
     };
   }
 
-  const aggregated = salaryCalculationService.aggregatePersistedRows(persistedRows);
+  const aggregated =
+    compensationLetterBridgeService.aggregatePersistedLetterRows(persistedRows);
 
   return {
     structureName: aggregated.structureName,
@@ -392,7 +393,7 @@ async function getOfferLetterDetail(pool, offerId, req) {
   return buildOfferLetterItem(pool, row);
 }
 
-async function generateOfferLetter(pool, offerId, payload, req) {
+async function generateOfferLetter(pool, offerId, _payload, req) {
   const row = await offerLetterRepository.findOfferLetterDetail(pool, offerId);
 
   if (!row) {
@@ -404,56 +405,22 @@ async function generateOfferLetter(pool, offerId, payload, req) {
 
   offerLetterValidation.assertAwaitingLetterOperations(row);
 
-  const normalizedComponents = normalizeIncomingComponents(payload?.ctcBreakup);
-  const totals = calculateTotals(normalizedComponents);
-  const annualCtc = Number(row.offered_ctc || 0);
-
-  if (Math.abs(totals.totalCtc - annualCtc) > 0.01) {
-    throw httpError(
-      `Total CTC (${totals.totalCtc}) must equal Annual CTC (${annualCtc}).`,
-      400
-    );
-  }
-
-  const detail = mapDetailResponse(row, normalizedComponents);
-  const pdfBuffer = await buildOfferLetterPdf(detail, totals);
-  const pdfPath = await uploadOfferLetterPdf(pdfBuffer, offerId);
-
-  let letter =
-    row.letter_id &&
-    (await offerLetterRepository.findLetterByOfferId(pool, offerId));
-
-  if (!letter) {
-    letter = await offerLetterRepository.insertLetter(pool, {
-      letter_id: `OL-${offerId}`,
-      offer_id: offerId,
-      template_name: payload?.templateName || "Standard Offer Letter",
-      status: "Awaiting Letter"
-    });
-  }
-
-  await offerLetterRepository.replaceCtcComponents(
+  const generated = await offerLetterGenerationService.generateOfferLetterDocument(
     pool,
-    letter.letter_id,
-    normalizedComponents
-  );
-
-  const actor = userContext(req);
-  const generated = await offerLetterRepository.markLetterGenerated(
-    pool,
-    letter.letter_id,
-    actor.name || "system"
+    offerId,
+    req
   );
 
   return {
-    letterId: generated.letter_id,
-    offerId,
-    status: generated.status,
-    pdfPath: generated.pdf_path,
-    generatedOn: generated.generated_on?.toISOString?.() || generated.generated_on,
-    gross: totals.gross,
-    totalCtc: totals.totalCtc,
-    ctcBreakup: totals.components
+    offerId: generated.offerId || offerId,
+    status: "Generated",
+    pdfPath: generated.pdfPath,
+    pdfGenerated: generated.pdfGenerated,
+    documents: generated.documents,
+    gross: generated.salaryBreakup?.grossAnnual ?? null,
+    totalCtc: generated.salaryBreakup?.totalCTC ?? null,
+    salaryBreakup: generated.salaryBreakup,
+    deprecatedLegacyEnvelope: true
   };
 }
 

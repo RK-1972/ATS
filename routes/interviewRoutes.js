@@ -95,6 +95,15 @@ function registerInterviewRoutes(app, pool, verifyToken, scheduleIntegrations = 
     }
   });
 
+  app.post("/api/v1/interviews/:id/cancel", verifyToken, async (req, res) => {
+    try {
+      const result = await interviewService.cancelInterview(pool, req.params.id, req.body, req);
+      res.json({ success: true, ...result });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
   app.post("/api/v1/interviews/:id/complete", verifyToken, async (req, res) => {
     try {
       const result = await interviewService.completeInterview(
