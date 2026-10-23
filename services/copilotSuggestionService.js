@@ -187,7 +187,7 @@ async function buildPersonalizedSuggestions(pool, req) {
   }
 
   const userResult = await pool.query(
-    `SELECT employee_code, email_id, role_name, full_name, is_active
+    `SELECT employee_code, email_id, role_name, secondary_role, full_name, is_active
      FROM user_mstr
      WHERE employee_code = $1
      LIMIT 1`,
@@ -224,8 +224,11 @@ async function buildPersonalizedSuggestions(pool, req) {
 
   const interviewerRows = await loadInterviewerPanelRows(pool, employeeCode);
   const hasInterviewerPanel = interviewerRows.length > 0;
+  const primaryRole = String(userRow.role_name || "").trim();
   const isInterviewerScope =
-    workspace.showInterviewWorkspace === true || hasInterviewerPanel;
+    workspace.showInterviewWorkspace === true ||
+    hasInterviewerPanel ||
+    primaryRole === "Interviewer";
 
   const todayCount = filterInterviewsToday(interviewerRows).length;
   const pendingFeedbackCount = filterInterviewsPendingFeedback(interviewerRows).length;
@@ -234,16 +237,12 @@ async function buildPersonalizedSuggestions(pool, req) {
 
   const ids = [];
 
-  if (isInterviewerScope && todayCount > 0) {
-    ids.push("my-interviews-today");
-  }
-
-  if (isInterviewerScope && pendingFeedbackCount > 0) {
-    ids.push("my-pending-interview-feedback");
-  }
-
-  if (isInterviewerScope && upcomingCount > 0) {
-    ids.push("my-upcoming-interviews");
+  if (isInterviewerScope) {
+    ids.push(
+      "my-interviews-today",
+      "my-pending-interview-feedback",
+      "my-upcoming-interviews"
+    );
   }
 
   if (canTaLeadOperate) {

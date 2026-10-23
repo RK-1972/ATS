@@ -388,7 +388,42 @@ describe("copilotSuggestionService", () => {
     const ids = result.suggestions.map((s) => s.id);
     assert.ok(ids.includes("conduct-interview"));
     assert.ok(ids.includes("my-upcoming-interviews"));
-    assert.equal(ids.includes("my-interviews-today"), false);
+    assert.ok(ids.includes("my-interviews-today"));
+    assert.ok(ids.includes("my-pending-interview-feedback"));
+  });
+
+  it("includes interviewer navigation actions when in scope even with zero matching interviews", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: { showInterviewWorkspace: true }
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
+      throw new Error("denied");
+    });
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("INT-EMPTY", {
+      role_name: "Interviewer",
+      __hasPanel: true,
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "INT-EMPTY", role_name: "Interviewer" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("my-interviews-today"));
+    assert.ok(ids.includes("my-pending-interview-feedback"));
+    assert.ok(ids.includes("my-upcoming-interviews"));
+    assert.equal(ids.includes("conduct-interview"), false);
   });
 
   it("includes interviewer-focused actions when panel rows match filters", async () => {
