@@ -8,6 +8,7 @@ const legacyOperationalAdapter = require("../services/legacyOperationalAdapter")
 const workspaceResolverService = require("../services/workspaceResolverService");
 
 const copilotSuggestionService = require("../services/copilotSuggestionService");
+const { getBusinessCalendarDateKey } = require("../utils/optalynxBusinessTimezone");
 
 function activeUserRow(employeeCode, overrides = {}) {
   return {
@@ -43,7 +44,27 @@ function mockPoolForUser(userRow) {
   };
 }
 
+const BASELINE_PHRASES = {
+  requisitions: "Show My Requisitions",
+  candidates: "Show Java Candidates",
+  interview: "Schedule Interview",
+  "todays-interviews": "Show Today's Interviews",
+  "assign-recruiter": "Assign Recruiter",
+  "map-candidate": "Map Candidate",
+  "conduct-interview": "Conduct Interview"
+};
+
 describe("copilotSuggestionService", () => {
+  it("preserves legacy V1 action ids and input phrases", () => {
+    for (const id of copilotSuggestionService.LEGACY_COPILOT_ACTION_IDS) {
+      assert.ok(copilotSuggestionService.COPILOT_ACTION_IDS.includes(id));
+      assert.equal(
+        copilotSuggestionService.ACTION_INPUT_TEXT[id],
+        BASELINE_PHRASES[id]
+      );
+    }
+  });
+
   it("defines inputText for every supported action id", () => {
     for (const id of copilotSuggestionService.COPILOT_ACTION_IDS) {
       assert.ok(
@@ -343,8 +364,15 @@ describe("copilotSuggestionService", () => {
     mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
       throw new Error("denied");
     });
+    const tomorrowDate = new Date(Date.now() + 86400000);
+    const tomorrow = getBusinessCalendarDateKey(tomorrowDate);
+
     mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => [
-      { interview_status: "Scheduled", feedback_submitted: false }
+      {
+        interview_date: tomorrow,
+        interview_status: "Scheduled",
+        feedback_submitted: false
+      }
     ]);
 
     const userRow = activeUserRow("INT-2", {
@@ -357,9 +385,253 @@ describe("copilotSuggestionService", () => {
       user: { employee_code: "INT-2", role_name: "Interviewer" }
     });
 
-    assert.deepEqual(
-      result.suggestions.map((s) => s.id),
-      ["conduct-interview"]
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("conduct-interview"));
+    assert.ok(ids.includes("my-upcoming-interviews"));
+    assert.equal(ids.includes("my-interviews-today"), false);
+  });
+
+  it("includes interviewer-focused actions when panel rows match filters", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: { showInterviewWorkspace: true }
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
     );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
+      throw new Error("denied");
+    });
+    const today = getBusinessCalendarDateKey(new Date());
+    const tomorrow = getBusinessCalendarDateKey(new Date(Date.now() + 86400000));
+
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => [
+      {
+        interview_date: today,
+        interview_status: "Scheduled",
+        feedback_submitted: false
+      },
+      {
+        interview_date: tomorrow,
+        interview_status: "Scheduled",
+        feedback_submitted: false
+      }
+    ]);
+
+    const userRow = activeUserRow("INT-3", {
+      role_name: "Interviewer",
+      __hasPanel: true,
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "INT-3", role_name: "Interviewer" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("my-interviews-today"));
+    assert.ok(ids.includes("my-upcoming-interviews"));
+    assert.ok(ids.includes("conduct-interview"));
+  });
+
+  it("excludes TA Lead actions when operator authorization is denied", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: {}
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
+      throw new Error("denied");
+    });
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("REC-NO-TA", {
+      role_name: "Recruiter",
+      __assignmentCount: 1
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "REC-NO-TA", role_name: "Recruiter" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.equal(ids.includes("ta-lead-team-requisitions"), false);
+    assert.equal(ids.includes("ta-lead-recruiter-workload"), false);
+    assert.equal(ids.includes("ta-lead-recruitment-bottlenecks"), false);
+    assert.ok(ids.includes("requisitions"));
+  });
+
+  it("includes TA Lead actions for TA Leader role via workspace flag", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: {}
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
+      throw new Error("denied");
+    });
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("TL-LEADER-1", {
+      role_name: "TA Leader",
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "TL-LEADER-1", role_name: "TA Leader" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("ta-lead-team-requisitions"));
+    assert.ok(ids.includes("ta-lead-recruitment-bottlenecks"));
+  });
+
+  it("includes TA Lead actions only when operator authorization passes", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: {}
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {});
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("TL-1", {
+      role_name: "TA Lead",
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "TL-1", role_name: "TA Lead" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("ta-lead-team-requisitions"));
+    assert.ok(ids.includes("ta-lead-recruiter-workload"));
+    assert.ok(ids.includes("ta-lead-recruitment-bottlenecks"));
+    assert.equal(new Set(ids).size, ids.length);
+  });
+
+  it("excludes admin navigation actions for non-Admin multi-role users", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: { showRecruitmentWorkspace: true, showInterviewWorkspace: true }
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {});
+    const today = getBusinessCalendarDateKey(new Date());
+
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => [
+      {
+        interview_date: today,
+        interview_status: "Scheduled",
+        feedback_submitted: false
+      }
+    ]);
+
+    const userRow = activeUserRow("REC-INT-1", {
+      role_name: "Recruiter",
+      __hasPanel: true,
+      __assignmentCount: 2
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "REC-INT-1", role_name: "Recruiter" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("requisitions"));
+    assert.ok(ids.includes("my-interviews-today"));
+    assert.equal(ids.includes("admin-operational-exceptions"), false);
+    assert.equal(ids.includes("admin-manage-compensation-structures"), false);
+    assert.equal(ids.includes("admin-employee-responsibility-clearance"), false);
+  });
+
+  it("includes admin navigation actions only for Admin role", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: {}
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {
+      throw new Error("denied");
+    });
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("ADM-1", {
+      role_name: "Admin",
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "ADM-1", role_name: "Admin" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("admin-employee-responsibility-clearance"));
+    assert.ok(ids.includes("admin-manage-compensation-structures"));
+    assert.ok(ids.includes("admin-operational-exceptions"));
+  });
+
+  it("does not include admin navigation actions for TA Lead without Admin role", async () => {
+    mock.method(workspaceResolverService, "resolveWorkspace", async () => ({
+      workspace: {}
+    }));
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+    mock.method(
+      hiringManagerIdentityService,
+      "resolveBoundHiringManager",
+      async () => {
+        throw new Error("no hm");
+      }
+    );
+    mock.method(requisitionCapabilityAuth, "assertCanAssignRecruiters", async () => {});
+    mock.method(legacyOperationalAdapter, "listMyInterviewsForLegacyApi", async () => []);
+
+    const userRow = activeUserRow("TL-NO-ADMIN", {
+      role_name: "TA Lead",
+      __assignmentCount: 0
+    });
+    const pool = mockPoolForUser(userRow);
+    const result = await copilotSuggestionService.buildPersonalizedSuggestions(pool, {
+      user: { employee_code: "TL-NO-ADMIN", role_name: "TA Lead" }
+    });
+
+    const ids = result.suggestions.map((s) => s.id);
+    assert.ok(ids.includes("ta-lead-team-requisitions"));
+    assert.equal(ids.includes("admin-operational-exceptions"), false);
   });
 });

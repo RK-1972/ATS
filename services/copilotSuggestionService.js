@@ -8,8 +8,14 @@ const workspaceResolverService = require("./workspaceResolverService");
 const hiringManagerIdentityService = require("./hiringManagerIdentityService");
 const { assertCanAssignRecruiters } = require("./requisitionCapabilityAuth");
 const legacyOperationalAdapter = require("./legacyOperationalAdapter");
+const {
+  filterInterviewsToday,
+  filterInterviewsPendingFeedback,
+  filterInterviewsUpcoming
+} = require("./copilotInterviewFilters");
 
-const COPILOT_ACTION_IDS = Object.freeze([
+/** Regression baseline — original V1 quick-action ids and phrases (must not change). */
+const LEGACY_COPILOT_ACTION_IDS = Object.freeze([
   "requisitions",
   "candidates",
   "interview",
@@ -19,7 +25,33 @@ const COPILOT_ACTION_IDS = Object.freeze([
   "conduct-interview"
 ]);
 
+const ROLE_FOCUSED_ACTION_IDS = Object.freeze([
+  "my-interviews-today",
+  "my-pending-interview-feedback",
+  "my-upcoming-interviews",
+  "ta-lead-team-requisitions",
+  "ta-lead-recruiter-workload",
+  "ta-lead-recruitment-bottlenecks",
+  "admin-employee-responsibility-clearance",
+  "admin-manage-compensation-structures",
+  "admin-operational-exceptions"
+]);
+
+const COPILOT_ACTION_IDS = Object.freeze([
+  ...ROLE_FOCUSED_ACTION_IDS,
+  ...LEGACY_COPILOT_ACTION_IDS
+]);
+
 const ACTION_INPUT_TEXT = Object.freeze({
+  "my-interviews-today": "Open My Interviews Today",
+  "my-pending-interview-feedback": "Open My Pending Interview Feedback",
+  "my-upcoming-interviews": "Open My Upcoming Interviews",
+  "ta-lead-team-requisitions": "Open My Team Requisitions",
+  "ta-lead-recruiter-workload": "Open Recruiter Workload",
+  "ta-lead-recruitment-bottlenecks": "Open Recruitment Bottlenecks",
+  "admin-employee-responsibility-clearance": "Open Employee Responsibility Clearance",
+  "admin-manage-compensation-structures": "Open Manage Compensation Structures",
+  "admin-operational-exceptions": "Open Operational Exceptions",
   requisitions: "Show My Requisitions",
   candidates: "Show Java Candidates",
   interview: "Schedule Interview",
@@ -112,7 +144,7 @@ async function canAssignRecruiters(pool, req) {
   }
 }
 
-async function countConductActionableInterviews(pool, employeeCode) {
+async function loadInterviewerPanelRows(pool, employeeCode) {
   const panelResult = await pool.query(
     `SELECT panel_id
      FROM interview_panel_mstr
@@ -123,16 +155,21 @@ async function countConductActionableInterviews(pool, employeeCode) {
   );
 
   if (!panelResult.rows.length) {
-    return 0;
+    return [];
   }
 
   const panelId = panelResult.rows[0].panel_id;
-  const rows = await legacyOperationalAdapter.listMyInterviewsForLegacyApi(
-    pool,
-    panelId
-  );
 
+  return legacyOperationalAdapter.listMyInterviewsForLegacyApi(pool, panelId);
+}
+
+async function countConductActionableInterviews(pool, employeeCode) {
+  const rows = await loadInterviewerPanelRows(pool, employeeCode);
   return filterConductActionableInterviews(rows).length;
+}
+
+function dedupeIds(ids) {
+  return [...new Set(ids)].filter((id) => COPILOT_ACTION_IDS.includes(id));
 }
 
 /**
@@ -182,13 +219,45 @@ async function buildPersonalizedSuggestions(pool, req) {
     isAdmin;
 
   const canAssign = await canAssignRecruiters(pool, req);
+  const canTaLeadOperate =
+    workspace.showTaLeadWorkspace === true || (await canAssignRecruiters(pool, req));
 
-  const conductCount = await countConductActionableInterviews(
-    pool,
-    employeeCode
-  );
+  const interviewerRows = await loadInterviewerPanelRows(pool, employeeCode);
+  const hasInterviewerPanel = interviewerRows.length > 0;
+  const isInterviewerScope =
+    workspace.showInterviewWorkspace === true || hasInterviewerPanel;
+
+  const todayCount = filterInterviewsToday(interviewerRows).length;
+  const pendingFeedbackCount = filterInterviewsPendingFeedback(interviewerRows).length;
+  const upcomingCount = filterInterviewsUpcoming(interviewerRows).length;
+  const conductCount = filterConductActionableInterviews(interviewerRows).length;
 
   const ids = [];
+
+  if (isInterviewerScope && todayCount > 0) {
+    ids.push("my-interviews-today");
+  }
+
+  if (isInterviewerScope && pendingFeedbackCount > 0) {
+    ids.push("my-pending-interview-feedback");
+  }
+
+  if (isInterviewerScope && upcomingCount > 0) {
+    ids.push("my-upcoming-interviews");
+  }
+
+  if (canTaLeadOperate) {
+    ids.push("ta-lead-team-requisitions", "ta-lead-recruiter-workload");
+    ids.push("ta-lead-recruitment-bottlenecks");
+  }
+
+  if (isAdmin) {
+    ids.push(
+      "admin-employee-responsibility-clearance",
+      "admin-manage-compensation-structures",
+      "admin-operational-exceptions"
+    );
+  }
 
   if (isRecruitment) {
     ids.push("requisitions");
@@ -210,7 +279,6 @@ async function buildPersonalizedSuggestions(pool, req) {
     ids.push("assign-recruiter");
   }
 
-  // Map flow lists GET /my-requisitions for the authenticated recruiter only.
   if (recruiterAssignmentCount > 0) {
     ids.push("map-candidate");
   }
@@ -219,9 +287,7 @@ async function buildPersonalizedSuggestions(pool, req) {
     ids.push("conduct-interview");
   }
 
-  const uniqueIds = [...new Set(ids)].filter((id) =>
-    COPILOT_ACTION_IDS.includes(id)
-  );
+  const uniqueIds = dedupeIds(ids);
 
   const suggestions = uniqueIds.map((id) => ({
     id,
@@ -234,12 +300,17 @@ async function buildPersonalizedSuggestions(pool, req) {
     meta: {
       generated_at: new Date().toISOString(),
       recruiter_assignment_count: recruiterAssignmentCount,
-      conduct_interview_count: conductCount
+      conduct_interview_count: conductCount,
+      interviewer_today_count: todayCount,
+      interviewer_pending_feedback_count: pendingFeedbackCount,
+      interviewer_upcoming_count: upcomingCount
     }
   };
 }
 
 module.exports = {
+  LEGACY_COPILOT_ACTION_IDS,
+  ROLE_FOCUSED_ACTION_IDS,
   COPILOT_ACTION_IDS,
   ACTION_INPUT_TEXT,
   buildPersonalizedSuggestions,
