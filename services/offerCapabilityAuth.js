@@ -79,16 +79,16 @@ async function assertCanWriteOfferRecord(pool, req, offerId) {
 }
 
 /**
- * Allow only when the logged-in user has an active Work Assignment that
- * resolves showOfferWorkspace via master workspace_flag metadata.
+ * Same predicate as Offer Letter routes (`requireOfferWorkspace`) and POST /api/v1/offers:
+ * active employee assignment whose master resolves `showOfferWorkspace`.
  */
-async function assertCanAccessOfferWorkspace(pool, req) {
+async function hasOfferWorkspaceAccess(pool, req) {
   const employeeCode = req.user?.employee_code
     ? String(req.user.employee_code).trim()
     : "";
 
   if (!employeeCode) {
-    throw authError(DENIED_MESSAGE);
+    return false;
   }
 
   const assignments = await workAssignmentService.getEmployeeWorkAssignments(
@@ -97,7 +97,15 @@ async function assertCanAccessOfferWorkspace(pool, req) {
   );
   const workspace = resolveWorkspaceFlagsFromAssignments(assignments);
 
-  if (!workspace[OFFER_WORKSPACE_FLAG]) {
+  return Boolean(workspace[OFFER_WORKSPACE_FLAG]);
+}
+
+/**
+ * Allow only when the logged-in user has an active Work Assignment that
+ * resolves showOfferWorkspace via master workspace_flag metadata.
+ */
+async function assertCanAccessOfferWorkspace(pool, req) {
+  if (!(await hasOfferWorkspaceAccess(pool, req))) {
     throw authError(DENIED_MESSAGE);
   }
 }
@@ -164,6 +172,7 @@ async function assertCanSubmitOfferClarification(pool, req, offerId) {
 
 module.exports = {
   OFFER_WORKSPACE_FLAG,
+  hasOfferWorkspaceAccess,
   assertCanAccessOfferWorkspace,
   requireOfferWorkspace,
   assertCanWriteOfferRecord,

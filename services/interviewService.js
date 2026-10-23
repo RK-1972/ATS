@@ -5,6 +5,8 @@ const taskService = require("./taskService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 const { isLegacyDualWriteEnabled, isEnterpriseOperationalSor } = require("../config/operationalCutover");
 const { normalizeRating, formatRatingLabel } = require("./operationalMigrationService");
+const interviewRepeatStageService = require("./interviewRepeatStageService");
+const interviewFeedbackConfidentialityService = require("./interviewFeedbackConfidentialityService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "interviews.seed.json");
 
@@ -321,14 +323,25 @@ async function getInterviewBundle(pool, req) {
   }
 
   const interviewRows = await listScopedInterviewRows(pool, req);
-  const interviewIds = interviewRows.map((row) => row.interview_id);
+  const canReadHr =
+    await interviewFeedbackConfidentialityService.canReadHrInterviewFeedback(pool, req);
+  const bundleRows = interviewRows.map((row) =>
+    interviewFeedbackConfidentialityService.redactHrInterviewEnterpriseRow(row, canReadHr)
+  );
+  const interviewIds = bundleRows.map((row) => row.interview_id);
   const panelRows = await listScopedPanelAssignmentRows(pool, req, interviewIds);
 
-  return {
-    interviews: interviewRows.map(mapInterviewRow),
-    panelAssignments: panelRows,
-    summary: buildInterviewBundleSummary(interviewRows)
-  };
+  const interviews = bundleRows.map(mapInterviewRow);
+
+  return interviewFeedbackConfidentialityService.sanitizeInterviewBundleForCaller(
+    pool,
+    req,
+    {
+      interviews,
+      panelAssignments: panelRows,
+      summary: buildInterviewBundleSummary(bundleRows)
+    }
+  );
 }
 
 async function scheduleInterview(pool, payload, req) {
@@ -339,7 +352,6 @@ async function scheduleInterview(pool, payload, req) {
   const {
     map_id: mapId,
     interviewer_id: interviewerId,
-    round_no: roundNo = 1,
     round_type: roundType,
     interview_date: interviewDate,
     interview_time: interviewTime,
@@ -421,6 +433,20 @@ async function scheduleInterview(pool, payload, req) {
     }
   }
 
+  const { repeatMetadata } = await interviewRepeatStageService.assertRepeatScheduleAuthorized(
+    pool,
+    req,
+    mapId,
+    roundType,
+    payload
+  );
+
+  const roundNo = await interviewRepeatStageService.allocateSessionRoundNo(
+    pool,
+    mapId,
+    roundType
+  );
+
   const ruleEval = await evaluateInterviewRules(pool, {
     round_type: roundType,
     department: payload.department,
@@ -484,7 +510,7 @@ async function scheduleInterview(pool, payload, req) {
       "Scheduled",
       instance.instanceId,
       remarks || null,
-      user.name,
+      user.employeeCode || user.name,
       user.name,
       new Date()
     ]
@@ -543,7 +569,8 @@ async function scheduleInterview(pool, payload, req) {
     user.name,
     null,
     "Scheduled",
-    remarks
+    repeatMetadata?.repeatReason || remarks,
+    repeatMetadata || null
   );
 
   await writeEnterpriseAudit(pool, {
@@ -763,7 +790,10 @@ async function scheduleInterviewCanonical(pool, body, req, helpers = {}) {
         body.req_id,
         body.map_id,
         body.interviewer_id,
-        body.round_no || 1,
+        enterprise.interview?.roundNo
+          || enterprise.interview?.round_no
+          || body.round_no
+          || 1,
         body.round_type,
         body.interview_date,
         body.interview_time,
@@ -1017,7 +1047,16 @@ async function getInterviewForRequest(pool, interviewId, req) {
   }
 
   await assertInterviewReadAccess(pool, req, row);
-  return mapInterviewRow(row);
+  const canReadHr =
+    await interviewFeedbackConfidentialityService.canReadHrInterviewFeedback(pool, req);
+  const redacted = interviewFeedbackConfidentialityService.redactHrInterviewEnterpriseRow(
+    row,
+    canReadHr
+  );
+  return interviewFeedbackConfidentialityService.redactHrInterviewBundleDto(
+    mapInterviewRow(redacted),
+    canReadHr
+  );
 }
 
 async function getInterview(pool, interviewId) {
@@ -1624,6 +1663,49 @@ async function assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewI
   );
 }
 
+async function assertInterviewFeedbackReadAccess(pool, req, { scheduleId, interviewId } = {}) {
+  try {
+    await assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewId });
+  } catch (error) {
+    if (error.status !== 403) {
+      throw error;
+    }
+
+    const mayReadHr =
+      await interviewFeedbackConfidentialityService.canReadHrInterviewFeedback(
+        pool,
+        req
+      );
+
+    if (!mayReadHr) {
+      throw error;
+    }
+
+    const context = await resolveInterviewScheduleContext(pool, {
+      scheduleId,
+      interviewId
+    });
+
+    if (!context) {
+      throw error;
+    }
+
+    const recruitmentService = require("./recruitmentService");
+
+    if (!context.map_id) {
+      throw error;
+    }
+
+    await recruitmentService.assertAuthorizedMappingAccess(pool, req, context.map_id);
+  }
+
+  await interviewFeedbackConfidentialityService.assertInterviewFeedbackConfidentiality(
+    pool,
+    req,
+    { scheduleId, interviewId }
+  );
+}
+
 async function submitFeedback(pool, payload, req) {
   const user = userContext(req);
   const platformConfig = await loadPlatformConfig(pool);
@@ -1777,7 +1859,7 @@ async function getFeedbackBySchedule(pool, scheduleId, req) {
     throw httpError("schedule_id is required.", 400);
   }
 
-  await assertInterviewFeedbackAccess(pool, req, { scheduleId });
+  await assertInterviewFeedbackReadAccess(pool, req, { scheduleId });
 
   const result = await pool.query(
     `
@@ -1970,34 +2052,126 @@ async function syncLegacyFeedback(pool, interview, payload, user, req) {
       );
     }
 
-    if (newStage && interview.mapId && (await tableExists(pool, "candidate_req_map"))) {
-      await pool.query(
-        "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
-        [newStage, interview.mapId]
+    if (
+      newStage
+      && interview.mapId
+      && (await tableExists(pool, "candidate_req_map"))
+    ) {
+      const legacyMap = await pool.query(
+        "SELECT stage_name FROM candidate_req_map WHERE map_id = $1 LIMIT 1",
+        [interview.mapId]
       );
+      const legacyStageName = legacyMap.rows[0]?.stage_name || null;
+      const interviewRoundType = payload.interview_level || interview.roundType;
+
+      const legacySessions = await interviewRepeatStageService.listInterviewsForMap(
+        pool,
+        interview.mapId
+      );
+      const legacyAppliesRank = interviewRepeatStageService
+        .shouldApplyPipelineStageFromInterviewFeedback(
+          legacyStageName,
+          interviewRoundType
+        );
+      const legacyIsCurrentDecision = interviewRepeatStageService
+        .isInterviewCurrentStageDecision(
+          legacySessions.find((row) => row.interview_id === interview.interviewId)
+            || {
+              interview_id: interview.interviewId,
+              round_type: interviewRoundType,
+              feedback_submitted: true,
+              final_outcome: payload.final_outcome,
+              interview_status: "Completed"
+            },
+          legacySessions
+        );
+
+      if (legacyAppliesRank && legacyIsCurrentDecision) {
+        await pool.query(
+          "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
+          [newStage, interview.mapId]
+        );
+      }
     }
   }
 
   if (newStage && interview.mapId && isEnterpriseOperationalSor()) {
     const recruitmentService = require("./recruitmentService");
-    await recruitmentService.applyGovernedCandidateStageTransition(
-      pool,
-      interview.mapId,
-      newStage,
-      payload.overall_comments || "",
-      req,
-      {
-        pipelineEventType: "InterviewOutcomeStage",
-        skipIfUnchanged: true,
-        useOperationalStageName: true,
-        historyMetadata: {
-          interviewId: interview.interviewId,
-          scheduleId,
-          interviewLevel: payload.interview_level,
-          finalOutcome: payload.final_outcome
-        }
-      }
+    const mappingStageResult = await pool.query(
+      `SELECT stage_name
+       FROM rm_candidate_mappings
+       WHERE map_id = $1 AND is_active = true
+       LIMIT 1`,
+      [interview.mapId]
     );
+    const mappingStageName = mappingStageResult.rows[0]?.stage_name || null;
+    const interviewRoundType = payload.interview_level || interview.roundType;
+    const allSessions = await interviewRepeatStageService.listInterviewsForMap(
+      pool,
+      interview.mapId
+    );
+    const shouldApplyPipeline = interviewRepeatStageService
+      .shouldApplyPipelineStageFromInterviewFeedback(
+        mappingStageName,
+        interviewRoundType
+      );
+    const isCurrentStageDecision = interviewRepeatStageService
+      .isInterviewCurrentStageDecision(
+        allSessions.find((row) => row.interview_id === interview.interviewId)
+          || {
+            interview_id: interview.interviewId,
+            round_type: interviewRoundType,
+            feedback_submitted: true,
+            final_outcome: payload.final_outcome,
+            interview_status: "Completed",
+            modified_on: new Date()
+          },
+        allSessions
+      );
+
+    if (shouldApplyPipeline && isCurrentStageDecision) {
+      await recruitmentService.applyGovernedCandidateStageTransition(
+        pool,
+        interview.mapId,
+        newStage,
+        payload.overall_comments || "",
+        req,
+        {
+          pipelineEventType: "InterviewOutcomeStage",
+          skipIfUnchanged: true,
+          useOperationalStageName: true,
+          historyMetadata: {
+            interviewId: interview.interviewId,
+            scheduleId,
+            interviewLevel: payload.interview_level,
+            finalOutcome: payload.final_outcome,
+            stageBucket: interviewRepeatStageService.resolveInterviewStageBucket(
+              interviewRoundType
+            )
+          }
+        }
+      );
+    } else {
+      await writeEnterpriseAudit(pool, {
+        eventType: "InterviewOutcomeStageSkipped",
+        module: "Interview Management",
+        entity: "Interview",
+        entityId: interview.interviewId,
+        action: !shouldApplyPipeline
+          ? "Interview feedback recorded without pipeline regression on advanced stage"
+          : "Interview feedback recorded without pipeline update for non-current stage decision",
+        userName: user.name,
+        userRole: user.role,
+        metadata: {
+          mappingStageName,
+          interviewRoundType,
+          resolvedOutcomeStage: newStage,
+          finalOutcome: payload.final_outcome,
+          shouldApplyPipeline,
+          isCurrentStageDecision
+        }
+      });
+    }
   }
 }
 
@@ -2209,6 +2383,7 @@ async function getFeedbackDetailsBySchedule(pool, scheduleId, req) {
     `
     SELECT
       ist.schedule_id,
+      ist.map_id,
       ist.round_type AS interview_level,
       cm.candidate_code,
       CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
@@ -2246,6 +2421,182 @@ async function getFeedbackDetailsBySchedule(pool, scheduleId, req) {
   }
 
   return result.rows[0];
+}
+
+async function listInterviewFeedbackSummariesForMap(pool, mapId, req, options = {}) {
+  const recruitmentService = require("./recruitmentService");
+  await recruitmentService.assertAuthorizedMappingAccess(pool, req, mapId);
+
+  const rows = await interviewFeedbackConfidentialityService.listInterviewRowsWithSchedulerForMap(
+    pool,
+    mapId
+  );
+
+  const recruiterSchedulerOnly =
+    options.recruiterSchedulerOnly
+    ?? (
+      interviewFeedbackConfidentialityService.isRecruiterUser(req)
+      && !isAdminUser(req)
+    );
+
+  return await interviewFeedbackConfidentialityService.buildFeedbackSummariesFromRows(
+    rows,
+    req,
+    { recruiterSchedulerOnly, pool }
+  );
+}
+
+async function getPermittedFeedbackHistoryForMap(pool, mapId, req, options = {}) {
+  const recruitmentService = require("./recruitmentService");
+  const anchorScheduleId = options.anchorScheduleId || null;
+
+  if (
+    interviewFeedbackConfidentialityService.isInterviewerUser(req)
+    && !isAdminUser(req)
+  ) {
+    if (!anchorScheduleId) {
+      throw httpError("anchor_schedule_id is required for interviewer feedback history.", 400);
+    }
+
+    await assertInterviewFeedbackAccess(pool, req, {
+      scheduleId: anchorScheduleId
+    });
+  } else {
+    await recruitmentService.assertAuthorizedMappingAccess(pool, req, mapId);
+  }
+
+  const rows = await interviewFeedbackConfidentialityService.listInterviewRowsWithSchedulerForMap(
+    pool,
+    mapId
+  );
+
+  const recruiterSchedulerOnly =
+    interviewFeedbackConfidentialityService.isRecruiterUser(req)
+    && !isAdminUser(req);
+
+  const summaries = await interviewFeedbackConfidentialityService.buildFeedbackSummariesFromRows(
+    rows,
+    req,
+    { recruiterSchedulerOnly, pool }
+  );
+
+  const currentScheduleId = anchorScheduleId
+    ? String(anchorScheduleId)
+    : null;
+
+  return summaries
+    .filter((row) => row.hasFeedbackRecord)
+    .filter((row) => {
+      if (!currentScheduleId) {
+        return true;
+      }
+
+      return String(row.scheduleId) !== currentScheduleId;
+    });
+}
+
+async function listRecruiterScheduledFeedbackHistory(pool, req) {
+  if (
+    !interviewFeedbackConfidentialityService.isRecruiterUser(req)
+    && !isAdminUser(req)
+  ) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to view recruiter scheduled feedback history.",
+      403
+    );
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  const user = userContext(req);
+
+  if (!employeeCode && !user.name) {
+    return [];
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      i.interview_id,
+      i.schedule_id,
+      i.map_id,
+      i.round_no,
+      i.round_type,
+      i.interview_date,
+      i.interview_time,
+      i.interview_status,
+      i.feedback_submitted,
+      i.final_outcome,
+      i.created_by,
+      i.created_on,
+      i.modified_on,
+      ist.created_by AS schedule_created_by,
+      f.feedback_id,
+      f.final_outcome AS feedback_outcome,
+      f.submitted_on,
+      cm.candidate_code,
+      CONCAT(cm.first_name, ' ', cm.last_name) AS candidate_name,
+      COALESCE(rr.requisition_code, rm.req_code) AS req_code
+    FROM im_interviews i
+    INNER JOIN rm_candidate_mappings rcm
+      ON rcm.map_id = i.map_id
+     AND rcm.is_active = true
+    INNER JOIN cand_mstr cm ON cm.candidate_id = rcm.candidate_id
+    LEFT JOIN interview_schedule_trn ist ON ist.schedule_id = i.schedule_id
+    LEFT JOIN rm_requisitions rr ON rr.req_id = i.req_id
+    LEFT JOIN req_mstr rm ON rm.req_id = i.req_id
+    LEFT JOIN LATERAL (
+      SELECT feedback_id, final_outcome, submitted_on
+      FROM im_feedback
+      WHERE interview_id = i.interview_id
+      ORDER BY feedback_id DESC
+      LIMIT 1
+    ) f ON TRUE
+    WHERE f.feedback_id IS NOT NULL
+      AND (
+        $1::boolean = true
+        OR (
+          EXISTS (
+            SELECT 1
+            FROM rm_recruiter_assignments a
+            WHERE a.is_active = true
+              AND a.recruiter_code = $2
+              AND (
+                a.requisition_code = rcm.requisition_code
+                OR a.req_id = i.req_id
+              )
+          )
+          AND (
+            i.created_by = $2
+            OR i.created_by = $3
+            OR ist.created_by = $2
+          )
+        )
+      )
+    ORDER BY f.submitted_on DESC NULLS LAST, i.created_on DESC
+    `,
+    [
+      isAdminUser(req),
+      employeeCode || null,
+      user.name || null
+    ]
+  );
+
+  const summaries = await interviewFeedbackConfidentialityService.buildFeedbackSummariesFromRows(
+    result.rows,
+    req,
+    {
+      recruiterSchedulerOnly: !isAdminUser(req),
+      pool
+    }
+  );
+
+  return summaries.map((row, index) => ({
+    ...row,
+    mapId: result.rows[index]?.map_id || null,
+    candidateCode: result.rows[index]?.candidate_code || null,
+    candidateName: result.rows[index]?.candidate_name || null,
+    reqCode: result.rows[index]?.req_code || null
+  }));
 }
 
 async function getInterviewProgressByMapId(pool, mapId, req) {
@@ -2367,8 +2718,48 @@ async function getInterviewProgressByMapId(pool, mapId, req) {
     interviewerName: row.interviewer_name || null,
     assignmentStatus: row.assignment_status || null,
     remarks: row.remarks || null,
-    actionOn: row.modified_on || null
+    actionOn: row.modified_on || null,
+    createdOn: row.created_on || null
   }));
+
+  const stageGroups = await interviewRepeatStageService.buildInterviewProgressStageGroups(
+    pool,
+    normalizedMapId,
+    rounds
+  );
+
+  const schedulerRows =
+    await interviewFeedbackConfidentialityService.listInterviewRowsWithSchedulerForMap(
+      pool,
+      normalizedMapId
+    );
+
+  const recruiterSchedulerOnly =
+    interviewFeedbackConfidentialityService.isRecruiterUser(req)
+    && !isAdminUser(req);
+
+  const filteredStageGroups =
+    await interviewFeedbackConfidentialityService.filterStageGroupsForCaller(
+      stageGroups,
+      req,
+      schedulerRows,
+      { recruiterSchedulerOnly, pool }
+    );
+
+  const filteredRounds =
+    await interviewFeedbackConfidentialityService.filterProgressRoundsForCaller(
+      rounds,
+      req,
+      schedulerRows,
+      { recruiterSchedulerOnly, pool }
+    );
+
+  const feedbackSummaries = await listInterviewFeedbackSummariesForMap(
+    pool,
+    normalizedMapId,
+    req,
+    { recruiterSchedulerOnly }
+  );
 
   return {
     mapId: normalizedMapId,
@@ -2376,7 +2767,9 @@ async function getInterviewProgressByMapId(pool, mapId, req) {
     candidateName: mapping?.candidate_name || null,
     requisitionCode: mapping?.requisition_code || null,
     currentStage: mapping?.stage_name || null,
-    rounds
+    rounds: filteredRounds,
+    stageGroups: filteredStageGroups,
+    feedbackSummaries
   };
 }
 
@@ -2386,6 +2779,11 @@ module.exports = {
   getInterviewBundle,
   getFeedbackDetailsBySchedule,
   getInterviewProgressByMapId,
+  listInterviewFeedbackSummariesForMap,
+  getPermittedFeedbackHistoryForMap,
+  listRecruiterScheduledFeedbackHistory,
+  assertInterviewFeedbackReadAccess,
+  getRepeatSchedulePrecheck: interviewRepeatStageService.getRepeatSchedulePrecheck,
   scheduleInterview,
   scheduleInterviewCanonical,
   linkLegacySchedule,

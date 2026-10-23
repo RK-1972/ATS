@@ -3,9 +3,18 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const interviewService = require("../services/interviewService");
+const recruitmentService = require("../services/recruitmentService");
 const { resolveTaLeadOperatorUser } = require("./lib/resolveTaLeadOperatorUser");
 
 const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5000";
+
+const SYNTHETIC_TA_LEAD_USER = {
+  user_id: 999_999_002,
+  employee_code: "VERIFY_TA_LEAD_HARDENING",
+  email_id: "verify-ta-lead-hardening@local.invalid",
+  role_name: "TA Lead",
+  secondary_role: null
+};
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -73,7 +82,8 @@ async function findPanelMemberScheduleFixture() {
         ipm.employee_code AS panel_employee_code,
         ipm.user_id AS panel_user_id,
         i.interview_id,
-        f.feedback_id
+        f.feedback_id,
+        COALESCE(i.map_id, s.map_id) AS map_id
      FROM interview_schedule_trn s
      INNER JOIN interview_panel_mstr ipm
        ON ipm.panel_id = s.interviewer_id
@@ -198,7 +208,10 @@ async function main() {
   const recruiter = await resolveUserByRole("Recruiter");
   const hiringManager = await resolveUserByRole("Hiring Manager");
   const interviewer = await resolveUserByRole("Interviewer");
-  const taLead = await resolveTaLeadOperatorUser(pool, { requireNonPanelMember: true });
+  const taLeadOperator = await resolveTaLeadOperatorUser(pool, {
+    requireNonPanelMember: true
+  });
+  const taLeadRoleUser = await resolveUserByRole("TA Lead");
 
   if (!admin || !recruiter) {
     fail("fixtures", "Admin and Recruiter users required");
@@ -211,8 +224,10 @@ async function main() {
     ? await findNonPanelScheduleFixture(panelFixture.panel_employee_code)
     : null;
 
-  if (taLead) {
-    console.log(`Fixture TA Lead operator: ${taLead.email_id} (${taLead.role_name})`);
+  if (taLeadOperator) {
+    console.log(
+      `Fixture TA operator: ${taLeadOperator.email_id} (${taLeadOperator.role_name})`
+    );
   }
 
   if (!panelFixture) {
@@ -240,7 +255,7 @@ async function main() {
     recruiter: signToken(recruiter),
     hiringManager: hiringManager ? signToken(hiringManager) : null,
     interviewer: interviewer ? signToken(interviewer) : null,
-    taLead: taLead ? signToken(taLead) : null,
+    taLeadSynthetic: signToken(SYNTHETIC_TA_LEAD_USER),
     panelMember: panelUser ? signToken(panelUser) : null
   };
 
@@ -328,17 +343,60 @@ async function main() {
       }
     }
 
-    if (taLead) {
+    const taLeadDenyUser = taLeadRoleUser || SYNTHETIC_TA_LEAD_USER;
+
+    try {
+      await interviewService.assertInterviewFeedbackAccess(pool, {
+        user: taLeadDenyUser
+      }, {
+        scheduleId: panelFixture.schedule_id
+      });
+      fail("Service: TA Lead assert", "expected throw");
+    } catch (error) {
+      if (error.status === 403) {
+        pass("Service: TA Lead denied panel/recruiter feedback access");
+      } else {
+        fail("Service: TA Lead assert", `expected 403, got ${error.status}`);
+      }
+    }
+
+    if (taLeadOperator?.role_name === "TA Leader" && panelFixture.map_id) {
+      let taLeaderHasMapping = false;
+
       try {
-        await interviewService.assertInterviewFeedbackAccess(pool, { user: taLead }, {
-          scheduleId: panelFixture.schedule_id
-        });
-        fail("Service: TA Lead assert", "expected throw");
+        await recruitmentService.assertAuthorizedMappingAccess(
+          pool,
+          { user: taLeadOperator },
+          panelFixture.map_id
+        );
+        taLeaderHasMapping = true;
       } catch (error) {
-        if (error.status === 403) {
-          pass("Service: TA Lead denied feedback access");
+        taLeaderHasMapping = false;
+      }
+
+      try {
+        await interviewService.getFeedbackBySchedule(
+          pool,
+          panelFixture.schedule_id,
+          { user: taLeadOperator }
+        );
+
+        if (taLeaderHasMapping) {
+          pass("Service: TA Leader allowed feedback read with mapping authorization");
         } else {
-          fail("Service: TA Lead assert", `expected 403, got ${error.status}`);
+          fail(
+            "Service: TA Leader feedback read without mapping",
+            "expected 403"
+          );
+        }
+      } catch (error) {
+        if (error.status === 403 && !taLeaderHasMapping) {
+          pass("Service: TA Leader denied feedback read without mapping authorization");
+        } else {
+          fail(
+            "Service: TA Leader feedback read",
+            `${error.status} ${error.message}`
+          );
         }
       }
     }
@@ -473,7 +531,7 @@ async function main() {
 
     for (const [label, token] of [
       ["Hiring Manager", tokens.hiringManager],
-      ["TA Lead", tokens.taLead]
+      ["TA Lead", tokens.taLeadSynthetic]
     ]) {
       if (!token) {
         console.log(`SKIP: ${label} user not found`);

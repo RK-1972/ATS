@@ -30,7 +30,13 @@ async function handleScheduleInterview(pool, req, res, helpers = {}) {
     console.error("Schedule interview error:", error.message);
     res.status(error.status || 500).json({
       success: false,
-      message: error.message || "Internal Server Error"
+      message: error.message || "Internal Server Error",
+      guardCode: error.guardCode || null,
+      guard: error.guard || null,
+      requiresRepeatConfirmation: error.requiresRepeatConfirmation || false,
+      requiresRepeatReason: error.requiresRepeatReason || false,
+      requiresRepeatOverride: error.requiresRepeatOverride || false,
+      unauthorizedOverride: error.unauthorizedOverride || false
     });
   }
 }

@@ -1,10 +1,17 @@
 const interviewService = require("../services/interviewService");
+const interviewFeedbackConfidentialityService = require("../services/interviewFeedbackConfidentialityService");
 
 function handleError(res, error) {
   console.error("Interview API Error:", error.message);
   res.status(error.status || 500).json({
     success: false,
-    message: error.message || "Internal server error"
+    message: error.message || "Internal server error",
+    guardCode: error.guardCode || null,
+    guard: error.guard || null,
+    requiresRepeatConfirmation: error.requiresRepeatConfirmation || false,
+    requiresRepeatReason: error.requiresRepeatReason || false,
+    requiresRepeatOverride: error.requiresRepeatOverride || false,
+    unauthorizedOverride: error.unauthorizedOverride || false
   });
 }
 
@@ -12,11 +19,107 @@ function registerInterviewRoutes(app, pool, verifyToken, scheduleIntegrations = 
   app.get("/api/v1/interviews", verifyToken, async (req, res) => {
     try {
       const bundle = await interviewService.getInterviewBundle(pool, req);
-      res.json(bundle);
+      const sanitized =
+        await interviewFeedbackConfidentialityService.sanitizeInterviewBundleForCaller(
+          pool,
+          req,
+          bundle
+        );
+      res.json(sanitized);
     } catch (error) {
       handleError(res, error);
     }
   });
+
+  app.get("/api/v1/interviews/schedule-precheck", verifyToken, async (req, res) => {
+    try {
+      const mapId = req.query.map_id || req.query.mapId;
+      const roundType = req.query.round_type || req.query.roundType;
+
+      const data = await interviewService.getRepeatSchedulePrecheck(
+        pool,
+        mapId,
+        roundType,
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Repeat schedule precheck loaded.",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/v1/interviews/recruiter-scheduled-feedback", verifyToken, async (req, res) => {
+    try {
+      const data = await interviewService.listRecruiterScheduledFeedbackHistory(
+        pool,
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Recruiter scheduled feedback history loaded.",
+        count: data.length,
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get(
+    "/api/v1/interviews/permitted-feedback/:mapId",
+    verifyToken,
+    async (req, res) => {
+      try {
+        const data = await interviewService.getPermittedFeedbackHistoryForMap(
+          pool,
+          req.params.mapId,
+          req,
+          {
+            anchorScheduleId:
+              req.query.anchor_schedule_id || req.query.anchorScheduleId || null
+          }
+        );
+
+        res.json({
+          success: true,
+          message: "Permitted feedback history loaded.",
+          count: data.length,
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.get(
+    "/api/v1/interviews/feedback-summaries/:mapId",
+    verifyToken,
+    async (req, res) => {
+      try {
+        const data = await interviewService.listInterviewFeedbackSummariesForMap(
+          pool,
+          req.params.mapId,
+          req
+        );
+
+        res.json({
+          success: true,
+          message: "Interview feedback summaries loaded.",
+          count: data.length,
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.get("/api/v1/interviews/progress/:mapId", verifyToken, async (req, res) => {
     try {
