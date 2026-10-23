@@ -7752,6 +7752,8 @@ registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin);
 registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin);
 registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin);
 registerTaskRoutes(app, pool, verifyToken);
+const { registerCopilotRoutes } = require("./routes/copilotRoutes");
+registerCopilotRoutes(app, pool, verifyToken);
 registerInterviewRoutes(app, pool, verifyToken, {
   createInterviewMeeting,
   sendInterviewEmail
