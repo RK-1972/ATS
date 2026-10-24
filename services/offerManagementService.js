@@ -1315,6 +1315,9 @@ async function releaseOffer(pool, offerId, payload, req) {
   const user = userContext(req);
   await getOffer(pool, offerId, req);
 
+  const candidateOfferHoldService = require("./candidateOfferHoldService");
+  let activatedHold = null;
+
   const client = await pool.connect();
 
   try {
@@ -1323,10 +1326,19 @@ async function releaseOffer(pool, offerId, payload, req) {
     await offerApprovalWorkflowService.assertCurrentSubmissionFullyApproved(client, offerId);
 
     const offerLock = await client.query(
-      `SELECT workflow_instance_id FROM om_offers WHERE offer_id = $1`,
+      `SELECT *
+       FROM om_offers
+       WHERE offer_id = $1
+       FOR UPDATE`,
       [offerId]
     );
-    const workflowInstanceId = offerLock.rows[0]?.workflow_instance_id;
+
+    if (!offerLock.rows[0]) {
+      throw httpError(`Offer not found: ${offerId}`, 404);
+    }
+
+    const lockedOffer = offerLock.rows[0];
+    const workflowInstanceId = lockedOffer.workflow_instance_id;
 
     if (workflowInstanceId) {
       await workflowService.advanceWorkflow(
@@ -1344,6 +1356,13 @@ async function releaseOffer(pool, offerId, payload, req) {
       [user.name, offerId]
     );
 
+    const holdResult = await candidateOfferHoldService.activateHoldOnOfferRelease(
+      client,
+      lockedOffer,
+      req
+    );
+    activatedHold = holdResult.hold;
+
     await client.query("COMMIT");
   } catch (error) {
     try {
@@ -1354,6 +1373,31 @@ async function releaseOffer(pool, offerId, payload, req) {
     throw error;
   } finally {
     client.release();
+  }
+
+  let holdActivationSummary = null;
+
+  if (activatedHold) {
+    holdActivationSummary = await candidateOfferHoldService.runHoldActivationSideEffects(
+      pool,
+      activatedHold,
+      req
+    );
+
+    await writeEnterpriseAudit(pool, {
+      eventType: "OfferHoldActivated",
+      module: "Recruitment Management",
+      entity: "Candidate",
+      entityId: String(activatedHold.candidate_id),
+      action: "Offer Hold activated on offer release",
+      userName: user.name,
+      userRole: user.role,
+      metadata: {
+        offer_id: offerId,
+        hold_id: activatedHold.hold_id,
+        side_effects: holdActivationSummary
+      }
+    });
   }
 
   const offer = await getOffer(pool, offerId, req);
@@ -1402,7 +1446,14 @@ async function releaseOffer(pool, offerId, payload, req) {
 
   return {
     offer: await getOffer(pool, offerId),
-    toastMessage: "Offer released."
+    toastMessage: "Offer released.",
+    offerHold: activatedHold
+      ? {
+          hold_id: activatedHold.hold_id,
+          candidate_id: activatedHold.candidate_id,
+          activation_side_effects: holdActivationSummary
+        }
+      : null
   };
 }
 

@@ -1972,11 +1972,18 @@ async function mapCandidate(pool, payload, req) {
   try {
     await client.query("BEGIN");
 
+    const candidateOfferHoldService = require("./candidateOfferHoldService");
+    await candidateOfferHoldService.lockCandidateRow(client, candidateId);
+    await candidateOfferHoldService.assertNoActiveHoldUnderPolicyLock(
+      client,
+      candidateId,
+      req
+    );
+
     const candLock = await client.query(
       `SELECT candidate_container, owner_employee_code
        FROM cand_mstr
-       WHERE candidate_id = $1
-       FOR UPDATE`,
+       WHERE candidate_id = $1`,
       [candidateId]
     );
     const candRow = candLock.rows[0] || null;
@@ -2233,6 +2240,8 @@ async function applyGovernedCandidateStageTransition(
   }
 
   const requisitionCode = mapping?.requisition_code;
+  const transitionCandidateId =
+    mapping?.candidate_id || legacyRow?.candidate_id || null;
 
   let requisition = null;
   if (requisitionCode) {
@@ -2291,10 +2300,25 @@ async function applyGovernedCandidateStageTransition(
       : { ruleEvaluation: ruleEval };
 
   if (mapping) {
-    const client = await pool.connect();
+    const ownsClient = !options.policyClient;
+    const client = options.policyClient || await pool.connect();
 
     try {
-      await client.query("BEGIN");
+      if (ownsClient) {
+        await client.query("BEGIN");
+      }
+
+      if (transitionCandidateId) {
+        const candidateOfferHoldService = require("./candidateOfferHoldService");
+        await candidateOfferHoldService.lockCandidateRow(client, transitionCandidateId);
+        await candidateOfferHoldService.assertCandidateEligibleForStageOnMapping(
+          client,
+          transitionCandidateId,
+          requisitionCode,
+          req,
+          { client }
+        );
+      }
 
       await client.query(
         `UPDATE rm_candidate_mappings
@@ -2316,16 +2340,40 @@ async function applyGovernedCandidateStageTransition(
         metadata: historyMetadata
       });
 
-      await client.query("COMMIT");
+      if (
+        isLegacyDualWriteEnabled()
+        && legacyRow
+        && (await tableExists(pool, "candidate_req_map"))
+      ) {
+        await client.query(
+          "UPDATE candidate_req_map SET stage_name = $1, remarks = COALESCE($2, remarks) WHERE map_id = $3",
+          [canonicalStageName, remarks || null, mapId]
+        );
+      }
+
+      if (mapping.candidate_id) {
+        await client.query(
+          "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
+          [canonicalStageName, mapping.candidate_id]
+        );
+      }
+
+      if (ownsClient) {
+        await client.query("COMMIT");
+      }
     } catch (error) {
-      try {
-        await client.query("ROLLBACK");
-      } catch (_rollbackError) {
-        // ignore rollback failures
+      if (ownsClient) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_rollbackError) {
+          // ignore rollback failures
+        }
       }
       throw error;
     } finally {
-      client.release();
+      if (ownsClient) {
+        client.release();
+      }
     }
   } else {
     await pipelineHistoryService.recordPipelineStageTransition(pool, {
@@ -2342,20 +2390,36 @@ async function applyGovernedCandidateStageTransition(
     });
   }
 
-  if (isLegacyDualWriteEnabled() && legacyRow && (await tableExists(pool, "candidate_req_map"))) {
-    await pool.query(
-      "UPDATE candidate_req_map SET stage_name = $1, remarks = $2 WHERE map_id = $3",
-      [canonicalStageName, remarks, mapId]
-    );
+  if (
+    !mapping
+    && transitionCandidateId
+    && isLegacyDualWriteEnabled()
+    && legacyRow
+    && (await tableExists(pool, "candidate_req_map"))
+  ) {
+    const candidateOfferHoldService = require("./candidateOfferHoldService");
+    await candidateOfferHoldService.withCandidatePolicyTransaction(
+      pool,
+      transitionCandidateId,
+      async (client) => {
+        await candidateOfferHoldService.assertCandidateEligibleForStageOnMapping(
+          client,
+          transitionCandidateId,
+          requisitionCode,
+          req,
+          { client }
+        );
 
-    await pool.query(
-      "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
-      [canonicalStageName, legacyRow.candidate_id]
-    );
-  } else if (mapping?.candidate_id) {
-    await pool.query(
-      "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
-      [canonicalStageName, mapping.candidate_id]
+        await client.query(
+          "UPDATE candidate_req_map SET stage_name = $1, remarks = $2 WHERE map_id = $3",
+          [canonicalStageName, remarks, mapId]
+        );
+
+        await client.query(
+          "UPDATE cand_mstr SET candidate_status = $1 WHERE candidate_id = $2",
+          [canonicalStageName, legacyRow.candidate_id]
+        );
+      }
     );
   }
 

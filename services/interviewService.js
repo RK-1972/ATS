@@ -433,8 +433,9 @@ async function scheduleInterview(pool, payload, req) {
     }
   }
 
+  const runScheduleMutations = async (db) => {
   const { repeatMetadata } = await interviewRepeatStageService.assertRepeatScheduleAuthorized(
-    pool,
+    db,
     req,
     mapId,
     roundType,
@@ -442,12 +443,12 @@ async function scheduleInterview(pool, payload, req) {
   );
 
   const roundNo = await interviewRepeatStageService.allocateSessionRoundNo(
-    pool,
+    db,
     mapId,
     roundType
   );
 
-  const ruleEval = await evaluateInterviewRules(pool, {
+  const ruleEval = await evaluateInterviewRules(db, {
     round_type: roundType,
     department: payload.department,
     grade: payload.grade,
@@ -457,7 +458,7 @@ async function scheduleInterview(pool, payload, req) {
 
   const interviewId = generateInterviewId();
   const instance = await workflowService.startWorkflow(
-    pool,
+    db,
     "INTERVIEW",
     {
       instance_id: `WF-INT-${interviewId}`,
@@ -472,7 +473,7 @@ async function scheduleInterview(pool, payload, req) {
   );
 
   await workflowService.advanceWorkflow(
-    pool,
+    db,
     instance.instanceId,
     "advance",
     { stageKey: "requested", actor: user.name, comment: "Interview scheduled" },
@@ -480,7 +481,7 @@ async function scheduleInterview(pool, payload, req) {
   );
 
   await workflowService.advanceWorkflow(
-    pool,
+    db,
     instance.instanceId,
     "advance",
     { stageKey: "scheduled", actor: user.name, comment: remarks || "" },
@@ -491,7 +492,7 @@ async function scheduleInterview(pool, payload, req) {
     (item) => item.key === "interview_management"
   )?.settings?.feedback_reminder_hours || 24;
 
-  await pool.query(
+  await db.query(
     `INSERT INTO im_interviews (
       interview_id, map_id, req_id, requisition_code, candidate_id, round_no, round_type,
       interview_date, interview_time, interview_status, workflow_instance_id, remarks,
@@ -516,7 +517,7 @@ async function scheduleInterview(pool, payload, req) {
     ]
   );
 
-  await pool.query(
+  await db.query(
     `INSERT INTO im_panel_assignments (
       interview_id, panel_id, interviewer_name, interviewer_email, interviewer_type,
       assignment_status, assigned_by, effective_from
@@ -533,7 +534,9 @@ async function scheduleInterview(pool, payload, req) {
     ]
   );
 
-  await taskService.createTask(pool, {
+  const taskTx = db !== pool ? { client: db } : null;
+
+  await taskService.createTask(db, {
     module: "Interview Management",
     taskType: "Accept Interview Assignment",
     title: `Accept ${roundType} interview assignment`,
@@ -546,9 +549,9 @@ async function scheduleInterview(pool, payload, req) {
     businessObjectType: "Interview",
     businessObjectId: interviewId,
     metadata: { roundType, interviewDate, interviewTime }
-  }, req);
+  }, req, taskTx);
 
-  await taskService.createTask(pool, {
+  await taskService.createTask(db, {
     module: "Interview Management",
     taskType: "Conduct Interview",
     title: `Conduct ${roundType} interview`,
@@ -560,10 +563,10 @@ async function scheduleInterview(pool, payload, req) {
     businessObjectType: "Interview",
     businessObjectId: interviewId,
     metadata: { interviewDate, interviewTime }
-  }, req);
+  }, req, taskTx);
 
   await recordInterviewHistory(
-    pool,
+    db,
     interviewId,
     "InterviewScheduled",
     user.name,
@@ -573,7 +576,7 @@ async function scheduleInterview(pool, payload, req) {
     repeatMetadata || null
   );
 
-  await writeEnterpriseAudit(pool, {
+  await writeEnterpriseAudit(db, {
     eventType: "InterviewScheduled",
     module: "Interview Management",
     entity: "Interview",
@@ -589,7 +592,7 @@ async function scheduleInterview(pool, payload, req) {
   if (isEnterpriseOperationalSor() && enterpriseMap.rows.length) {
     const recruitmentService = require("./recruitmentService");
     await recruitmentService.applyGovernedCandidateStageTransition(
-      pool,
+      db,
       mapId,
       stageName,
       remarks || "",
@@ -598,6 +601,7 @@ async function scheduleInterview(pool, payload, req) {
         pipelineEventType: "InterviewScheduledStage",
         skipIfUnchanged: true,
         useOperationalStageName: true,
+        policyClient: db !== pool ? db : null,
         historyMetadata: {
           interviewId,
           roundType,
@@ -608,9 +612,9 @@ async function scheduleInterview(pool, payload, req) {
     );
   } else if (
     isLegacyDualWriteEnabled()
-    && (await tableExists(pool, "candidate_req_map"))
+    && (await tableExists(db, "candidate_req_map"))
   ) {
-    await pool.query(
+    await db.query(
       "UPDATE candidate_req_map SET stage_name = $1 WHERE map_id = $2",
       [stageName, mapId]
     );
@@ -641,6 +645,25 @@ async function scheduleInterview(pool, payload, req) {
     ruleEvaluation: ruleEval,
     toastMessage: "Interview scheduled successfully."
   };
+  };
+
+  if (candidateId) {
+    const candidateOfferHoldService = require("./candidateOfferHoldService");
+    return candidateOfferHoldService.withCandidatePolicyTransaction(
+      pool,
+      candidateId,
+      async (client) => {
+        await candidateOfferHoldService.assertNoActiveHoldUnderPolicyLock(
+          client,
+          candidateId,
+          req
+        );
+        return runScheduleMutations(client);
+      }
+    );
+  }
+
+  return runScheduleMutations(pool);
 }
 
 async function linkLegacySchedule(pool, interviewId, scheduleId, meetingLink, teamsEventId, req) {
@@ -1145,27 +1168,6 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
   const previousDate = formatInterviewDateValue(interview.interviewDate);
   const previousTime = formatInterviewTimeValue(interview.interviewTime);
 
-  await pool.query(
-    `UPDATE im_interviews
-     SET interview_date = $1, interview_time = $2, remarks = COALESCE($3, remarks),
-         modified_by = $4, modified_on = NOW()
-     WHERE interview_id = $5`,
-    [interviewDate, interviewTime, remarks, user.name, interview.interviewId]
-  );
-
-  await syncLegacyScheduleMirror(pool, interview.scheduleId, {
-    interviewDate,
-    interviewTime
-  });
-
-  await syncRescheduleConductInterviewTask(
-    pool,
-    interview,
-    interviewDate,
-    interviewTime,
-    req
-  );
-
   const historyMetadata = {
     previous_interview_date: previousDate,
     previous_interview_time: previousTime,
@@ -1173,27 +1175,68 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     interview_time: interviewTime
   };
 
-  await recordInterviewHistory(
-    pool,
-    interview.interviewId,
-    "InterviewRescheduled",
-    user.name,
-    interview.interviewStatus,
-    INTERVIEW_STATUS.SCHEDULED,
-    remarks,
-    historyMetadata
-  );
+  const runRescheduleMutations = async (db) => {
+    await db.query(
+      `UPDATE im_interviews
+       SET interview_date = $1, interview_time = $2, remarks = COALESCE($3, remarks),
+           modified_by = $4, modified_on = NOW()
+       WHERE interview_id = $5`,
+      [interviewDate, interviewTime, remarks, user.name, interview.interviewId]
+    );
 
-  await writeEnterpriseAudit(pool, {
-    eventType: "InterviewRescheduled",
-    module: "Interview Management",
-    entity: "Interview",
-    entityId: interview.interviewId,
-    action: "Interview rescheduled",
-    userName: user.name,
-    userRole: user.role,
-    metadata: historyMetadata
-  });
+    await syncLegacyScheduleMirror(db, interview.scheduleId, {
+      interviewDate,
+      interviewTime
+    });
+
+    await syncRescheduleConductInterviewTask(
+      db,
+      interview,
+      interviewDate,
+      interviewTime,
+      req
+    );
+
+    await recordInterviewHistory(
+      db,
+      interview.interviewId,
+      "InterviewRescheduled",
+      user.name,
+      interview.interviewStatus,
+      INTERVIEW_STATUS.SCHEDULED,
+      remarks,
+      historyMetadata
+    );
+
+    await writeEnterpriseAudit(db, {
+      eventType: "InterviewRescheduled",
+      module: "Interview Management",
+      entity: "Interview",
+      entityId: interview.interviewId,
+      action: "Interview rescheduled",
+      userName: user.name,
+      userRole: user.role,
+      metadata: historyMetadata
+    });
+  };
+
+  if (interview.candidateId) {
+    const candidateOfferHoldService = require("./candidateOfferHoldService");
+    await candidateOfferHoldService.withCandidatePolicyTransaction(
+      pool,
+      interview.candidateId,
+      async (client) => {
+        await candidateOfferHoldService.assertNoActiveHoldUnderPolicyLock(
+          client,
+          interview.candidateId,
+          req
+        );
+        await runRescheduleMutations(client);
+      }
+    );
+  } else {
+    await runRescheduleMutations(pool);
+  }
 
   return {
     interview: await getInterview(pool, interview.interviewId),
@@ -1201,7 +1244,26 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
   };
 }
 
-async function cancelInterview(pool, interviewId, payload, req) {
+async function cancelInterviewForOfferHold(pool, interviewId, req, metadata = {}) {
+  const {
+    CANCELLATION_REASON_OFFER_HOLD
+  } = require("./candidateOfferHoldService");
+
+  return cancelInterview(
+    pool,
+    interviewId,
+    {
+      cancellation_reason: CANCELLATION_REASON_OFFER_HOLD,
+      notes: metadata.offerId
+        ? `Offer ${metadata.offerId} released`
+        : "Offer Hold activation"
+    },
+    req,
+    { bypassScheduleAccess: true }
+  );
+}
+
+async function cancelInterview(pool, interviewId, payload, req, options = {}) {
   const user = userContext(req);
   const row = await fetchInterviewRowByLookup(pool, interviewId);
 
@@ -1209,7 +1271,9 @@ async function cancelInterview(pool, interviewId, payload, req) {
     throw httpError(`Interview not found: ${interviewId}`, 404);
   }
 
-  await assertInterviewScheduleMutateAccess(pool, req, row);
+  if (!options.bypassScheduleAccess) {
+    await assertInterviewScheduleMutateAccess(pool, req, row);
+  }
   const interview = mapInterviewRow(row);
   const platformConfig = await loadPlatformConfig(pool);
   await assertInterviewModuleEnabled(platformConfig);
@@ -2794,6 +2858,7 @@ module.exports = {
   acceptAssignment,
   rescheduleInterview,
   cancelInterview,
+  cancelInterviewForOfferHold,
   completeInterview,
   assertInterviewScheduleMutateAccess,
   INTERVIEW_STATUS,

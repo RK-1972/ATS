@@ -789,6 +789,47 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
+  const candidateOfferHoldService = require("../services/candidateOfferHoldService");
+
+  app.get(
+    "/api/v1/recruitment/candidates/:candidateId/offer-hold",
+    operatorGuard,
+    async (req, res) => {
+      try {
+        const data = await candidateOfferHoldService.getOfferHoldStatusForCandidate(
+          pool,
+          req.params.candidateId,
+          req
+        );
+        res.json({ success: true, data });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
+  app.post(
+    "/api/v1/recruitment/candidates/:candidateId/offer-hold/release",
+    operatorGuard,
+    async (req, res) => {
+      try {
+        const result = await candidateOfferHoldService.releaseOfferHold(
+          pool,
+          req.params.candidateId,
+          req.body?.reason || req.body?.release_reason || "",
+          req
+        );
+        res.json({
+          success: true,
+          message: "Candidate released from Offer Hold.",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
+
   app.put("/api/v1/recruitment/candidate-mappings/:mapId/stage", operatorGuard, async (req, res) => {
     try {
       const result = await recruitmentService.updateCandidateStage(
