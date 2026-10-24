@@ -5,6 +5,7 @@ const {
   touchSession,
   refreshStaleSessionStatesForHeartbeat
 } = require("../services/applicationSessionService");
+const sessionTakeoverService = require("../services/sessionTakeoverService");
 
 function handleError(res, error) {
   console.error("Application Audit API Error:", error.message);
@@ -109,10 +110,17 @@ function registerApplicationAuditRoutes(app, pool, verifyToken) {
       }
 
       const data = await touchSession(pool, sessionId);
+      const pendingTakeover = await sessionTakeoverService.getPendingInboxForSession(
+        pool,
+        sessionId
+      );
       res.status(200).json({
         success: true,
         message: "Session heartbeat recorded.",
-        data
+        data: {
+          ...data,
+          pending_takeover: pendingTakeover
+        }
       });
     } catch (error) {
       handleError(res, error);

@@ -34,6 +34,11 @@ const workspaceResolverService = require("./services/workspaceResolverService");
 const hiringManagerIdentityService = require("./services/hiringManagerIdentityService");
 const approvalRouteRepository = require("./repositories/approvalRouteRepository");
 const { assertEmployeeAccountActive } = require("./middleware/activeEmployeeAuth");
+const { assertEmployeeSessionActive } = require("./middleware/employeeSessionAuth");
+const {
+  resolveLoginAfterPasswordVerified
+} = require("./services/sessionTakeoverService");
+const sessionTakeoverService = require("./services/sessionTakeoverService");
 const {
   allocateNextCandidateCode
 } = require("./utils/candidateCodeGenerator");
@@ -1327,6 +1332,20 @@ const verifyToken = async (req, res, next) => {
         success: false,
         message:
           "Account is inactive. Contact your administrator or sign in again after reactivation."
+
+      });
+
+    }
+
+    const sessionCheck = await assertEmployeeSessionActive(pool, verifiedUser);
+
+    if (!sessionCheck.ok) {
+
+      return res.status(sessionCheck.status).json({
+
+        success: false,
+        code: sessionCheck.code,
+        message: sessionCheck.message
 
       });
 
@@ -4543,156 +4562,31 @@ app.post("/login", async (req, res) => {
 
     }
 
-    if (!process.env.JWT_SECRET) {
+    const loginResolution = await resolveLoginAfterPasswordVerified(pool, user, req);
 
-      console.error("[login] JWT_SECRET is not configured");
-
-      return res.status(500).json({
-
-        success: false,
-        message: "Login Error"
-
-      });
-
-    }
-
-    console.log("[login] Generating JWT");
-
-    const sessionId = crypto.randomUUID();
-
-    const token = jwt.sign(
-
-  {
-
-    user_id: user.user_id,
-    employee_code: user.employee_code,
-    email_id: user.email_id,
-    role_name: user.role_name,
-    secondary_role: user.secondary_role,
-    session_id: sessionId
-
-  },
-
-      process.env.JWT_SECRET,
-
-      {
-
-        expiresIn: "8h"
-
-      }
-
-    );
-
-    console.log("[login] JWT generated", {
-      user_id: user.user_id,
-      session_id: sessionId
-    });
-
-    try {
-      await applicationSessionService.recordLogin(pool, {
-        sessionId,
-        user,
-        req
-      });
-    } catch (sessionAuditError) {
-      console.error("[login] Session audit record failed", {
-        user_id: user.user_id,
-        session_id: sessionId,
-        message: sessionAuditError.message
-      });
-    }
-
-    let workAssignments = [];
-    let workAssignmentStatus = "NO_ASSIGNMENTS";
-    let workspace = {};
-
-    try {
-      const employeeAssignments =
-        await workAssignmentService.getEmployeeWorkAssignments(
-          pool,
-          user.employee_code
-        );
-
-      workAssignments = (employeeAssignments || [])
-        .filter((row) => row.is_active === true)
-        .map((row) => ({
-          assignment_code: row.assignment_code,
-          assignment_name: row.assignment_name
-        }));
-
-      workAssignmentStatus =
-        workAssignments.length > 0 ? "LOADED" : "NO_ASSIGNMENTS";
-    } catch (workAssignmentError) {
-      console.error("[login] Failed to load work assignments", {
-        employee_code: user.employee_code,
-        message: workAssignmentError.message
-      });
-      workAssignments = [];
-      workAssignmentStatus = "SERVICE_UNAVAILABLE";
-    }
-
-    try {
-      const resolved = await workspaceResolverService.resolveWorkspace(
-        pool,
-        user.employee_code
-      );
-      workspace = resolved?.workspace || {};
-    } catch (workspaceError) {
-      console.error("[login] Failed to resolve workspace", {
-        employee_code: user.employee_code,
-        message: workspaceError.message
-      });
-      workspace = {};
-    }
-
-    try {
-      await hiringManagerIdentityService.resolveBoundHiringManager(pool, {
-        user: {
-          employee_code: user.employee_code,
-          email_id: user.email_id
+    if (loginResolution.outcome === "TAKEOVER_PENDING") {
+      return res.status(202).json({
+        success: true,
+        code: "SESSION_TAKEOVER_PENDING",
+        message:
+          "Another sign-in is requesting access. Approve or deny on your active session.",
+        data: {
+          poll_token: loginResolution.pollToken,
+          expires_at: loginResolution.expiresAt,
+          poll_interval_seconds: loginResolution.pollIntervalSeconds
         }
       });
-      workspace = {
-        ...workspace,
-        showHiringManagerWorkspace: true
-      };
-    } catch (_hmBindingError) {
-      // HM workspace visibility requires a bound hiring_manager_mstr profile.
     }
 
-    if (user.role_name === "TA Lead" || user.role_name === "TA Leader") {
-      workspace = {
-        ...workspace,
-        showTaLeadWorkspace: true
-      };
+    if (loginResolution.outcome === "TAKEOVER_COMPLETE_REQUIRED") {
+      return res.status(409).json({
+        success: false,
+        code: "SESSION_TAKEOVER_COMPLETE_REQUIRED",
+        message: loginResolution.message
+      });
     }
 
-    res.status(200).json({
-
-      success: true,
-
-      message: "Login Successful",
-
-      token: token,
-
-      user: {
-
-        user_id: user.user_id,
-        employee_code: user.employee_code,
-        full_name: user.full_name,
-        email_id: user.email_id,
-        role_name: user.role_name,
-        secondary_role: user.secondary_role
-
-      },
-
-      work_assignments: workAssignments,
-
-      work_assignment_status: workAssignmentStatus,
-
-      workspace
-
-    });
+    res.status(200).json(loginResolution.body);
 
   }
 
@@ -4728,6 +4622,13 @@ app.post("/api/v1/auth/logout", verifyToken, async (req, res) => {
       await applicationSessionService.confirmLogout(pool, sessionId, {
         reason: "USER_LOGOUT"
       });
+      try {
+        await sessionTakeoverService.cancelPendingForSession(pool, sessionId, {
+          reason: "SESSION_ENDED"
+        });
+      } catch (cancelError) {
+        console.error("[logout] Takeover cancel failed", cancelError.message);
+      }
     }
 
     res.status(200).json({
@@ -7580,6 +7481,26 @@ if (
 
       );
 
+      try {
+        const employeeRow = await pool.query(
+          `SELECT employee_code FROM user_mstr WHERE user_id = $1`,
+          [tokenData.user_id]
+        );
+        const employeeCode = employeeRow.rows[0]?.employee_code;
+        if (employeeCode) {
+          await applicationSessionService.revokeActiveSessionsForEmployee(
+            pool,
+            employeeCode,
+            { reason: "PASSWORD_RESET" }
+          );
+          await sessionTakeoverService.cancelPendingForEmployee(pool, employeeCode, {
+            reason: "PASSWORD_RESET"
+          });
+        }
+      } catch (revokeError) {
+        console.error("[reset-password] Session revoke failed", revokeError.message);
+      }
+
       res.status(200).json({
 
         success: true,
@@ -7744,6 +7665,9 @@ const { registerAuditRoutes } = require("./routes/auditRoutes");
 const {
   registerApplicationAuditRoutes
 } = require("./routes/applicationAuditRoutes");
+const {
+  registerSessionTakeoverRoutes
+} = require("./routes/sessionTakeoverRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -7776,6 +7700,7 @@ registerTaLeadRoutes(app, pool, verifyToken);
 registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
 registerAuditRoutes(app, pool, verifyToken, verifyAdmin);
 registerApplicationAuditRoutes(app, pool, verifyToken);
+registerSessionTakeoverRoutes(app, pool, verifyToken);
 registerReportBuilderRoutes(app, pool, verifyToken);
 registerCandidatePortalRoutes(
   app,

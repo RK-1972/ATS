@@ -23,7 +23,10 @@ function summarizeUserAgent(value) {
   return formatUserAgentSummary(value);
 }
 
-async function recordLogin(pool, { sessionId, user, req }) {
+async function recordLogin(
+  pool,
+  { sessionId, user, req, queryExecutor = null, skipReconcile = false }
+) {
   const normalizedSessionId = String(sessionId || "").trim();
   const employeeCode = String(user?.employee_code || "").trim();
 
@@ -31,7 +34,9 @@ async function recordLogin(pool, { sessionId, user, req }) {
     throw httpError("sessionId and employee_code are required to record login.", 400);
   }
 
-  await pool.query(
+  const query = queryExecutor || ((sql, params) => pool.query(sql, params));
+
+  await query(
     `INSERT INTO app_user_session (
        session_id, employee_code, user_id, email_id,
        login_at, last_seen_at, source_ip, status, user_agent_summary
@@ -47,10 +52,12 @@ async function recordLogin(pool, { sessionId, user, req }) {
     ]
   );
 
-  await reconcileSupersededActiveSessions(pool, {
-    employeeCode,
-    keepSessionId: normalizedSessionId
-  });
+  if (!skipReconcile) {
+    await reconcileSupersededActiveSessions(pool, {
+      employeeCode,
+      keepSessionId: normalizedSessionId
+    });
+  }
 
   return { session_id: normalizedSessionId, status: SESSION_STATUS.ACTIVE };
 }
@@ -99,9 +106,24 @@ async function confirmLogout(pool, sessionId, { reason = "USER_LOGOUT" } = {}) {
  */
 async function onEmployeeAccountDeactivated(pool, employeeCode) {
   try {
-    return await revokeActiveSessionsForEmployee(pool, employeeCode, {
+    const revokeResult = await revokeActiveSessionsForEmployee(pool, employeeCode, {
       reason: "ACCOUNT_DEACTIVATED"
     });
+    try {
+      const { cancelPendingForEmployee } = require("./sessionTakeoverService");
+      await cancelPendingForEmployee(pool, employeeCode, {
+        reason: "ACCOUNT_DEACTIVATED"
+      });
+    } catch (takeoverCancelError) {
+      console.error(
+        "[applicationSession] Failed to cancel pending takeover requests",
+        {
+          employee_code: String(employeeCode || "").trim(),
+          message: takeoverCancelError.message
+        }
+      );
+    }
+    return revokeResult;
   } catch (error) {
     console.error(
       "[applicationSession] Failed to revoke active sessions after deactivation",
