@@ -232,7 +232,7 @@ describe("applicationSessionService", () => {
           phases.push("expire");
         } else if (text.includes("newer.login_at > s.login_at")) {
           phases.push("supersede");
-        } else if (params[2] === "INACTIVITY") {
+        } else if (params[2] === "IDLE_TIMEOUT") {
           phases.push("interrupt");
         }
         return { rowCount: 1 };
@@ -349,7 +349,7 @@ describe("applicationAuditReadService smart search", () => {
         if (text.includes("JWT_EXPIRED")) {
           return { rowCount: 0 };
         }
-        if (text.includes("INACTIVITY")) {
+        if (text.includes("IDLE_TIMEOUT")) {
           return { rowCount: 0 };
         }
         if (text.includes("COUNT(*)")) {
@@ -389,7 +389,7 @@ describe("applicationAuditReadService.listSessions", () => {
           operations.push("supersede");
           return { rowCount: 0 };
         }
-        if (params?.[2] === "INACTIVITY") {
+        if (params?.[2] === "IDLE_TIMEOUT") {
           operations.push("interrupt");
           return { rowCount: 0 };
         }

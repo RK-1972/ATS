@@ -7668,6 +7668,9 @@ const {
 const {
   registerSessionTakeoverRoutes
 } = require("./routes/sessionTakeoverRoutes");
+const {
+  registerEmployeeSessionRoutes
+} = require("./routes/employeeSessionRoutes");
 
 registerMasterDataRoutes(app, pool, verifyToken, verifyAdmin);
 registerPlatformConfigRoutes(app, pool, verifyToken, verifyAdmin);
@@ -7700,6 +7703,7 @@ registerTaLeadRoutes(app, pool, verifyToken);
 registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
 registerAuditRoutes(app, pool, verifyToken, verifyAdmin);
 registerApplicationAuditRoutes(app, pool, verifyToken);
+registerEmployeeSessionRoutes(app, pool, verifyToken);
 registerSessionTakeoverRoutes(app, pool, verifyToken);
 registerReportBuilderRoutes(app, pool, verifyToken);
 registerCandidatePortalRoutes(

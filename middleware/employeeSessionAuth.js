@@ -1,6 +1,7 @@
 const {
   SESSION_STATUS,
-  refreshStaleSessionStatesForHeartbeat
+  refreshStaleSessionStatesForHeartbeat,
+  terminateIdleSessionIfDue
 } = require("../services/applicationSessionService");
 
 const SESSION_INVALID_MESSAGE =
@@ -26,6 +27,7 @@ async function assertEmployeeSessionActive(pool, verifiedUser) {
   }
 
   await refreshStaleSessionStatesForHeartbeat(pool);
+  await terminateIdleSessionIfDue(pool, sessionId);
 
   const result = await pool.query(
     `SELECT status

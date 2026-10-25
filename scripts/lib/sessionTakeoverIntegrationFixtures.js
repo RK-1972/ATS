@@ -164,6 +164,34 @@ async function assertTakeoverSchemaReady(pool) {
   return { ok: true };
 }
 
+async function applyMigration067IfMissing(pool) {
+  const connectionString = String(pool?.options?.connectionString || "").trim();
+  assertSessionTakeoverIntegrationTarget(parsePostgresUrl(connectionString));
+
+  const column = await pool.query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'app_user_session'
+       AND column_name = 'last_user_activity_at'
+     LIMIT 1`
+  );
+
+  if (column.rowCount) {
+    return { applied: false };
+  }
+
+  const migrationPath = path.join(
+    __dirname,
+    "..",
+    "..",
+    "migrations",
+    "067_employee_idle_user_activity.sql"
+  );
+  await pool.query(fs.readFileSync(migrationPath, "utf8"));
+  return { applied: true };
+}
+
 async function applyMigration066IfMissing(pool) {
   const connectionString = String(pool?.options?.connectionString || "").trim();
   assertSessionTakeoverIntegrationTarget(parsePostgresUrl(connectionString));
@@ -227,12 +255,14 @@ async function insertActiveSession(pool, { sessionId, user, label = "fixture" })
   await pool.query(
     `INSERT INTO app_user_session (
        session_id, employee_code, user_id, email_id,
-       login_at, last_seen_at, source_ip, status, user_agent_summary
-     ) VALUES ($1,$2,$3,$4,NOW(),NOW(),$5::inet,$6,$7)
+       login_at, last_seen_at, last_user_activity_at,
+       source_ip, status, user_agent_summary
+     ) VALUES ($1,$2,$3,$4,NOW(),NOW(),NOW(),$5::inet,$6,$7)
      ON CONFLICT (session_id) DO UPDATE
        SET status = EXCLUDED.status,
            login_at = NOW(),
            last_seen_at = NOW(),
+           last_user_activity_at = NOW(),
            user_agent_summary = EXCLUDED.user_agent_summary`,
     [
       sessionId,
@@ -318,6 +348,7 @@ module.exports = {
   assertSessionSchemaReady,
   assertTakeoverSchemaReady,
   applyMigration066IfMissing,
+  applyMigration067IfMissing,
   provisionFixtureUser,
   insertActiveSession,
   cleanupFixtureTakeoverRows,

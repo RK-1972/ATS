@@ -28,6 +28,7 @@ const {
   assertSessionSchemaReady,
   assertTakeoverSchemaReady,
   applyMigration066IfMissing,
+  applyMigration067IfMissing,
   provisionFixtureUser,
   insertActiveSession,
   cleanupFixtureArtifacts,
@@ -74,6 +75,7 @@ describe("session takeover (PostgreSQL integration)", { concurrency: 1 }, () => 
     }
 
     await applyMigration066IfMissing(pool);
+    await applyMigration067IfMissing(pool);
     const takeoverSchema = await assertTakeoverSchemaReady(pool);
     if (!takeoverSchema.ok) {
       skipReason = takeoverSchema.reason;
