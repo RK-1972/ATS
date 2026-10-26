@@ -839,6 +839,17 @@ async function scheduleInterviewCanonical(pool, body, req, helpers = {}) {
     );
   }
 
+  try {
+    const interviewNotificationService = require("./interviewNotificationService");
+    await interviewNotificationService.notifyInterviewParticipants(pool, {
+      interviewId: enterprise.interviewId,
+      outcomeKey: "interview_scheduled",
+      actorEmployeeCode: req.user?.employee_code || null
+    });
+  } catch (bellError) {
+    console.error("[interview bell] schedule:", bellError.message);
+  }
+
   return {
     ...enterprise,
     teamsLink,
@@ -1238,6 +1249,17 @@ async function rescheduleInterview(pool, interviewId, payload, req) {
     await runRescheduleMutations(pool);
   }
 
+  try {
+    const interviewNotificationService = require("./interviewNotificationService");
+    await interviewNotificationService.notifyInterviewParticipants(pool, {
+      interviewId: interview.interviewId,
+      outcomeKey: "interview_rescheduled",
+      actorEmployeeCode: user.employeeCode
+    });
+  } catch (bellError) {
+    console.error("[interview bell] reschedule:", bellError.message);
+  }
+
   return {
     interview: await getInterview(pool, interview.interviewId),
     toastMessage: "Interview rescheduled successfully."
@@ -1353,6 +1375,17 @@ async function cancelInterview(pool, interviewId, payload, req, options = {}) {
     throw error;
   } finally {
     client.release();
+  }
+
+  try {
+    const interviewNotificationService = require("./interviewNotificationService");
+    await interviewNotificationService.notifyInterviewParticipants(pool, {
+      interviewId: interview.interviewId,
+      outcomeKey: "interview_cancelled",
+      actorEmployeeCode: user.employeeCode
+    });
+  } catch (bellError) {
+    console.error("[interview bell] cancel:", bellError.message);
   }
 
   return {
@@ -1907,6 +1940,17 @@ async function submitFeedback(pool, payload, req) {
   });
 
   await syncLegacyFeedback(pool, interview, payload, user, req);
+
+  try {
+    const interviewNotificationService = require("./interviewNotificationService");
+    await interviewNotificationService.notifyFeedbackSubmitted(pool, {
+      interviewId: interview.interviewId,
+      scheduleId: interview.scheduleId || scheduleId,
+      actorEmployeeCode: user.employeeCode
+    });
+  } catch (bellError) {
+    console.error("[interview bell] feedback:", bellError.message);
+  }
 
   return {
     interview: await getInterview(pool, interview.interviewId),

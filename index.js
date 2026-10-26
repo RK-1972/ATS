@@ -8688,6 +8688,18 @@ await client.query(
 
       await client.query("COMMIT");
 
+      const bellNotificationService = require("./services/bellNotificationService");
+      await bellNotificationService.notifyOutcome(pool, "ownership_approved", {
+        recipientKey: request.to_recruiter_id,
+        correlationId: `ownership-approved-${request.request_id}`,
+        message: "Your candidate ownership request was approved.",
+        routeState: { requestId: request.request_id },
+        context: {
+          request_id: request.request_id,
+          candidate_id: request.candidate_id
+        }
+      });
+
       res.status(200).json({
 
         success: true,
@@ -8842,6 +8854,18 @@ app.put(
         ]
 
       );
+
+      const bellNotificationService = require("./services/bellNotificationService");
+      await bellNotificationService.notifyOutcome(pool, "ownership_rejected", {
+        recipientKey: request.to_recruiter_id,
+        correlationId: `ownership-rejected-${request.request_id}`,
+        message: "Your candidate ownership request was rejected.",
+        routeState: { requestId: request.request_id },
+        context: {
+          request_id: request.request_id,
+          candidate_id: request.candidate_id
+        }
+      });
 
       res.status(200).json({
 

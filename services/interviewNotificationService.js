@@ -369,6 +369,199 @@ async function notifyInterviewCancelledOfferHold(
   };
 }
 
+function formatInterviewSlot(row) {
+  const dateLabel = row?.interview_date ? formatInterviewDateLabel(row.interview_date) : "";
+  const timeLabel = row?.interview_time ? String(row.interview_time) : "";
+  return [dateLabel, timeLabel].filter(Boolean).join(" ");
+}
+
+async function listInterviewEmployeeRecipients(pool, interviewId, actorEmployeeCode) {
+  const codes = new Set();
+  const normalizedInterviewId = String(interviewId || "").trim();
+
+  if (!normalizedInterviewId) {
+    return [];
+  }
+
+  try {
+    const byEmail = await pool.query(
+      `SELECT DISTINCT u.employee_code
+       FROM im_panel_assignments p
+       INNER JOIN user_mstr u
+         ON LOWER(BTRIM(u.email_id)) = LOWER(BTRIM(p.interviewer_email))
+       WHERE p.interview_id = $1
+         AND COALESCE(u.is_active, TRUE) = TRUE
+         AND BTRIM(COALESCE(u.employee_code, '')) <> ''`,
+      [normalizedInterviewId]
+    );
+
+    for (const row of byEmail.rows) {
+      codes.add(String(row.employee_code).trim());
+    }
+  } catch (error) {
+    console.error(
+      "[interviewNotificationService] panel email recipient lookup failed:",
+      error.message
+    );
+  }
+
+  try {
+    const byPanel = await pool.query(
+      `SELECT DISTINCT ip.employee_code
+       FROM im_panel_assignments p
+       INNER JOIN interview_panel_mstr ip
+         ON ip.panel_id = p.panel_id
+       WHERE p.interview_id = $1
+         AND BTRIM(COALESCE(ip.employee_code, '')) <> ''`,
+      [normalizedInterviewId]
+    );
+
+    for (const row of byPanel.rows) {
+      codes.add(String(row.employee_code).trim());
+    }
+  } catch (error) {
+    console.error(
+      "[interviewNotificationService] panel employee recipient lookup failed:",
+      error.message
+    );
+  }
+
+  const actor = String(actorEmployeeCode || "").trim();
+  if (actor) {
+    codes.delete(actor);
+  }
+
+  return [...codes];
+}
+
+async function loadInterviewBellContext(pool, interviewId) {
+  const result = await pool.query(
+    `SELECT i.interview_id, i.round_type, i.interview_date, i.interview_time,
+            i.schedule_id, i.created_by,
+            c.first_name, c.last_name
+     FROM im_interviews i
+     LEFT JOIN cand_mstr c ON c.candidate_id = i.candidate_id
+     WHERE i.interview_id = $1`,
+    [String(interviewId)]
+  );
+
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  const candidateName = `${row.first_name || ""} ${row.last_name || ""}`.trim() || "the candidate";
+
+  return {
+    interviewId: row.interview_id,
+    roundType: row.round_type || "Interview",
+    scheduleId: row.schedule_id || null,
+    createdBy: row.created_by || null,
+    candidateName,
+    slot: formatInterviewSlot(row)
+  };
+}
+
+/**
+ * In-app Bell for panel employees already recorded on the interview.
+ * Does not send email and does not change interview_scheduled email correlation ids.
+ */
+async function notifyInterviewParticipants(pool, {
+  interviewId,
+  outcomeKey,
+  actorEmployeeCode
+}) {
+  const bellNotificationService = require("./bellNotificationService");
+  const context = await loadInterviewBellContext(pool, interviewId);
+
+  if (!context) {
+    return { skipped: true, reason: "interview_not_found" };
+  }
+
+  const recipients = await listInterviewEmployeeRecipients(
+    pool,
+    interviewId,
+    actorEmployeeCode
+  );
+
+  if (!recipients.length) {
+    return { skipped: true, reason: "no_employee_recipients", deliveries: [] };
+  }
+
+  const verb = outcomeKey === "interview_rescheduled"
+    ? "rescheduled"
+    : outcomeKey === "interview_cancelled"
+      ? "cancelled"
+      : "scheduled";
+  const slotLabel = context.slot ? ` on ${context.slot}` : "";
+  const message = `${context.roundType} with ${context.candidateName} was ${verb}${slotLabel}.`;
+  const deliveries = [];
+
+  for (const recipient of recipients) {
+    deliveries.push(
+      await bellNotificationService.notifyOutcome(pool, outcomeKey, {
+        recipientEmployeeCode: recipient,
+        correlationId: `${outcomeKey}-bell-${context.interviewId}-${recipient}`,
+        message,
+        context: {
+          interview_id: context.interviewId,
+          document_number: context.interviewId,
+          candidate_name: context.candidateName,
+          round_type: context.roundType
+        }
+      })
+    );
+  }
+
+  return { skipped: false, deliveries };
+}
+
+/**
+ * Notify the interview creator when someone else submits feedback.
+ * No reminder is generated here; reminder scheduling is not implemented.
+ */
+async function notifyFeedbackSubmitted(pool, {
+  interviewId,
+  scheduleId,
+  actorEmployeeCode
+}) {
+  const bellNotificationService = require("./bellNotificationService");
+  const context = await loadInterviewBellContext(pool, interviewId);
+
+  if (!context) {
+    return { skipped: true, reason: "interview_not_found" };
+  }
+
+  const creator = await bellNotificationService.resolveActiveEmployeeCode(
+    pool,
+    context.createdBy
+  );
+  const actor = String(actorEmployeeCode || "").trim();
+
+  if (!creator || (actor && creator === actor)) {
+    return { skipped: true, reason: "no_distinct_recipient" };
+  }
+
+  const resolvedScheduleId = scheduleId || context.scheduleId;
+  const route = resolvedScheduleId
+    ? `/view-feedback/${resolvedScheduleId}`
+    : undefined;
+
+  return bellNotificationService.notifyOutcome(pool, "feedback_submitted", {
+    recipientEmployeeCode: creator,
+    correlationId: `feedback-submitted-${context.interviewId}`,
+    message: `Feedback was submitted for ${context.roundType} with ${context.candidateName}.`,
+    route,
+    routeState: resolvedScheduleId ? { scheduleId: resolvedScheduleId } : null,
+    context: {
+      interview_id: context.interviewId,
+      document_number: context.interviewId,
+      schedule_id: resolvedScheduleId || null,
+      candidate_name: context.candidateName
+    }
+  });
+}
+
 module.exports = {
   INTERVIEW_NOTIFICATION_EVENTS,
   INTERVIEW_NOTIFICATION_TEMPLATES,
@@ -379,5 +572,8 @@ module.exports = {
   setInterviewCancelledEmailDeliverer,
   clearInterviewCancelledEmailDeliverer,
   notifyInterviewScheduled,
-  notifyInterviewCancelledOfferHold
+  notifyInterviewCancelledOfferHold,
+  notifyInterviewParticipants,
+  notifyFeedbackSubmitted,
+  listInterviewEmployeeRecipients
 };

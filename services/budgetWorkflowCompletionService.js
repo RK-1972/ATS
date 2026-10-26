@@ -428,6 +428,15 @@ async function handleBudgetWorkflowCompleted(queryable, event, req) {
     }
   });
 
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "budget_approved", {
+    recipientKey: request.submitted_by_employee_code || prior.submitted_by_employee_code,
+    correlationId: `budget-approved-${requestId}-${event.instanceId}`,
+    message: `Budget request ${requestId} was approved.`,
+    routeState: { budgetRequestId: requestId },
+    context: { document_number: requestId, budget_request_id: requestId }
+  });
+
   return {
     businessActionCompleted: true,
     budget_request_id: requestId,
@@ -484,6 +493,15 @@ async function handleBudgetWorkflowRejected(queryable, event, req) {
       rejected_by_task_id: event.rejectedByTaskId || null,
       comments
     }
+  });
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "budget_rejected", {
+    recipientKey: prior?.submitted_by_employee_code,
+    correlationId: `budget-rejected-${requestId}-${event.instanceId}`,
+    message: `Budget request ${requestId} was rejected.`,
+    routeState: { budgetRequestId: requestId },
+    context: { document_number: requestId, budget_request_id: requestId }
   });
 
   return {
@@ -629,6 +647,26 @@ async function handleBudgetClarificationSubmitted(queryable, event, req) {
       same_instance: true
     }
   });
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(
+    queryable,
+    "budget_clarification_submitted",
+    {
+      recipientKey: event.reactivatedAssignee,
+      correlationId: `budget-clarification-submitted-${requestId}-${event.reactivatedTaskId || event.instanceId}`,
+      message: `Budget request ${requestId} has a clarification response and is back in your approval queue.`,
+      routeState: {
+        budgetRequestId: requestId,
+        taskId: event.reactivatedTaskId || null
+      },
+      context: {
+        document_number: requestId,
+        budget_request_id: requestId,
+        task_id: event.reactivatedTaskId || null
+      }
+    }
+  );
 
   return {
     businessActionCompleted: true,

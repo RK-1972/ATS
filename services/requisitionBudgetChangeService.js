@@ -642,6 +642,26 @@ async function handleBudgetChangeWorkflowCompleted(queryable, event, req) {
     req
   );
 
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(
+    queryable,
+    "requisition_budget_change_approved",
+    {
+      recipientKey: changeRow.requested_by,
+      correlationId: `requisition-budget-change-approved-${changeId}`,
+      message: `Requisition budget change ${changeId} for ${changeRow.requisition_code} was approved.`,
+      routeState: {
+        requisitionCode: changeRow.requisition_code,
+        changeId
+      },
+      context: {
+        document_number: changeRow.requisition_code,
+        requisition_code: changeRow.requisition_code,
+        change_id: changeId
+      }
+    }
+  );
+
   return {
     businessActionCompleted: true,
     change_id: changeId,
@@ -675,6 +695,26 @@ async function handleBudgetChangeWorkflowRejected(queryable, event, req) {
     user.name,
     req,
     event.comments || ""
+  );
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(
+    queryable,
+    "requisition_budget_change_rejected",
+    {
+      recipientKey: changeRow.requested_by,
+      correlationId: `requisition-budget-change-rejected-${changeId}`,
+      message: `Requisition budget change ${changeId} for ${changeRow.requisition_code} was rejected.`,
+      routeState: {
+        requisitionCode: changeRow.requisition_code,
+        changeId
+      },
+      context: {
+        document_number: changeRow.requisition_code,
+        requisition_code: changeRow.requisition_code,
+        change_id: changeId
+      }
+    }
   );
 
   return {

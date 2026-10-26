@@ -133,6 +133,18 @@ async function handleRequisitionWorkflowCompleted(queryable, event, req) {
     }
   });
 
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "requisition_approved", {
+    recipientKey: await resolveRequestorEmployeeCode(queryable, requisition.created_by),
+    correlationId: `requisition-approved-${requisition.requisition_code}-${event.instanceId}`,
+    message: `Requisition ${requisition.requisition_code} was approved.`,
+    routeState: { requisitionCode: requisition.requisition_code },
+    context: {
+      document_number: requisition.requisition_code,
+      requisition_code: requisition.requisition_code
+    }
+  });
+
   return {
     businessActionCompleted: true,
     requisition_code: requisition.requisition_code,
@@ -214,6 +226,18 @@ async function handleRequisitionWorkflowRejected(queryable, event, req) {
       approval_status: rejectionStatus,
       comments: event.comments || "",
       source: "talent_demand_workflow_rejection"
+    }
+  });
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "requisition_rejected", {
+    recipientKey: await resolveRequestorEmployeeCode(queryable, requisition.created_by),
+    correlationId: `requisition-rejected-${requisition.requisition_code}-${event.instanceId}`,
+    message: `Requisition ${requisition.requisition_code} was rejected.`,
+    routeState: { requisitionCode: requisition.requisition_code },
+    context: {
+      document_number: requisition.requisition_code,
+      requisition_code: requisition.requisition_code
     }
   });
 
@@ -451,6 +475,26 @@ async function handleRequisitionClarificationSubmitted(queryable, event, req) {
       source: "talent_demand_clarification_submitted"
     }
   });
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(
+    queryable,
+    "requisition_clarification_submitted",
+    {
+      recipientKey: event.reactivatedAssignee,
+      correlationId: `requisition-clarification-submitted-${requisition.requisition_code}-${event.reactivatedTaskId || event.instanceId}`,
+      message: `Requisition ${requisition.requisition_code} has a clarification response and is back in your approval queue.`,
+      routeState: {
+        requisitionCode: requisition.requisition_code,
+        taskId: event.reactivatedTaskId || null
+      },
+      context: {
+        document_number: requisition.requisition_code,
+        requisition_code: requisition.requisition_code,
+        task_id: event.reactivatedTaskId || null
+      }
+    }
+  );
 
   return {
     businessActionCompleted: true,

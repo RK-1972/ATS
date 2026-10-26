@@ -112,22 +112,26 @@ async function notifyOfferClarificationSubmitted(
   });
 
   const submittedOnIso = new Date().toISOString();
+  const bellNotificationService = require("./bellNotificationService");
 
-  return notificationService.send(pool, {
-    event: EVENTS.CLARIFICATION_SUBMITTED,
-    recipient,
-    channel: NOTIFICATION_CHANNELS.IN_APP,
+  return bellNotificationService.notifyOutcome(pool, EVENTS.CLARIFICATION_SUBMITTED, {
+    recipientEmployeeCode: recipient,
     templateKey: TEMPLATES.CLARIFICATION_SUBMITTED,
     correlationId: buildSubmittedCorrelationId(
       normalizedOfferId,
       approverTaskId,
       submittedOnIso
     ),
-    payload: {
+    message: `${contextLabel} — ${requestorName || "The requester"} submitted a clarification response. Review in Pending Offer Approvals.`,
+    routeState: {
+      offerId: normalizedOfferId,
+      taskId: Number(approverTaskId)
+    },
+    context: {
       offer_id: normalizedOfferId,
+      document_number: normalizedOfferId,
       approver_task_id: Number(approverTaskId),
-      title: "Offer clarification received",
-      message: `${contextLabel} — ${requestorName || "The requester"} submitted a clarification response. Review in Pending Offer Approvals.`,
+      task_id: Number(approverTaskId),
       submitted_by: requestorName || null,
       requisition_code: requisitionCode || null,
       candidate_name: candidateName || null

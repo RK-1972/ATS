@@ -1851,6 +1851,24 @@ async function assignRecruiter(pool, reqId, recruiterCode, req) {
     metadata: { recruiterCode, ruleEvaluation: ruleEval }
   });
 
+  const requisitionCode = requisition?.requisition_code || null;
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(pool, "requisition_assigned", {
+    recipientKey: recruiterCode,
+    correlationId: assignmentRow?.assignment_id
+      ? `requisition-assigned-${assignmentRow.assignment_id}`
+      : `requisition-assigned-${requisitionCode || reqId}-${recruiterCode}`,
+    message: `Requisition ${requisitionCode || reqId} was assigned to you.`,
+    route: requisitionCode
+      ? `/recruiter/my-requisitions/${encodeURIComponent(requisitionCode)}`
+      : "/recruiter/my-requisitions",
+    routeState: requisitionCode ? { requisitionCode } : null,
+    context: {
+      document_number: requisitionCode || String(reqId),
+      requisition_code: requisitionCode
+    }
+  });
+
   return {
     assignment: assignmentRow,
     toastMessage: "Recruiter assigned successfully."

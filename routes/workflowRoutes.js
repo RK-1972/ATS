@@ -1,4 +1,5 @@
 const workflowService = require("../services/workflowService");
+const bellNotificationService = require("../services/bellNotificationService");
 
 function handleError(res, error) {
   console.error("Workflow API Error:", error.message);
@@ -15,6 +16,30 @@ function registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin) {
   // My Approvals Workbench (active assignments for actor)
   // Registered before /:workflowCode to avoid path capture.
   // =====================================================
+  app.get("/api/v1/workflows/my-bell-notifications", runtimeGuard, async (req, res) => {
+    try {
+      const employeeCode = String(req.user?.employee_code || "").trim();
+      if (!employeeCode) {
+        return res.status(401).json({
+          success: false,
+          message: "Employee code is required."
+        });
+      }
+
+      const data = await bellNotificationService.listBellNotifications(
+        pool,
+        employeeCode
+      );
+      res.json({
+        success: true,
+        message: "Bell notifications retrieved successfully",
+        data
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
   app.get("/api/v1/workflows/my-approvals", runtimeGuard, async (req, res) => {
     try {
       const data = await workflowService.getMyActiveApprovals(pool, req);

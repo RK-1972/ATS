@@ -321,6 +321,25 @@ async function handleOfferWorkflowCompleted(queryable, event, req) {
   const offerLetterService = require("./offerLetterService");
   await offerLetterService.ensureAwaitingLetterForOffer(queryable, offerId);
 
+  const requestorEmployeeCode = await resolveOfferRequestorEmployeeCode(
+    queryable,
+    offerRow
+  );
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "offer_approved", {
+    recipientKey: requestorEmployeeCode,
+    correlationId: `offer-approved-${offerId}-${event.instanceId}`,
+    message: `Offer ${offerId}${
+      offerRow.candidate_name ? ` for ${offerRow.candidate_name}` : ""
+    } was approved.`,
+    routeState: { offerId },
+    context: {
+      document_number: offerId,
+      offer_id: offerId,
+      candidate_name: offerRow.candidate_name || null
+    }
+  });
+
   return {
     businessActionCompleted: true,
     offer_id: offerId,
@@ -415,6 +434,25 @@ async function handleOfferWorkflowRejected(queryable, event, req) {
       workflow_instance_id: event.instanceId,
       rejected_by_task_id: event.rejectedByTaskId || null,
       comments
+    }
+  });
+
+  const requestorEmployeeCode = await resolveOfferRequestorEmployeeCode(
+    queryable,
+    offerRow
+  );
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "offer_rejected", {
+    recipientKey: requestorEmployeeCode,
+    correlationId: `offer-rejected-${offerId}-${event.instanceId}`,
+    message: `Offer ${offerId}${
+      offerRow.candidate_name ? ` for ${offerRow.candidate_name}` : ""
+    } was rejected.`,
+    routeState: { offerId },
+    context: {
+      document_number: offerId,
+      offer_id: offerId,
+      candidate_name: offerRow.candidate_name || null
     }
   });
 

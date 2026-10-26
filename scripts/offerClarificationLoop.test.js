@@ -52,6 +52,7 @@ describe("offerClarificationNotificationService", () => {
     );
     assert.match(sendCalls[0].payload.message, /Jane Doe/);
     assert.match(sendCalls[0].payload.message, /clarification/i);
+    assert.notEqual(sendCalls[0].payload.bell, true);
   });
 
   it("skips notification when requester or task id is missing", async () => {
@@ -80,6 +81,10 @@ describe("offerClarificationNotificationService", () => {
     assert.equal(sendCalls.length, 1);
     assert.equal(sendCalls[0].recipient, APPROVER_CODE);
     assert.equal(sendCalls[0].event, "offer_clarification_submitted");
+    assert.equal(sendCalls[0].channel, "in_app");
+    assert.equal(sendCalls[0].payload.bell, true);
+    assert.equal(sendCalls[0].payload.title, "Offer Clarification Received");
+    assert.equal(sendCalls[0].payload.route, "/offers/pending-approvals");
     assert.match(sendCalls[0].correlationId, /^offer-clarification-submitted-/);
   });
 });

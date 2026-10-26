@@ -535,6 +535,22 @@ async function handleHeadcountChangeWorkflowCompleted(queryable, event, req) {
     req
   );
 
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "headcount_change_approved", {
+    recipientKey: changeRow.requested_by,
+    correlationId: `headcount-change-approved-${changeId}`,
+    message: `Headcount change ${changeId} for ${changeRow.requisition_code} was approved.`,
+    routeState: {
+      requisitionCode: changeRow.requisition_code,
+      changeId
+    },
+    context: {
+      document_number: changeRow.requisition_code,
+      requisition_code: changeRow.requisition_code,
+      change_id: changeId
+    }
+  });
+
   return {
     businessActionCompleted: true,
     change_id: changeId,
@@ -569,6 +585,22 @@ async function handleHeadcountChangeWorkflowRejected(queryable, event, req) {
     req,
     event.comments || ""
   );
+
+  const bellNotificationService = require("./bellNotificationService");
+  await bellNotificationService.notifyOutcome(queryable, "headcount_change_rejected", {
+    recipientKey: changeRow.requested_by,
+    correlationId: `headcount-change-rejected-${changeId}`,
+    message: `Headcount change ${changeId} for ${changeRow.requisition_code} was rejected.`,
+    routeState: {
+      requisitionCode: changeRow.requisition_code,
+      changeId
+    },
+    context: {
+      document_number: changeRow.requisition_code,
+      requisition_code: changeRow.requisition_code,
+      change_id: changeId
+    }
+  });
 
   return {
     businessActionCompleted: true,
