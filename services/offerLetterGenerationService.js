@@ -8,7 +8,10 @@ const offerTemplateMergeService = require("./offerTemplateMergeService");
 const pdfGenerationService = require("./pdfGenerationService");
 const offerDocumentStorageService = require("./offerDocumentStorageService");
 const { userContext } = require("./enterpriseAuditService");
-const { assertOfferReadAccess } = require("./offerManagementService");
+
+function getAssertOfferReadAccess() {
+  return require("./offerManagementService").assertOfferReadAccess;
+}
 
 const OFFER_LETTER_DOCUMENT_TYPE = "Offer Letter";
 const OFFER_BUSINESS_OBJECT_TYPE = "OFFER";
@@ -114,7 +117,7 @@ async function generateOfferLetterDocument(pool, offerId, req) {
     throw httpError("Offer id is required.", 400);
   }
 
-  await assertOfferReadAccess(pool, req, offerId);
+  await getAssertOfferReadAccess()(pool, req, offerId);
 
   try {
     const offerRow = await findOfferContext(pool, offerId);
