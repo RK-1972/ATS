@@ -762,17 +762,6 @@ function mapRequisitionInspectorDetails(row) {
 }
 
 async function getRequisitionInspectorDetail(pool, code, req) {
-  await assertCanCreateRequisition(pool, req);
-
-  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
-
-  if (!ownerKeys.length) {
-    throw httpError(
-      "Enterprise Access Denied. You are not authorized to view requisitions.",
-      403
-    );
-  }
-
   const requisitionCode = String(code || "").trim();
 
   if (!requisitionCode) {
@@ -786,14 +775,27 @@ async function getRequisitionInspectorDetail(pool, code, req) {
     throw httpError("Requisition not found.", 404);
   }
 
-  const createdByKey = String(row.created_by || "").trim();
+  const instanceId = resolveRequisitionWorkflowInstanceId(row);
+  let activeTask = null;
 
-  if (!createdByKey || !ownerKeys.includes(createdByKey)) {
-    throw httpError(
-      "Enterprise Access Denied. You are not authorized to view this requisition.",
-      403
-    );
+  try {
+    activeTask = await findActiveRequisitionApprovalTask(pool, requisitionCode, instanceId);
+  } catch (_error) {
+    activeTask = null;
   }
+
+  const assignee = String(
+    activeTask?.assignment_assignee || activeTask?.assignee || ""
+  ).trim();
+
+  await assertRequisitionApprovalParticipantAccess(pool, req, row, {
+    assigneeEmployeeCode: assignee
+  });
+
+  const ownerKeys = await resolveRequisitionRequestorCreatedByKeys(pool, req);
+  const createdByKey = String(row.created_by || "").trim();
+  const isRequestor = Boolean(createdByKey) && ownerKeys.includes(createdByKey);
+  const isAdmin = String(req.user?.role_name || "").toLowerCase() === "admin";
 
   const requestor = await resolveRequestorProfile(pool, row.created_by);
   const details = mapRequisitionInspectorDetails(row);
@@ -824,8 +826,7 @@ async function getRequisitionInspectorDetail(pool, code, req) {
 
     const canResubmit =
       row.req_status === REQUISITION_STATUS.CLARIFICATION_REQUESTED
-      && Boolean(createdByKey)
-      && ownerKeys.includes(createdByKey);
+      && (isRequestor || isAdmin);
 
     return {
       requisition: details,
