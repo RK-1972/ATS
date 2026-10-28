@@ -95,7 +95,7 @@ describe("talentDemandDraftService.updateDraft save path", () => {
     const pool = {
       query: async (sql) => {
         if (String(sql).includes("FROM wp_approved_positions")) {
-          return { rows: [{ position_title: "Role" }] };
+          return { rows: [{ position_title: "Role", headcount: 1 }] };
         }
         return { rows: [] };
       }

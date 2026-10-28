@@ -247,6 +247,8 @@ async function resolveTalentDemandFields(queryable, options = {}) {
     approved_position_title: position.position_title || null,
     approved_position_department: position.department || null,
     approved_position_grade: position.grade || null,
+    approved_headcount:
+      position.headcount != null ? Number(position.headcount) : null,
     approval_route_id: approvalRouteId,
     approval_route_name: routeMeta.approval_route_name,
     position_selection_required: positionSelectionRequired,
@@ -299,6 +301,9 @@ async function buildTalentDemandFieldResolutionPreview(pool, query = {}) {
       approved_position_title: position?.position_title || null,
       approved_position_department: position?.department || null,
       approved_position_grade: position?.grade || null,
+      approved_headcount:
+        position?.headcount != null ? Number(position.headcount) : null,
+      budget_approved: position?.budget_approved ?? null,
       approval_route_id: approvalRouteId,
       approval_route_name: routeMeta.approval_route_name,
       position_selection_required: false,
@@ -317,6 +322,9 @@ async function buildTalentDemandFieldResolutionPreview(pool, query = {}) {
       approved_position_title: eligible[0].position_title,
       approved_position_department: eligible[0].department,
       approved_position_grade: eligible[0].grade,
+      approved_headcount:
+        eligible[0].headcount != null ? Number(eligible[0].headcount) : null,
+      budget_approved: eligible[0].budget_approved ?? null,
       approval_route_id: approvalRouteId,
       approval_route_name: routeMeta.approval_route_name,
       position_selection_required: false,

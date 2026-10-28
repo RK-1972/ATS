@@ -228,6 +228,7 @@ async function listDraftsByOwner(pool, ownerEmployeeCode) {
      FROM td_draft_mstr
      WHERE owner_employee_code = $1
        AND is_deleted = FALSE
+       AND UPPER(COALESCE(status, 'DRAFT')) = 'DRAFT'
      ORDER BY updated_on DESC`,
     [ownerEmployeeCode]
   );

@@ -66,6 +66,56 @@ async function loadAuthoritativePositionTitle(queryable, approvedPositionId) {
   return normalizeText(row.position_title);
 }
 
+async function loadAuthoritativeHeadcount(queryable, approvedPositionId) {
+  const positionId = normalizeText(approvedPositionId);
+  if (!positionId) {
+    return null;
+  }
+
+  const result = await queryable.query(
+    `SELECT headcount
+     FROM wp_approved_positions
+     WHERE position_id = $1`,
+    [positionId]
+  );
+
+  const row = result.rows[0];
+  if (!row) {
+    throw httpError(`Approved position not found: ${positionId}`, 404);
+  }
+
+  const headcount = Number(row.headcount);
+  if (!Number.isFinite(headcount) || !Number.isInteger(headcount) || headcount < 1) {
+    throw httpError(
+      "Approved position headcount is invalid or missing.",
+      400
+    );
+  }
+
+  return headcount;
+}
+
+function assertOpeningsCountMatchesApprovedHeadcount(payload, authoritativeHeadcount) {
+  if (
+    payload.openings_count === undefined ||
+    payload.openings_count === null ||
+    payload.openings_count === ""
+  ) {
+    return;
+  }
+
+  const requested = Number(payload.openings_count);
+  if (
+    !Number.isFinite(requested) ||
+    Number(requested) !== Number(authoritativeHeadcount)
+  ) {
+    throw httpError(
+      "openings_count must match the approved position headcount.",
+      400
+    );
+  }
+}
+
 function assertJobTitleMatchesAuthoritative(payloadJobTitle, authoritativeTitle) {
   if (payloadJobTitle === undefined) {
     return;
@@ -125,11 +175,19 @@ async function assertApprovedPositionUpdateIntegrity(queryable, options = {}) {
   );
 
   assertJobTitleMatchesAuthoritative(payload.job_title, authoritativeTitle);
+
+  const authoritativeHeadcount = await loadAuthoritativeHeadcount(
+    queryable,
+    effectivePositionId
+  );
+  assertOpeningsCountMatchesApprovedHeadcount(payload, authoritativeHeadcount);
 }
 
 module.exports = {
   assertApprovedPositionUpdateIntegrity,
   assertApprovedPositionIdImmutable,
   assertJobTitleMatchesAuthoritative,
-  loadAuthoritativePositionTitle
+  loadAuthoritativePositionTitle,
+  loadAuthoritativeHeadcount,
+  assertOpeningsCountMatchesApprovedHeadcount
 };

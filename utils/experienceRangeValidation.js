@@ -45,6 +45,20 @@ function collectExperienceRangeErrors(experienceMin, experienceMax) {
   return errors;
 }
 
+function sanitizeExperienceInput(rawValue) {
+  if (rawValue === "" || rawValue === null || rawValue === undefined) {
+    return "";
+  }
+
+  const text = String(rawValue);
+  if (!/^\d*(\.\d*)?$/.test(text) || text.includes("-")) {
+    return null;
+  }
+
+  return text;
+}
+
 module.exports = {
-  collectExperienceRangeErrors
+  collectExperienceRangeErrors,
+  sanitizeExperienceInput
 };

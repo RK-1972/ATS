@@ -6,7 +6,9 @@
 
 const talentDemandDraftRepository = require("../repositories/talentDemandDraftRepository");
 const {
-  assertApprovedPositionUpdateIntegrity
+  assertApprovedPositionUpdateIntegrity,
+  loadAuthoritativeHeadcount,
+  assertOpeningsCountMatchesApprovedHeadcount
 } = require("../utils/approvedPositionUpdateIntegrity");
 const {
   resolveRequisitionRequestorCreatedByKeys,
@@ -130,9 +132,16 @@ async function createDraft(pool, formData, actor) {
     approvedPositionId
   );
 
+  const authoritativeHeadcount = await loadAuthoritativeHeadcount(
+    pool,
+    approvedPositionId
+  );
+  assertOpeningsCountMatchesApprovedHeadcount(formData || {}, authoritativeHeadcount);
+
   assertDraftOpeningsCount(formData);
 
   const payload = buildDraftPayload(formData, actor);
+  payload.openings_count = authoritativeHeadcount;
 
   if (!payload.owner_employee_code || !payload.created_by) {
     throw httpError("owner_employee_code and created_by are required.", 400);
@@ -163,12 +172,18 @@ async function updateDraft(pool, draftId, formData, actor) {
     existingRequisitionCode: existing.result_requisition_code
   });
 
+  const authoritativeHeadcount = await loadAuthoritativeHeadcount(
+    pool,
+    existing.approved_position_id
+  );
+
   assertDraftOpeningsCount(formData);
 
   const payload = {
     ...formData,
     updated_by: actorName || employeeCode,
-    status: DRAFT_STATUS.DRAFT
+    status: DRAFT_STATUS.DRAFT,
+    openings_count: authoritativeHeadcount
   };
 
   const updated = await talentDemandDraftRepository.updateDraft(

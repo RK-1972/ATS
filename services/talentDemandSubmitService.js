@@ -18,6 +18,9 @@ const talentDemandDraftRepository = require("../repositories/talentDemandDraftRe
 const recruitmentService = require("./recruitmentService");
 const workflowService = require("./workflowService");
 const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
+const {
+  loadAuthoritativeHeadcount
+} = require("../utils/approvedPositionUpdateIntegrity");
 
 const { DRAFT_STATUS } = talentDemandDraftService;
 
@@ -209,10 +212,15 @@ async function submitDraft(pool, draftId, employeeCode, rowVersion, req = null) 
 
     draft.approved_position_id = resolvedFields.approved_position_id;
     draft.approval_route_id = resolvedFields.approval_route_id;
+    draft.openings_count =
+      resolvedFields.approved_headcount != null
+        ? resolvedFields.approved_headcount
+        : await loadAuthoritativeHeadcount(client, draft.approved_position_id);
 
     await talentDemandDraftRepository.updateDraft(client, draftId, {
       approved_position_id: resolvedFields.approved_position_id,
       approval_route_id: resolvedFields.approval_route_id,
+      openings_count: draft.openings_count,
       updated_by: employeeCode
     });
 

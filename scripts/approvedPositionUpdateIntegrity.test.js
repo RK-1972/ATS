@@ -16,7 +16,8 @@ function createMockQueryable(positionTitle = "Senior Engineer") {
             {
               position_id: params[0],
               position_title: positionTitle,
-              status: "Active"
+              status: "Active",
+              headcount: 2
             }
           ]
         };
