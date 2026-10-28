@@ -16,6 +16,7 @@ describe("talentDemandSubmitService.assertSubmitReadiness", () => {
     employment_type: "Full Time",
     priority_level: "High",
     target_date: "2026-12-31",
+    openings_count: 1,
     row_version: 1
   };
 
@@ -49,6 +50,20 @@ describe("talentDemandSubmitService.assertSubmitReadiness", () => {
         ),
       (error) => {
         assert.match(error.message, /experience_min cannot be negative/);
+        return true;
+      }
+    );
+  });
+
+  it("rejects negative openings_count on submit readiness", () => {
+    assert.throws(
+      () =>
+        assertSubmitReadiness(
+          { ...baseDraft, openings_count: -3 },
+          1
+        ),
+      (error) => {
+        assert.match(error.message, /openings_count must be a whole number/i);
         return true;
       }
     );

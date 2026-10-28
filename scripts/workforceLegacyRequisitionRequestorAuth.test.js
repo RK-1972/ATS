@@ -34,6 +34,22 @@ describe("legacy requisition requestor authorization", () => {
         if (text.includes("FROM wp_config_state")) {
           return { rows: [buildConfigRow(positionId)] };
         }
+        if (text.includes("FROM wp_approved_positions")) {
+          return {
+            rows: [
+              {
+                position_id: positionId,
+                position_title: "Analyst",
+                department: "HR",
+                grade: "G1",
+                headcount: 1,
+                budget_approved: 1000000,
+                remaining_budget: 500000,
+                status: "Active"
+              }
+            ]
+          };
+        }
         if (text.includes("FROM rm_requisitions") && text.includes("approved_position_id = $1")) {
           return {
             rows: [
@@ -81,6 +97,22 @@ describe("legacy requisition requestor authorization", () => {
         const text = String(sql);
         if (text.includes("FROM wp_config_state")) {
           return { rows: [buildConfigRow(positionId)] };
+        }
+        if (text.includes("FROM wp_approved_positions")) {
+          return {
+            rows: [
+              {
+                position_id: positionId,
+                position_title: "Analyst",
+                department: "HR",
+                grade: "G1",
+                headcount: 1,
+                budget_approved: 1000000,
+                remaining_budget: 500000,
+                status: "Active"
+              }
+            ]
+          };
         }
         if (text.includes("FROM rm_requisitions") && text.includes("approved_position_id = $1")) {
           return {

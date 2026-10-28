@@ -148,6 +148,280 @@ describe("bellNotificationService", () => {
     assert.equal(rows[0].category, "offer");
   });
 
+  it("hides clarification bell rows when the linked approval task is no longer active", async () => {
+    const executor = executorFrom(async (sql, params) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 11,
+              event_key: "offer_clarification_submitted",
+              metadata: {
+                bell: true,
+                title: "Offer Clarification Received",
+                message: "Clarification submitted.",
+                category: "offer",
+                route: "/offers/pending-approvals",
+                route_state: { offerId: "OFF-9", taskId: 9001 },
+                task_id: 9001,
+                document_number: "OFF-9"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            },
+            {
+              delivery_id: 12,
+              event_key: "offer_approved",
+              metadata: {
+                bell: true,
+                title: "Offer Approved",
+                message: "Offer OFF-8 approved.",
+                category: "offer",
+                route: "/offers/my-requests",
+                document_number: "OFF-8"
+              },
+              attempted_on: "2026-10-25T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM wf_tasks t")) {
+        assert.deepEqual(params, ["EMP-REQ", [9001]]);
+        return { rows: [] };
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-REQ");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].event_key, "offer_approved");
+  });
+
+  it("keeps clarification bell rows while the linked task remains pending for the assignee", async () => {
+    const executor = executorFrom(async (sql, params) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 21,
+              event_key: "budget_clarification_submitted",
+              metadata: {
+                bell: true,
+                title: "Budget Clarification Received",
+                message: "Budget clarification submitted.",
+                category: "budget",
+                route: "/my-approvals",
+                route_state: { budgetRequestId: "BR-1", taskId: 7001 },
+                task_id: 7001,
+                document_number: "BR-1"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM wf_tasks t")) {
+        return { rows: [{ task_id: 7001 }] };
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-REQ");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].event_key, "budget_clarification_submitted");
+    assert.equal(rows[0].task_id, 7001);
+  });
+
+  it("hides interview schedule bell rows after the interview is no longer scheduled", async () => {
+    const executor = executorFrom(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 31,
+              event_key: "interview_scheduled",
+              metadata: {
+                bell: true,
+                title: "Interview Scheduled",
+                message: "Technical interview scheduled.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-55",
+                interview_id: "INT-55"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM im_interviews")) {
+        return {
+          rows: [{ interview_id: "INT-55", interview_status: "Completed" }]
+        };
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-PANEL");
+    assert.equal(rows.length, 0);
+  });
+
+  it("keeps interview schedule bell rows when the interview record is missing", async () => {
+    const executor = executorFrom(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 32,
+              event_key: "interview_scheduled",
+              metadata: {
+                bell: true,
+                title: "Interview Scheduled",
+                message: "Technical interview scheduled.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-MISSING",
+                interview_id: "INT-MISSING"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM im_interviews")) {
+        return { rows: [] };
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-PANEL");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].event_key, "interview_scheduled");
+  });
+
+  it("keeps schedule and clarification rows when eligibility lookups fail", async () => {
+    const executor = executorFrom(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 41,
+              event_key: "offer_clarification_submitted",
+              metadata: {
+                bell: true,
+                title: "Offer Clarification Received",
+                message: "Clarification submitted.",
+                category: "offer",
+                route: "/offers/pending-approvals",
+                task_id: 9100,
+                document_number: "OFF-10"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            },
+            {
+              delivery_id: 42,
+              event_key: "interview_rescheduled",
+              metadata: {
+                bell: true,
+                title: "Interview Rescheduled",
+                message: "Interview moved.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-77",
+                interview_id: "INT-77"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            },
+            {
+              delivery_id: 43,
+              event_key: "interview_cancelled",
+              metadata: {
+                bell: true,
+                title: "Interview Cancelled",
+                message: "Interview cancelled.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-77"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM wf_tasks t")) {
+        throw new Error("task lookup unavailable");
+      }
+      if (text.includes("FROM im_interviews")) {
+        throw new Error("interview lookup unavailable");
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-REQ");
+    assert.equal(rows.length, 3);
+    assert.deepEqual(
+      rows.map((row) => row.event_key).sort(),
+      [
+        "interview_cancelled",
+        "interview_rescheduled",
+        "offer_clarification_submitted"
+      ]
+    );
+  });
+
+  it("hides scheduled bell rows for cancelled interviews but keeps cancellation notices", async () => {
+    const executor = executorFrom(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM notification_deliveries")) {
+        return {
+          rows: [
+            {
+              delivery_id: 51,
+              event_key: "interview_scheduled",
+              metadata: {
+                bell: true,
+                title: "Interview Scheduled",
+                message: "Technical interview scheduled.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-88",
+                interview_id: "INT-88"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            },
+            {
+              delivery_id: 52,
+              event_key: "interview_cancelled",
+              metadata: {
+                bell: true,
+                title: "Interview Cancelled",
+                message: "Interview cancelled.",
+                category: "interviewScheduled",
+                route: "/interviewer",
+                document_number: "INT-88"
+              },
+              attempted_on: "2026-10-26T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (text.includes("FROM im_interviews")) {
+        return {
+          rows: [{ interview_id: "INT-88", interview_status: "Cancelled" }]
+        };
+      }
+      throw new Error(`unexpected query: ${text}`);
+    });
+
+    const rows = await bellNotificationService.listBellNotifications(executor, "EMP-PANEL");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].event_key, "interview_cancelled");
+  });
+
   it("rejects a bell list without an employee code before querying", async () => {
     await assert.rejects(
       () => bellNotificationService.listBellNotifications({

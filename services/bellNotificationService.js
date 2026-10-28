@@ -113,6 +113,17 @@ const BELL_OUTCOMES = {
 
 const BELL_LIST_LIMIT = 50;
 
+const TASK_LINKED_CLARIFICATION_EVENTS = new Set([
+  "offer_clarification_submitted",
+  "budget_clarification_submitted",
+  "requisition_clarification_submitted"
+]);
+
+const INTERVIEW_SCHEDULE_BELL_EVENTS = new Set([
+  "interview_scheduled",
+  "interview_rescheduled"
+]);
+
 function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
@@ -280,6 +291,179 @@ function mapBellRow(row) {
     route_state: routeState,
     task_id: metadata.task_id || routeState?.taskId || null,
     document_number: metadata.document_number || null,
+    interview_id:
+      metadata.interview_id ||
+      (INTERVIEW_SCHEDULE_BELL_EVENTS.has(String(row.event_key || ""))
+        ? metadata.document_number || null
+        : null),
+    attempted_on: row.attempted_on,
+    bell_dismissed:
+      metadata.bell_dismissed === true || metadata.bell_dismissed === "true"
+  };
+}
+
+function resolveBellTaskId(row) {
+  const taskId = row?.task_id ?? row?.route_state?.taskId ?? null;
+  if (taskId == null || taskId === "") {
+    return null;
+  }
+  return Number(taskId);
+}
+
+async function loadActiveBellTaskIds(executor, employeeCode, taskIds) {
+  const normalizedIds = [...new Set(taskIds.filter((id) => Number.isFinite(id)))];
+
+  if (!normalizedIds.length) {
+    return { reliable: true, ids: new Set() };
+  }
+
+  try {
+    const result = await executor.query(
+      `SELECT DISTINCT t.task_id
+     FROM wf_tasks t
+     INNER JOIN wf_assignments a ON a.task_id = t.task_id
+     WHERE a.assignee = $1
+       AND a.active = TRUE
+       AND LOWER(t.status) = 'pending'
+       AND t.task_id = ANY($2::bigint[])`,
+      [employeeCode, normalizedIds]
+    );
+
+    return {
+      reliable: true,
+      ids: new Set(result.rows.map((row) => String(row.task_id)))
+    };
+  } catch (error) {
+    console.error(
+      "[bellNotificationService] active task lookup failed:",
+      error.message
+    );
+    return { reliable: false, ids: new Set() };
+  }
+}
+
+async function loadInterviewScheduleEligibility(executor, interviewIds) {
+  const normalizedIds = [
+    ...new Set(
+      interviewIds.map((id) => String(id || "").trim()).filter(Boolean)
+    )
+  ];
+
+  if (!normalizedIds.length) {
+    return { reliable: true, byId: new Map() };
+  }
+
+  const byId = new Map(normalizedIds.map((id) => [id, "unknown"]));
+
+  try {
+    const result = await executor.query(
+      `SELECT interview_id, interview_status
+     FROM im_interviews
+     WHERE interview_id = ANY($1::varchar[])`,
+      [normalizedIds]
+    );
+
+    for (const row of result.rows) {
+      const interviewId = String(row.interview_id || "").trim();
+      if (!interviewId) {
+        continue;
+      }
+
+      const status = String(row.interview_status || "").trim();
+      if (status === "Scheduled") {
+        byId.set(interviewId, "scheduled");
+      } else if (status) {
+        byId.set(interviewId, "not_scheduled");
+      }
+    }
+
+    return { reliable: true, byId };
+  } catch (error) {
+    console.error(
+      "[bellNotificationService] interview eligibility lookup failed:",
+      error.message
+    );
+    return { reliable: false, byId: new Map() };
+  }
+}
+
+async function filterResolvedActionBellRows(executor, employeeCode, rows) {
+  const withoutDismissed = rows.filter((row) => !row.bell_dismissed);
+
+  const clarificationTaskIds = [];
+  const scheduleInterviewIds = [];
+
+  withoutDismissed.forEach((row) => {
+    const eventKey = String(row.event_key || "").trim();
+
+    if (TASK_LINKED_CLARIFICATION_EVENTS.has(eventKey)) {
+      const taskId = resolveBellTaskId(row);
+      if (Number.isFinite(taskId)) {
+        clarificationTaskIds.push(taskId);
+      }
+    }
+
+    if (INTERVIEW_SCHEDULE_BELL_EVENTS.has(eventKey)) {
+      const interviewId = String(
+        row.interview_id || row.document_number || ""
+      ).trim();
+      if (interviewId) {
+        scheduleInterviewIds.push(interviewId);
+      }
+    }
+  });
+
+  const [activeTaskLookup, interviewEligibility] = await Promise.all([
+    loadActiveBellTaskIds(executor, employeeCode, clarificationTaskIds),
+    loadInterviewScheduleEligibility(executor, scheduleInterviewIds)
+  ]);
+
+  return withoutDismissed.filter((row) => {
+    const eventKey = String(row.event_key || "").trim();
+
+    if (TASK_LINKED_CLARIFICATION_EVENTS.has(eventKey)) {
+      const taskId = resolveBellTaskId(row);
+      if (!Number.isFinite(taskId)) {
+        return true;
+      }
+      if (!activeTaskLookup.reliable) {
+        return true;
+      }
+      return activeTaskLookup.ids.has(String(taskId));
+    }
+
+    if (INTERVIEW_SCHEDULE_BELL_EVENTS.has(eventKey)) {
+      const interviewId = String(
+        row.interview_id || row.document_number || ""
+      ).trim();
+      if (!interviewId) {
+        return true;
+      }
+      if (!interviewEligibility.reliable) {
+        return true;
+      }
+      const eligibility = interviewEligibility.byId.get(interviewId) || "unknown";
+      if (eligibility === "unknown") {
+        return true;
+      }
+      return eligibility === "scheduled";
+    }
+
+    return true;
+  });
+}
+
+function toBellNotificationResponse(row) {
+  return {
+    delivery_id: row.delivery_id,
+    event_key: row.event_key,
+    title: row.title,
+    message: row.message,
+    category: row.category,
+    route: row.route,
+    route_state: row.route_state,
+    task_id: row.task_id,
+    document_number: row.document_number,
     attempted_on: row.attempted_on
   };
 }
@@ -303,7 +487,17 @@ async function listBellNotifications(executor, employeeCode) {
     [recipient, BELL_LIST_LIMIT]
   );
 
-  return result.rows.map(mapBellRow).filter((row) => row.title && row.category);
+  const mapped = result.rows
+    .map(mapBellRow)
+    .filter((row) => row.title && row.category);
+
+  const activeRows = await filterResolvedActionBellRows(
+    executor,
+    recipient,
+    mapped
+  );
+
+  return activeRows.map(toBellNotificationResponse);
 }
 
 module.exports = {

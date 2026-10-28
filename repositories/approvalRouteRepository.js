@@ -240,7 +240,41 @@ function normalizeOptionalAmount(value) {
     throw error;
   }
 
+  if (amount < 0) {
+    const error = new Error("Amount cannot be negative.");
+    error.status = 400;
+    throw error;
+  }
+
   return amount;
+}
+
+function validateMaxApprovalDays(value, options = {}) {
+  const { allowBlank = false } = options;
+
+  if (value === null || value === undefined || value === "") {
+    if (allowBlank) {
+      return null;
+    }
+
+    const error = new Error(
+      "max_approval_days must be a whole number of at least 1."
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+    const error = new Error(
+      "max_approval_days must be a whole number of at least 1."
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  return parsed;
 }
 
 function mapPolicyRow(row) {
@@ -468,6 +502,9 @@ ${POLICY_MATCHING_CRITERIA_SQL}
 }
 
 async function createApprovalRoute(pool, routeData) {
+  const maxApprovalDays =
+    validateMaxApprovalDays(routeData.max_approval_days, { allowBlank: true }) ?? 3;
+
   const result = await pool.query(
     `INSERT INTO approval_route_mstr (
        route_name,
@@ -488,7 +525,7 @@ async function createApprovalRoute(pool, routeData) {
       routeData.applies_to ?? "Requisition",
       routeData.status ?? "Draft",
       routeData.effective_from ?? null,
-      routeData.max_approval_days ?? 3,
+      maxApprovalDays,
       routeData.created_by ?? null
     ]
   );
@@ -497,6 +534,13 @@ async function createApprovalRoute(pool, routeData) {
 }
 
 async function updateApprovalRoute(pool, routeId, routeData) {
+  let maxApprovalDays = null;
+  if (Object.prototype.hasOwnProperty.call(routeData, "max_approval_days")) {
+    maxApprovalDays = validateMaxApprovalDays(routeData.max_approval_days, {
+      allowBlank: true
+    });
+  }
+
   const result = await pool.query(
     `UPDATE approval_route_mstr
      SET
@@ -517,7 +561,7 @@ async function updateApprovalRoute(pool, routeId, routeData) {
       routeData.applies_to ?? null,
       routeData.status ?? null,
       routeData.effective_from ?? null,
-      routeData.max_approval_days ?? null,
+      maxApprovalDays,
       routeData.updated_by ?? null
     ]
   );
@@ -935,5 +979,6 @@ module.exports = {
   getApprovalRoutePolicy,
   createApprovalRoutePolicy,
   updateApprovalRoutePolicy,
-  setApprovalRoutePolicyActive
+  setApprovalRoutePolicyActive,
+  validateMaxApprovalDays
 };

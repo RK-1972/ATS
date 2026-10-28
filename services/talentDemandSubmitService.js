@@ -11,6 +11,9 @@ const talentDemandDraftService = require("./talentDemandDraftService");
 const {
   collectExperienceRangeErrors
 } = require("../utils/experienceRangeValidation");
+const {
+  collectOpeningsCountErrors
+} = require("../utils/nonNegativeNumericValidation");
 const talentDemandDraftRepository = require("../repositories/talentDemandDraftRepository");
 const recruitmentService = require("./recruitmentService");
 const workflowService = require("./workflowService");
@@ -111,6 +114,8 @@ function assertSubmitReadiness(draft, rowVersion) {
       draft.experience_max
     )
   );
+
+  errors.push(...collectOpeningsCountErrors(draft.openings_count, { allowBlank: true }));
 
   if (errors.length > 0) {
     throw httpError(errors.join(" "), 400);

@@ -135,7 +135,19 @@ async function assertValidRequestedHeadcount(
   requisition,
   requestedHeadcount
 ) {
-  const requested = normalizeRequiredHeadcount(requestedHeadcount);
+  const parsed = Number(requestedHeadcount);
+  if (
+    !Number.isFinite(parsed) ||
+    !Number.isInteger(parsed) ||
+    parsed < 1
+  ) {
+    throw httpError(
+      "requested_headcount must be a whole number of at least 1.",
+      400
+    );
+  }
+
+  const requested = normalizeRequiredHeadcount(parsed);
   const current = normalizeRequiredHeadcount(requisition.headcount);
 
   if (requested === current) {

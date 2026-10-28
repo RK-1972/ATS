@@ -1381,33 +1381,24 @@ async function createFromApprovedPosition(
   req
 ) {
   const user = userContext(req);
+  const normalizedPositionId = String(positionId || "").trim();
+
+  if (!normalizedPositionId) {
+    throw httpError(
+      "Requisitions must be created from an Approved Position in Workforce Planning. Provide approved_position_id.",
+      400
+    );
+  }
+
+  await assertCanCreateRequisition(queryable, req);
+
   const platformConfig = await loadPlatformConfig(queryable);
   await assertRecruitmentModuleEnabled(platformConfig);
 
-  const position = await loadApprovedPosition(queryable, positionId);
-  if (!position) {
-    throw httpError(`Approved position not found: ${positionId}`, 404);
-  }
-
-  if (position.status === "Fully Utilized") {
-    throw httpError("Approved position budget is fully utilized.", 400);
-  }
-
-  const existingForPosition = await queryable.query(
-    `SELECT requisition_code
-     FROM rm_requisitions
-     WHERE approved_position_id = $1
-     ORDER BY created_on ASC
-     LIMIT 1`,
-    [positionId]
+  const position = await requisitionFieldResolutionService.assertApprovedPositionSelectable(
+    queryable,
+    normalizedPositionId
   );
-
-  if (existingForPosition.rows.length > 0) {
-    throw httpError(
-      `A requisition already exists for approved position ${positionId}: ${existingForPosition.rows[0].requisition_code}. One Approved Position creates exactly one Requisition.`,
-      409
-    );
-  }
 
   const mdValidation = await validateMasterDataReferences(queryable, {
     department: position.department,

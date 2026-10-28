@@ -15,6 +15,7 @@ const {
   buildSubmissionVersionMetaPatch,
   MIRROR_VERSION_STATUS_PUBLISHED
 } = offerApprovalWorkflowService;
+const { assertStrictlyPositiveNumber, assertOptionalStrictlyPositiveNumber } = require("../utils/nonNegativeNumericValidation");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "offers.seed.json");
 
@@ -658,10 +659,10 @@ async function createOffer(pool, payload, req) {
     throw httpError("Offer must link to a candidate mapping.", 400);
   }
 
-  const offeredCtc = Number(context.offered_ctc || context.total_ctc || 0);
-  if (offeredCtc <= 0) {
-    throw httpError("Offered CTC is required.", 400);
-  }
+  const offeredCtc = assertStrictlyPositiveNumber(
+    context.offered_ctc || context.total_ctc,
+    "Offered CTC"
+  );
 
   const commercialErrors = validateCommercialOfferFields(context);
   if (commercialErrors.length) {
@@ -1220,8 +1221,18 @@ async function negotiateOffer(pool, offerId, payload, req) {
   const user = userContext(req);
   const offer = await getOffer(pool, offerId, req);
 
+  const proposedCtc = assertStrictlyPositiveNumber(
+    payload.proposed_ctc ?? offer.offeredCtc,
+    "Proposed CTC"
+  );
+
+  const counterCtc = assertOptionalStrictlyPositiveNumber(
+    payload.counter_ctc,
+    "Counter CTC"
+  );
+
   const ruleEval = await evaluateOfferRules(pool, {
-    offered_salary_lpa: Number(payload.proposed_ctc || offer.offeredCtc) / 100000,
+    offered_salary_lpa: proposedCtc / 100000,
     approved_budget_lpa: offer.approvedBudget / 100000,
     grade: offer.grade,
     action: "negotiate_offer"
@@ -1240,8 +1251,8 @@ async function negotiateOffer(pool, offerId, payload, req) {
     [
       offerId,
       roundNo,
-      Number(payload.proposed_ctc || offer.offeredCtc),
-      payload.counter_ctc ? Number(payload.counter_ctc) : null,
+      proposedCtc,
+      counterCtc,
       user.name,
       payload.notes || null,
       new Date()
@@ -1286,7 +1297,10 @@ async function reviseOffer(pool, offerId, payload, req) {
 
   await saveRevision(pool, row, payload.reason, user.name);
 
-  const offeredCtc = Number(payload.offered_ctc ?? row.offered_ctc);
+  const offeredCtc = assertStrictlyPositiveNumber(
+    payload.offered_ctc ?? row.offered_ctc,
+    "Offered CTC"
+  );
   const { varianceAmount, variancePct } = computeVariance(row.approved_budget, offeredCtc);
   const nextVersion = Number((Number(row.version) + 0.1).toFixed(1));
 
@@ -1791,13 +1805,10 @@ async function correctAndResubmitPendingApproval(pool, offerId, payload, req) {
         ?? offerRow.joining_bonus_frequency
     });
 
-    const offeredCtc = Number(
-      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc
+    const offeredCtc = assertStrictlyPositiveNumber(
+      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc,
+      "Offered CTC"
     );
-
-    if (!Number.isFinite(offeredCtc) || offeredCtc <= 0) {
-      throw httpError("Offered CTC is required.", 400);
-    }
 
     const commercialErrors = validateCommercialOfferFields({
       ...mergedCommercial,
@@ -2024,13 +2035,10 @@ async function amendApprovedUnreleasedOffer(pool, offerId, payload, req) {
         ?? offerRow.joining_bonus_frequency
     });
 
-    const offeredCtc = Number(
-      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc
+    const offeredCtc = assertStrictlyPositiveNumber(
+      payload.offered_ctc ?? payload.offeredCtc ?? offerRow.offered_ctc,
+      "Offered CTC"
     );
-
-    if (!Number.isFinite(offeredCtc) || offeredCtc <= 0) {
-      throw httpError("Offered CTC is required.", 400);
-    }
 
     const commercialErrors = validateCommercialOfferFields({
       ...mergedCommercial,

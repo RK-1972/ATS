@@ -1512,7 +1512,7 @@ async function resolveInterviewScheduleContext(pool, { scheduleId, interviewId }
   }
 
   const enterprise = await pool.query(
-    `SELECT interview_id, schedule_id
+    `SELECT interview_id, schedule_id, map_id
      FROM im_interviews
      WHERE schedule_id::text = $1::text OR interview_id = $1
      LIMIT 1`,
@@ -1525,7 +1525,7 @@ async function resolveInterviewScheduleContext(pool, { scheduleId, interviewId }
 
   if (scheduleId != null && scheduleId !== "" && (await tableExists(pool, "interview_schedule_trn"))) {
     const legacy = await pool.query(
-      `SELECT schedule_id, NULL::varchar AS interview_id
+      `SELECT schedule_id, NULL::varchar AS interview_id, map_id
        FROM interview_schedule_trn
        WHERE schedule_id = $1
        LIMIT 1`,
@@ -1596,6 +1596,59 @@ async function isCallerAssignedToInterview(pool, panelIds, context) {
   }
 
   return false;
+}
+
+/**
+ * Panel member assigned to any interview on the same candidate mapping may read
+ * earlier non-HR feedback on that mapping (see assertInterviewFeedbackReadAccess).
+ */
+async function isCallerPanelAssignedToMap(pool, panelIds, mapId) {
+  const normalizedMapId = String(mapId || "").trim();
+
+  if (!panelIds.length || !normalizedMapId) {
+    return false;
+  }
+
+  const result = await pool.query(
+    `SELECT 1
+     FROM im_interviews i
+     INNER JOIN im_panel_assignments ipa
+       ON ipa.interview_id = i.interview_id
+     WHERE i.map_id = $1
+       AND ipa.panel_id = ANY($2::int[])
+       AND ipa.assignment_status <> 'Reassigned'
+     LIMIT 1`,
+    [normalizedMapId, panelIds]
+  );
+
+  return result.rows.length > 0;
+}
+
+async function canReadFeedbackViaSameMapPanelAssignment(
+  pool,
+  req,
+  { scheduleId, interviewId } = {}
+) {
+  if (isAdminUser(req)) {
+    return false;
+  }
+
+  const panelIds = await resolveCallerPanelIds(pool, req);
+
+  if (!panelIds.length) {
+    return false;
+  }
+
+  const context = await resolveInterviewScheduleContext(pool, {
+    scheduleId,
+    interviewId
+  });
+
+  if (!context?.map_id) {
+    return false;
+  }
+
+  return isCallerPanelAssignedToMap(pool, panelIds, context.map_id);
 }
 
 async function isCallerRecruiterAssignedToScheduleContext(pool, employeeCode, context) {
@@ -1761,39 +1814,54 @@ async function assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewI
 }
 
 async function assertInterviewFeedbackReadAccess(pool, req, { scheduleId, interviewId } = {}) {
+  let readAuthorized = false;
+
   try {
     await assertInterviewFeedbackAccess(pool, req, { scheduleId, interviewId });
+    readAuthorized = true;
   } catch (error) {
     if (error.status !== 403) {
       throw error;
     }
 
-    const mayReadHr =
-      await interviewFeedbackConfidentialityService.canReadHrInterviewFeedback(
-        pool,
-        req
-      );
+    if (await canReadFeedbackViaSameMapPanelAssignment(pool, req, { scheduleId, interviewId })) {
+      readAuthorized = true;
+    } else {
+      const mayReadHr =
+        await interviewFeedbackConfidentialityService.canReadHrInterviewFeedback(
+          pool,
+          req
+        );
 
-    if (!mayReadHr) {
-      throw error;
+      if (!mayReadHr) {
+        throw error;
+      }
+
+      const context = await resolveInterviewScheduleContext(pool, {
+        scheduleId,
+        interviewId
+      });
+
+      if (!context) {
+        throw error;
+      }
+
+      const recruitmentService = require("./recruitmentService");
+
+      if (!context.map_id) {
+        throw error;
+      }
+
+      await recruitmentService.assertAuthorizedMappingAccess(pool, req, context.map_id);
+      readAuthorized = true;
     }
+  }
 
-    const context = await resolveInterviewScheduleContext(pool, {
-      scheduleId,
-      interviewId
-    });
-
-    if (!context) {
-      throw error;
-    }
-
-    const recruitmentService = require("./recruitmentService");
-
-    if (!context.map_id) {
-      throw error;
-    }
-
-    await recruitmentService.assertAuthorizedMappingAccess(pool, req, context.map_id);
+  if (!readAuthorized) {
+    throw httpError(
+      "Enterprise Access Denied. You are not authorized to access feedback for this interview.",
+      403
+    );
   }
 
   await interviewFeedbackConfidentialityService.assertInterviewFeedbackConfidentiality(

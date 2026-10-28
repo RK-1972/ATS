@@ -33,6 +33,17 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     verifyToken,
     requireRecruiterAssignmentOperator(pool)
   ];
+  const requestorMiddleware = requireRequisitionRequestor(pool);
+  /** Read-only catalogue: REQUISITION_REQUESTOR or Admin role (no global create bypass). */
+  const approvedPositionCatalogueGuard = [
+    verifyToken,
+    async (req, res, next) => {
+      if (String(req.user?.role_name || "").trim().toLowerCase() === "admin") {
+        return next();
+      }
+      return requestorMiddleware(req, res, next);
+    }
+  ];
   app.get("/api/v1/recruitment/my-dashboard", verifyToken, async (req, res) => {
     try {
       const bundle = await recruitmentService.getMyRecruiterDashboard(pool, req);
@@ -312,7 +323,7 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.get("/api/v1/recruitment/approved-positions", operatorGuard, async (req, res) => {
+  app.get("/api/v1/recruitment/approved-positions", approvedPositionCatalogueGuard, async (req, res) => {
     try {
       const data = await recruitmentService.listApprovedPositions(pool);
       res.json({
@@ -379,7 +390,7 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
     }
   });
 
-  app.post("/api/v1/recruitment/requisitions/legacy-form", operatorGuard, async (req, res) => {
+  app.post("/api/v1/recruitment/requisitions/legacy-form", requestorGuard, async (req, res) => {
     try {
       const result = await recruitmentService.handleLegacyCreateRequisition(pool, req.body, req);
       res.status(201).json({
@@ -487,9 +498,18 @@ function registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin) {
 
   app.post("/api/v1/recruitment/requisitions", requestorGuard, async (req, res) => {
     try {
+      const approvedPositionId = String(req.body?.approved_position_id || "").trim();
+      if (!approvedPositionId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Requisitions must be created from an Approved Position in Workforce Planning. Provide approved_position_id."
+        });
+      }
+
       const result = await recruitmentService.createFromApprovedPosition(
         pool,
-        req.body.approved_position_id,
+        approvedPositionId,
         {
           business_unit: req.body.business_unit,
           location: req.body.location,

@@ -10,10 +10,13 @@ const {
 } = require("../utils/approvedPositionUpdateIntegrity");
 const {
   resolveRequisitionRequestorCreatedByKeys,
-  assertRequisitionRequestorOwnerAccess
+  assertRequisitionRequestorOwnerAccess,
+  assertCanCreateRequisition
 } = require("./requisitionCapabilityAuth");
+const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
 const { loadRequisitionByCode } = require("./recruitmentService");
 const { REQUISITION_STATUS, isClosedRequisitionStatus } = require("../constants/requisitionStatus");
+const { collectOpeningsCountErrors } = require("../utils/nonNegativeNumericValidation");
 
 const DRAFT_STATUS = {
   DRAFT: "DRAFT",
@@ -25,6 +28,17 @@ function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+function assertDraftOpeningsCount(formData) {
+  if (formData?.openings_count === undefined || formData?.openings_count === "") {
+    return;
+  }
+
+  const errors = collectOpeningsCountErrors(formData.openings_count);
+  if (errors.length) {
+    throw httpError(errors[0], 400);
+  }
 }
 
 function resolveActor(actor) {
@@ -102,6 +116,22 @@ async function createDraft(pool, formData, actor) {
     throw httpError("Authenticated employee_code is required to create a draft.", 401);
   }
 
+  const approvedPositionId = String(formData?.approved_position_id || "").trim();
+  if (!approvedPositionId) {
+    throw httpError(
+      "approved_position_id is required to start Talent Demand from an approved workforce position.",
+      400
+    );
+  }
+
+  await assertCanCreateRequisition(pool, { user: actor });
+  await requisitionFieldResolutionService.assertApprovedPositionSelectable(
+    pool,
+    approvedPositionId
+  );
+
+  assertDraftOpeningsCount(formData);
+
   const payload = buildDraftPayload(formData, actor);
 
   if (!payload.owner_employee_code || !payload.created_by) {
@@ -132,6 +162,8 @@ async function updateDraft(pool, draftId, formData, actor) {
     payload: formData || {},
     existingRequisitionCode: existing.result_requisition_code
   });
+
+  assertDraftOpeningsCount(formData);
 
   const payload = {
     ...formData,

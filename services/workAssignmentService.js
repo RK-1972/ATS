@@ -68,6 +68,13 @@ function assertWorkAssignmentPayload(data, { partial = false, isCreate = false }
       throw httpError("business_module is required.", 400);
     }
   }
+
+  if (data.display_order !== undefined && data.display_order !== null && data.display_order !== "") {
+    const order = Number(data.display_order);
+    if (!Number.isFinite(order) || !Number.isInteger(order) || order < 0) {
+      throw httpError("display_order must be a whole number of at least 0.", 400);
+    }
+  }
 }
 
 function mapUniqueViolation(error) {

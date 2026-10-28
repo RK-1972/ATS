@@ -520,6 +520,70 @@ function validateConfiguration(payload) {
     errors.push("Budget variance percentage must be between 0 and 100.");
   }
 
+  if (
+    budget.auto_reject_above_pct !== undefined
+    && budget.auto_reject_above_pct !== null
+    && (budget.auto_reject_above_pct < 0 || budget.auto_reject_above_pct > 100)
+  ) {
+    errors.push("Auto-reject variance percentage must be between 0 and 100.");
+  }
+
+  if (
+    budget.default_headcount_buffer_pct !== undefined
+    && budget.default_headcount_buffer_pct !== null
+    && budget.default_headcount_buffer_pct < 0
+  ) {
+    errors.push("Default headcount buffer percentage cannot be negative.");
+  }
+
+  const aiGov = payload.ai_governance || {};
+  if (
+    aiGov.confidence_threshold !== undefined
+    && aiGov.confidence_threshold !== null
+    && (Number(aiGov.confidence_threshold) < 0 || Number(aiGov.confidence_threshold) > 1)
+  ) {
+    errors.push("AI confidence threshold must be between 0 and 1.");
+  }
+
+  if (
+    aiGov.monthly_token_limit !== undefined
+    && aiGov.monthly_token_limit !== null
+    && Number(aiGov.monthly_token_limit) < 0
+  ) {
+    errors.push("Monthly token limit cannot be negative.");
+  }
+
+  if (
+    aiGov.monthly_cost_cap_usd !== undefined
+    && aiGov.monthly_cost_cap_usd !== null
+    && Number(aiGov.monthly_cost_cap_usd) < 0
+  ) {
+    errors.push("Monthly AI cost cap cannot be negative.");
+  }
+
+  if (
+    aiGov.data_retention_days !== undefined
+    && aiGov.data_retention_days !== null
+    && aiGov.data_retention_days !== ""
+  ) {
+    const days = Number(aiGov.data_retention_days);
+    if (!Number.isInteger(days) || days < 0) {
+      errors.push("Data retention days must be a whole number of at least 0.");
+    }
+  }
+
+  const notifSettings = payload.notification_settings || {};
+  if (
+    notifSettings.retry_attempts !== undefined
+    && notifSettings.retry_attempts !== null
+    && notifSettings.retry_attempts !== ""
+  ) {
+    const retries = Number(notifSettings.retry_attempts);
+    if (!Number.isInteger(retries) || retries < 0) {
+      errors.push("Retry attempts must be a whole number of at least 0.");
+    }
+  }
+
   if (budget.auto_reject_above_pct < budget.max_budget_variance_pct) {
     warnings.push("Auto-reject threshold is below max variance — offers may auto-reject unexpectedly.");
   }

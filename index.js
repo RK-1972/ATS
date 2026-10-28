@@ -7855,7 +7855,7 @@ app.post("/approval-routes", verifyToken, verifyAdmin, async (req, res) => {
       });
     }
 
-    res.status(500).json({
+    res.status(error.status || 500).json({
       success: false,
       message: error.message || "Error creating approval route."
     });
@@ -7948,7 +7948,7 @@ app.put("/approval-routes/:routeId", verifyToken, verifyAdmin, async (req, res) 
       });
     }
 
-    res.status(500).json({
+    res.status(error.status || 500).json({
       success: false,
       message: error.message || "Error updating approval route."
     });

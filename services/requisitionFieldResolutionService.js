@@ -84,6 +84,19 @@ async function assertApprovedPositionSelectable(
     throw httpError("Approved position budget is fully utilized.", 400);
   }
 
+  const remainingBudget = Number(position.remaining_budget || 0);
+  if (!Number.isFinite(remainingBudget) || remainingBudget <= 0) {
+    throw httpError("No remaining approved budget on this position.", 400);
+  }
+
+  const normalizedStatus = String(position.status || "Active").trim().toLowerCase();
+  if (normalizedStatus !== "active" && normalizedStatus !== "expiring soon") {
+    throw httpError(
+      `Approved position ${positionId} is not eligible for requisition creation.`,
+      400
+    );
+  }
+
   const linked = await findRequisitionForPosition(queryable, positionId);
   if (linked) {
     if (

@@ -14,6 +14,7 @@ const approvalRouteResolverService = require("./approvalRouteResolverService");
 const approvalRouteRepository = require("../repositories/approvalRouteRepository");
 const userPermissionRepository = require("../repositories/userPermissionRepository");
 const workAssignmentService = require("./workAssignmentService");
+const requisitionFieldResolutionService = require("./requisitionFieldResolutionService");
 const { writeEnterpriseAudit, userContext } = require("./enterpriseAuditService");
 
 const SEED_PATH = require("path").join(__dirname, "..", "seed", "workforcePlanning.seed.json");
@@ -2469,18 +2470,28 @@ async function createRequisition(pool, positionId, req) {
     throw httpError("Authenticated employee_code is required.", 401);
   }
 
-  const row = await ensureConfigState(pool);
-  const draft = clonePayload(row.draft_payload);
-  const position = draft.approved_positions.find((item) => item.id === positionId);
-
-  if (!position) {
-    throw httpError(`Approved position not found: ${positionId}`, 404);
+  const normalizedPositionId = String(positionId || "").trim();
+  if (!normalizedPositionId) {
+    throw httpError("Approved position id is required.", 400);
   }
 
-  const existingRequisition = await findOpenRequisitionForPosition(pool, positionId);
+  const row = await ensureConfigState(pool);
+  const draft = clonePayload(row.draft_payload);
+  const position = draft.approved_positions.find(
+    (item) => item.id === normalizedPositionId
+  );
+
+  if (!position) {
+    throw httpError(`Approved position not found: ${normalizedPositionId}`, 404);
+  }
+
+  const existingRequisition = await findOpenRequisitionForPosition(
+    pool,
+    normalizedPositionId
+  );
   const existingDraft = await findOpenTalentDemandDraftForPosition(
     pool,
-    positionId,
+    normalizedPositionId,
     employeeCode
   );
 
@@ -2488,8 +2499,23 @@ async function createRequisition(pool, positionId, req) {
 
   if (existingRequisition && isRequisitionConsumedForCatalogue(existingRequisition)) {
     throw httpError(
-      `A requisition already exists for approved position ${positionId}: ${existingRequisition.requisition_code}.`,
+      `A requisition already exists for approved position ${normalizedPositionId}: ${existingRequisition.requisition_code}.`,
       409
+    );
+  }
+
+  if (!existingDraft && !existingRequisition) {
+    await requisitionFieldResolutionService.assertApprovedPositionSelectable(
+      pool,
+      normalizedPositionId
+    );
+  }
+
+  if (existingRequisition && !existingDraft) {
+    await requisitionFieldResolutionService.assertApprovedPositionSelectable(
+      pool,
+      normalizedPositionId,
+      { existingRequisitionCode: existingRequisition.requisition_code }
     );
   }
 
@@ -2535,10 +2561,13 @@ async function createRequisition(pool, positionId, req) {
       toastMessage: `Continue requisition ${existingRequisition.requisition_code}.`
     };
   }
+
+  await assertCanCreateRequisition(pool, req);
+
   const talentDraft = await talentDemandDraftService.createDraft(
     pool,
     {
-      approved_position_id: positionId,
+      approved_position_id: normalizedPositionId,
       job_title: position.position || position.position_title || null
     },
     req.user
@@ -2553,7 +2582,7 @@ async function createRequisition(pool, positionId, req) {
     resumeMode: "create",
     toastMessage: `Draft ${talentDraft.draft_code} created. Complete Talent Demand and submit when ready.`,
     approvedPosition: {
-      id: positionId,
+      id: normalizedPositionId,
       department: position.department,
       position: position.position,
       grade: position.grade,
