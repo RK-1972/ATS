@@ -2,11 +2,45 @@ const {
   FINAL_HR_INTERVIEW_ROUND_TYPE,
   FINAL_HR_INTERVIEW_OUTCOME_SELECTED
 } = require("../constants/offerRaiseEligibility");
+const { GENERATED_LETTER_STATUS } = require("../repositories/offerLetterRepository");
+
+const DUPLICATE_OFFER_MESSAGE =
+  "An offer already exists for this candidate on this requisition.";
 
 function httpError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+function normalizeRequisitionCode(value) {
+  return String(value || "").trim();
+}
+
+function resolveMappingCandidateId(mapping) {
+  const candidateId = Number(mapping?.candidate_id);
+  return Number.isFinite(candidateId) ? candidateId : null;
+}
+
+/**
+ * Same candidate–requisition pair used for offer raise (Rule C).
+ */
+function mappingOfferScope(mapping) {
+  if (!mapping) {
+    return null;
+  }
+  const requisitionCode = normalizeRequisitionCode(mapping.requisition_code);
+  const candidateId = resolveMappingCandidateId(mapping);
+  if (!requisitionCode || candidateId == null) {
+    return null;
+  }
+  const rawMappingKey = mapping.mapping_id ?? mapping.map_id;
+  const mappingKey = rawMappingKey != null ? Number(rawMappingKey) : null;
+  return {
+    candidateId,
+    requisitionCode,
+    mappingKey: Number.isFinite(mappingKey) ? mappingKey : null
+  };
 }
 
 /**
@@ -63,6 +97,108 @@ function interviewQualifiesForOfferRaise(mapping, interview) {
   return true;
 }
 
+const OFFER_RAISE_BLOCKING_OFFER_SQL = `
+  SELECT o.offer_id, o.offer_status
+  FROM om_offers o
+  WHERE o.candidate_id = $1
+    AND (
+      (
+        o.requisition_code = $2
+        AND TRIM(COALESCE(o.requisition_code, '')) <> ''
+      )
+      OR (
+        $3::int IS NOT NULL
+        AND o.mapping_id = $3::int
+        AND TRIM(COALESCE(o.requisition_code, '')) = ''
+      )
+    )
+  LIMIT 1
+`;
+
+const OFFER_RAISE_BLOCKING_LETTER_SQL = `
+  SELECT ol.letter_id, ol.status AS letter_status, o.offer_id
+  FROM om_offers o
+  INNER JOIN om_offer_letters ol ON ol.offer_id = o.offer_id
+  WHERE o.candidate_id = $1
+    AND (
+      (
+        o.requisition_code = $2
+        AND TRIM(COALESCE(o.requisition_code, '')) <> ''
+      )
+      OR (
+        $3::int IS NOT NULL
+        AND o.mapping_id = $3::int
+        AND TRIM(COALESCE(o.requisition_code, '')) = ''
+      )
+    )
+  LIMIT 1
+`;
+
+/**
+ * Returns blocking row metadata when an offer or offer letter already exists for the mapping scope.
+ */
+async function findBlockingOfferActivityForMapping(queryable, mapping) {
+  const scope = mappingOfferScope(mapping);
+  if (!scope) {
+    return null;
+  }
+
+  const offerResult = await queryable.query(OFFER_RAISE_BLOCKING_OFFER_SQL, [
+    scope.candidateId,
+    scope.requisitionCode,
+    scope.mappingKey
+  ]);
+  if (offerResult.rows[0]) {
+    return { kind: "offer", ...offerResult.rows[0] };
+  }
+
+  const letterResult = await queryable.query(OFFER_RAISE_BLOCKING_LETTER_SQL, [
+    scope.candidateId,
+    scope.requisitionCode,
+    scope.mappingKey
+  ]);
+  if (letterResult.rows[0]) {
+    return { kind: "offer_letter", ...letterResult.rows[0] };
+  }
+
+  return null;
+}
+
+async function assertNoBlockingOfferActivityForMapping(queryable, mapping) {
+  const blocking = await findBlockingOfferActivityForMapping(queryable, mapping);
+  if (blocking) {
+    throw httpError(DUPLICATE_OFFER_MESSAGE, 400);
+  }
+}
+
+/**
+ * Serializes offer raise for one candidate–requisition mapping (transaction-scoped advisory lock + row lock).
+ */
+async function acquireOfferRaiseCreationLock(client, mappingRef, mapping) {
+  const scope = mappingOfferScope(mapping);
+  if (!scope || mappingRef == null || mappingRef === "") {
+    throw httpError("Mapping not found.", 404);
+  }
+
+  const lockRow = await client.query(
+    `SELECT mapping_id, map_id, candidate_id, requisition_code
+     FROM rm_candidate_mappings
+     WHERE (mapping_id = $1 OR map_id = $1)
+       AND is_active = TRUE
+     FOR UPDATE`,
+    [mappingRef]
+  );
+
+  if (!lockRow.rows[0]) {
+    throw httpError("Mapping not found.", 404);
+  }
+
+  await client.query(
+    `SELECT pg_advisory_xact_lock($1::int, hashtext($2::text))`,
+    [scope.candidateId, scope.requisitionCode]
+  );
+}
+
 const OFFER_RAISE_ELIGIBLE_SQL = `
   SELECT DISTINCT ON (COALESCE(m.mapping_id, m.map_id))
     m.*,
@@ -86,6 +222,39 @@ const OFFER_RAISE_ELIGIBLE_SQL = `
    )
   LEFT JOIN cand_mstr c ON c.candidate_id = m.candidate_id
   WHERE m.is_active = TRUE
+    AND NOT EXISTS (
+      SELECT 1
+      FROM om_offers o
+      WHERE o.candidate_id = m.candidate_id
+        AND (
+          (
+            o.requisition_code = m.requisition_code
+            AND TRIM(COALESCE(o.requisition_code, '')) <> ''
+          )
+          OR (
+            o.mapping_id IS NOT NULL
+            AND o.mapping_id = COALESCE(m.mapping_id, m.map_id)
+            AND TRIM(COALESCE(o.requisition_code, '')) = ''
+          )
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM om_offers o
+      INNER JOIN om_offer_letters ol ON ol.offer_id = o.offer_id
+      WHERE o.candidate_id = m.candidate_id
+        AND (
+          (
+            o.requisition_code = m.requisition_code
+            AND TRIM(COALESCE(o.requisition_code, '')) <> ''
+          )
+          OR (
+            o.mapping_id IS NOT NULL
+            AND o.mapping_id = COALESCE(m.mapping_id, m.map_id)
+            AND TRIM(COALESCE(o.requisition_code, '')) = ''
+          )
+        )
+    )
   ORDER BY COALESCE(m.mapping_id, m.map_id), m.modified_on DESC NULLS LAST
 `;
 
@@ -97,7 +266,7 @@ async function listOfferRaiseEligibleMappings(pool) {
   return result.rows;
 }
 
-async function assertMappingEligibleForOfferRaise(pool, mapping, legacyRow) {
+async function assertMappingEligibleForOfferRaise(queryable, mapping, legacyRow) {
   const activeMapping = mapping || legacyRow;
   if (!activeMapping) {
     throw httpError("Mapping not found.", 404);
@@ -113,7 +282,7 @@ async function assertMappingEligibleForOfferRaise(pool, mapping, legacyRow) {
     );
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `SELECT i.*
      FROM im_interviews i
      WHERE i.candidate_id = $1
@@ -139,12 +308,20 @@ async function assertMappingEligibleForOfferRaise(pool, mapping, legacyRow) {
       400
     );
   }
+
+  await assertNoBlockingOfferActivityForMapping(queryable, activeMapping);
 }
 
 module.exports = {
   interviewQualifiesForOfferRaise,
   listOfferRaiseEligibleMappings,
   assertMappingEligibleForOfferRaise,
+  findBlockingOfferActivityForMapping,
+  assertNoBlockingOfferActivityForMapping,
+  acquireOfferRaiseCreationLock,
+  mappingOfferScope,
+  DUPLICATE_OFFER_MESSAGE,
+  GENERATED_LETTER_STATUS,
   FINAL_HR_INTERVIEW_ROUND_TYPE,
   FINAL_HR_INTERVIEW_OUTCOME_SELECTED
 };

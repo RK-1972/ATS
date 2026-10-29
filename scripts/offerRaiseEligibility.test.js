@@ -10,6 +10,12 @@ const {
   interviewQualifiesForOfferRaise,
   assertMappingEligibleForOfferRaise,
   listOfferRaiseEligibleMappings,
+  findBlockingOfferActivityForMapping,
+  assertNoBlockingOfferActivityForMapping,
+  acquireOfferRaiseCreationLock,
+  mappingOfferScope,
+  DUPLICATE_OFFER_MESSAGE,
+  GENERATED_LETTER_STATUS,
   FINAL_HR_INTERVIEW_ROUND_TYPE,
   FINAL_HR_INTERVIEW_OUTCOME_SELECTED
 } = require("../services/offerRaiseEligibilityService");
@@ -27,6 +33,59 @@ const offerWorkspaceAssignment = {
   workspace_flag: "showOfferWorkspace",
   assignment_code: "OFFER_RECRUITER"
 };
+
+const qualifyingInterview = {
+  map_id: 101,
+  candidate_id: 5001,
+  requisition_code: "REQ-100",
+  round_type: FINAL_HR_INTERVIEW_ROUND_TYPE,
+  final_outcome: FINAL_HR_INTERVIEW_OUTCOME_SELECTED,
+  feedback_submitted: true
+};
+
+function matchesBlockingOfferSql(offerRow, params) {
+  const [candidateId, requisitionCode, mappingKey] = params;
+  if (Number(offerRow.candidate_id) !== Number(candidateId)) {
+    return false;
+  }
+  const offerReq = String(offerRow.requisition_code ?? "").trim();
+  const requisitionMatch =
+    offerReq !== "" && offerReq === String(requisitionCode).trim();
+  const legacyMappingMatch =
+    mappingKey != null &&
+    Number(offerRow.mapping_id) === Number(mappingKey) &&
+    offerReq === "";
+  return requisitionMatch || legacyMappingMatch;
+}
+
+function createEligibilityQueryable({ offerRow = null, letterRow = null, ambientOffers = [] } = {}) {
+  const configuredOffers = [offerRow, ...ambientOffers].filter(Boolean);
+  return {
+    query: async (sql, params) => {
+      const text = String(sql);
+      if (text.includes("im_interviews")) {
+        return { rows: [qualifyingInterview] };
+      }
+      if (text.includes("om_offer_letters")) {
+        if (letterRow && matchesBlockingOfferSql(letterRow, params)) {
+          return { rows: [letterRow] };
+        }
+        return { rows: [] };
+      }
+      if (text.includes("FROM om_offers o") && !text.includes("om_offer_letters")) {
+        const matched = configuredOffers.find((row) => matchesBlockingOfferSql(row, params));
+        return { rows: matched ? [matched] : [] };
+      }
+      if (text.includes("rm_candidate_mappings") && text.includes("FOR UPDATE")) {
+        return { rows: [mapping] };
+      }
+      if (text.includes("pg_advisory_xact_lock")) {
+        return { rows: [{ locked: true }] };
+      }
+      return { rows: [] };
+    }
+  };
+}
 
 function poolWithWorkAssignments(rows, onEligibilityQuery) {
   return {
@@ -149,22 +208,35 @@ describe("assertMappingEligibleForOfferRaise", () => {
   });
 
   it("accepts when a qualifying HR Selected interview exists for the mapping", async () => {
-    const pool = {
-      query: async () => ({
-        rows: [
-          {
-            map_id: 101,
-            candidate_id: 5001,
-            requisition_code: "REQ-100",
-            round_type: FINAL_HR_INTERVIEW_ROUND_TYPE,
-            final_outcome: FINAL_HR_INTERVIEW_OUTCOME_SELECTED,
-            feedback_submitted: true
-          }
-        ]
-      })
-    };
+    await assertMappingEligibleForOfferRaise(
+      createEligibilityQueryable(),
+      mapping,
+      null
+    );
+  });
 
-    await assertMappingEligibleForOfferRaise(pool, mapping, null);
+  it("rejects when an existing offer blocks the same candidate and requisition", async () => {
+    await assert.rejects(
+      () =>
+        assertMappingEligibleForOfferRaise(
+          createEligibilityQueryable({
+            offerRow: {
+              offer_id: "OFF-1",
+              offer_status: "Draft",
+              candidate_id: 5001,
+              requisition_code: "REQ-100",
+              mapping_id: 101
+            }
+          }),
+          mapping,
+          null
+        ),
+      (error) => {
+        assert.equal(error.status, 400);
+        assert.equal(error.message, DUPLICATE_OFFER_MESSAGE);
+        return true;
+      }
+    );
   });
 });
 
@@ -184,6 +256,10 @@ describe("listOfferRaiseEligibleMappings", () => {
     await listOfferRaiseEligibleMappings(pool);
 
     assert.ok(!/rm_recruiter_assignments/i.test(capturedSql));
+    assert.match(capturedSql, /NOT EXISTS/i);
+    assert.match(capturedSql, /om_offers o/);
+    assert.match(capturedSql, /om_offer_letters ol/);
+    assert.match(capturedSql, /COALESCE\(m\.mapping_id, m\.map_id\)/);
     assert.deepEqual(capturedParams, [
       FINAL_HR_INTERVIEW_ROUND_TYPE,
       FINAL_HR_INTERVIEW_OUTCOME_SELECTED
@@ -349,5 +425,160 @@ describe("resolveMappingContextForOfferRaise", () => {
     const context = await recruitmentService.resolveMappingContextForOfferRaise(pool, 101);
     assert.equal(context.mapping.candidate_id, 5001);
     assert.ok(!queries.some((q) => /rm_recruiter_assignments/i.test(q)));
+  });
+});
+
+describe("existing offer and letter blocking (Rule B)", () => {
+  const blockingStatuses = [
+    "Draft",
+    "Pending Approval",
+    "Approved",
+    "Released",
+    "Accepted",
+    "Declined",
+    "Withdrawn",
+    "Expired"
+  ];
+
+  for (const offerStatus of blockingStatuses) {
+    it(`blocks eligibility when om_offers.offer_status is ${offerStatus}`, async () => {
+      const offerRow = {
+        offer_id: "OFF-BLOCK",
+        offer_status: offerStatus,
+        candidate_id: 5001,
+        requisition_code: "REQ-100",
+        mapping_id: 101
+      };
+      const blocking = await findBlockingOfferActivityForMapping(
+        createEligibilityQueryable({ offerRow }),
+        mapping
+      );
+      assert.equal(blocking?.kind, "offer");
+      assert.equal(blocking?.offer_status, offerStatus);
+
+      await assert.rejects(
+        () =>
+          assertNoBlockingOfferActivityForMapping(
+            createEligibilityQueryable({ offerRow }),
+            mapping
+          ),
+        (error) => error.message === DUPLICATE_OFFER_MESSAGE
+      );
+    });
+  }
+
+  it("blocks when a generated offer letter exists for the same candidate and requisition", async () => {
+    const blocking = await findBlockingOfferActivityForMapping(
+      createEligibilityQueryable({
+        letterRow: {
+          letter_id: "OL-1",
+          letter_status: GENERATED_LETTER_STATUS,
+          offer_id: "OFF-LETTER",
+          candidate_id: 5001,
+          requisition_code: "REQ-100",
+          mapping_id: 101
+        }
+      }),
+      mapping
+    );
+    assert.equal(blocking?.kind, "offer_letter");
+    assert.equal(blocking?.letter_status, GENERATED_LETTER_STATUS);
+  });
+
+  it("blocks legacy offer rows with matching mapping_id and NULL requisition_code", async () => {
+    const blocking = await findBlockingOfferActivityForMapping(
+      createEligibilityQueryable({
+        offerRow: {
+          offer_id: "OFF-LEGACY",
+          offer_status: "Withdrawn",
+          candidate_id: 5001,
+          requisition_code: null,
+          mapping_id: 101
+        }
+      }),
+      mapping
+    );
+    assert.equal(blocking?.kind, "offer");
+    assert.equal(blocking?.offer_status, "Withdrawn");
+
+    await assert.rejects(
+      () =>
+        assertMappingEligibleForOfferRaise(
+          createEligibilityQueryable({
+            offerRow: {
+              offer_id: "OFF-LEGACY",
+              offer_status: "Withdrawn",
+              candidate_id: 5001,
+              requisition_code: null,
+              mapping_id: 101
+            }
+          }),
+          mapping,
+          null
+        ),
+      (error) => error.message === DUPLICATE_OFFER_MESSAGE
+    );
+  });
+
+  it("does not block eligibility for REQ-100 when an offer exists only on REQ-200", async () => {
+    const offerOnReq200 = {
+      offer_id: "OFF-REQ-200",
+      offer_status: "Approved",
+      candidate_id: 5001,
+      requisition_code: "REQ-200",
+      mapping_id: 202
+    };
+
+    const queryable = createEligibilityQueryable({ ambientOffers: [offerOnReq200] });
+
+    const blocking = await findBlockingOfferActivityForMapping(queryable, mapping);
+    assert.equal(blocking, null);
+
+    await assertMappingEligibleForOfferRaise(
+      createEligibilityQueryable({ ambientOffers: [offerOnReq200] }),
+      mapping,
+      null
+    );
+  });
+
+  it("allows HR-selected mapping with no existing offer activity", async () => {
+    const blocking = await findBlockingOfferActivityForMapping(
+      createEligibilityQueryable(),
+      mapping
+    );
+    assert.equal(blocking, null);
+  });
+});
+
+describe("acquireOfferRaiseCreationLock (concurrency guard)", () => {
+  it("locks mapping row and acquires transaction-scoped advisory lock", async () => {
+    const calls = [];
+    const client = {
+      query: async (sql, params) => {
+        calls.push({ sql: String(sql), params });
+        if (String(sql).includes("FOR UPDATE")) {
+          return { rows: [mapping] };
+        }
+        return { rows: [] };
+      }
+    };
+
+    await acquireOfferRaiseCreationLock(client, 101, mapping);
+
+    assert.ok(calls.some((call) => /FOR UPDATE/i.test(call.sql)));
+    assert.ok(calls.some((call) => /pg_advisory_xact_lock/i.test(call.sql)));
+    const advisory = calls.find((call) => /pg_advisory_xact_lock/i.test(call.sql));
+    assert.equal(advisory.params[0], 5001);
+    assert.equal(advisory.params[1], "REQ-100");
+  });
+});
+
+describe("mappingOfferScope", () => {
+  it("scopes blocking to candidate_id and requisition_code pair", () => {
+    assert.deepEqual(mappingOfferScope(mapping), {
+      candidateId: 5001,
+      requisitionCode: "REQ-100",
+      mappingKey: 101
+    });
   });
 });

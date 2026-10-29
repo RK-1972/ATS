@@ -644,17 +644,20 @@ async function createOffer(pool, payload, req) {
 
   const mappingRef =
     payload.mapping_id ?? payload.map_id ?? context.mapping_id ?? context.map_id;
+  let mappingAccess = null;
   if (mappingRef) {
-    const mappingAccess = await recruitmentService.resolveMappingContextForOfferRaise(
+    mappingAccess = await recruitmentService.resolveMappingContextForOfferRaise(
       pool,
       mappingRef
     );
-    const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");
-    await offerRaiseEligibilityService.assertMappingEligibleForOfferRaise(
-      pool,
-      mappingAccess.mapping,
-      mappingAccess.legacyRow
-    );
+    const activeMapping = mappingAccess.mapping || mappingAccess.legacyRow;
+    if (activeMapping) {
+      context.candidate_id = context.candidate_id || activeMapping.candidate_id;
+      context.requisition_code =
+        context.requisition_code || activeMapping.requisition_code;
+      context.mapping_id =
+        context.mapping_id || activeMapping.mapping_id || activeMapping.map_id;
+    }
   } else {
     throw httpError("Offer must link to a candidate mapping.", 400);
   }
@@ -697,28 +700,48 @@ async function createOffer(pool, payload, req) {
   }, req);
 
   const offerId = context.offer_id || generateOfferId();
-  const instance = await workflowService.startWorkflow(
-    pool,
-    "OFFER",
-    {
-      instance_id: `WF-OFF-${offerId}`,
-      meta: {
-        offer_id: offerId,
-        requisition_code: context.requisition_code,
-        candidate_id: context.candidate_id,
-        offered_ctc_lpa: offeredCtc / 100000
+  const offerRaiseEligibilityService = require("./offerRaiseEligibilityService");
+  const activeMapping = mappingAccess.mapping || mappingAccess.legacyRow;
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await offerRaiseEligibilityService.acquireOfferRaiseCreationLock(
+      client,
+      mappingRef,
+      activeMapping
+    );
+
+    await offerRaiseEligibilityService.assertMappingEligibleForOfferRaise(
+      client,
+      mappingAccess.mapping,
+      mappingAccess.legacyRow
+    );
+
+    const instance = await workflowService.startWorkflow(
+      client,
+      "OFFER",
+      {
+        instance_id: `WF-OFF-${offerId}`,
+        meta: {
+          offer_id: offerId,
+          requisition_code: context.requisition_code,
+          candidate_id: context.candidate_id,
+          offered_ctc_lpa: offeredCtc / 100000
+        },
+        department: context.department,
+        grade: context.grade
       },
-      department: context.department,
-      grade: context.grade
-    },
-    req
-  );
+      req
+    );
 
-  const validUntil = new Date();
-  validUntil.setDate(validUntil.getDate() + validityDays);
+    const validUntil = new Date();
+    validUntil.setDate(validUntil.getDate() + validityDays);
 
-  await pool.query(
-    `INSERT INTO om_offers (
+    await client.query(
+      `INSERT INTO om_offers (
       offer_id, approved_position_id, requisition_code, candidate_id, mapping_id, interview_id,
       recruiter_id, hiring_manager, candidate_name, position_title, grade, department, location,
       business_unit, employment_type, approved_budget, offered_ctc, variance_amount, variance_pct,
@@ -726,88 +749,100 @@ async function createOffer(pool, payload, req) {
       expected_joining_date, variable_pay, variable_pay_frequency, joining_bonus, joining_bonus_frequency,
       created_by, modified_by, effective_from
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
-    [
-      offerId,
-      context.approved_position_id || null,
-      context.requisition_code || null,
-      context.candidate_id || null,
-      context.mapping_id || null,
-      context.interview_id || null,
-      context.recruiter_id || user.name,
-      context.hiring_manager || null,
-      context.candidate_name || null,
-      context.position_title || null,
-      context.grade || null,
-      context.department || null,
-      context.location || null,
-      context.business_unit || null,
-      context.employment_type || "Full-time",
-      approvedBudget,
-      offeredCtc,
-      varianceAmount,
-      variancePct,
-      context.currency || "INR",
-      "Draft",
-      instance.instanceId,
-      validityDays,
-      validUntil,
-      commercial.expected_joining_date,
-      commercial.variable_pay,
-      commercial.variable_pay_frequency,
-      commercial.joining_bonus,
-      commercial.joining_bonus_frequency,
-      user.name,
-      user.name,
-      new Date()
-    ]
-  );
+      [
+        offerId,
+        context.approved_position_id || null,
+        context.requisition_code || null,
+        context.candidate_id || null,
+        context.mapping_id || null,
+        context.interview_id || null,
+        context.recruiter_id || user.name,
+        context.hiring_manager || null,
+        context.candidate_name || null,
+        context.position_title || null,
+        context.grade || null,
+        context.department || null,
+        context.location || null,
+        context.business_unit || null,
+        context.employment_type || "Full-time",
+        approvedBudget,
+        offeredCtc,
+        varianceAmount,
+        variancePct,
+        context.currency || "INR",
+        "Draft",
+        instance.instanceId,
+        validityDays,
+        validUntil,
+        commercial.expected_joining_date,
+        commercial.variable_pay,
+        commercial.variable_pay_frequency,
+        commercial.joining_bonus,
+        commercial.joining_bonus_frequency,
+        user.name,
+        user.name,
+        new Date()
+      ]
+    );
 
-  await pool.query(
-    `INSERT INTO om_offer_compensation (
+    await client.query(
+      `INSERT INTO om_offer_compensation (
       offer_id, base_salary, variable_pay, bonus, benefits, total_ctc, currency, salary_band_code, effective_from
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [
-      offerId,
-      Number(context.base_salary || context.compensation?.base_salary || offeredCtc * 0.8),
-      Number(context.compensation?.variable_pay || offeredCtc * 0.15),
-      Number(context.compensation?.bonus || context.bonus || offeredCtc * 0.05),
-      Number(context.benefits || 0),
-      offeredCtc,
-      context.currency || "INR",
-      context.salary_band_code || null,
-      new Date()
-    ]
-  );
+      [
+        offerId,
+        Number(context.base_salary || context.compensation?.base_salary || offeredCtc * 0.8),
+        Number(context.compensation?.variable_pay || offeredCtc * 0.15),
+        Number(context.compensation?.bonus || context.bonus || offeredCtc * 0.05),
+        Number(context.benefits || 0),
+        offeredCtc,
+        context.currency || "INR",
+        context.salary_band_code || null,
+        new Date()
+      ]
+    );
 
-  await pool.query(
-    `INSERT INTO om_offer_acceptance (offer_id, response_status, effective_from)
+    await client.query(
+      `INSERT INTO om_offer_acceptance (offer_id, response_status, effective_from)
      VALUES ($1,'Pending',$2)`,
-    [offerId, new Date()]
-  );
+      [offerId, new Date()]
+    );
 
-  await taskService.createTask(pool, {
-    module: "Offer Management",
-    taskType: "Prepare Offer",
-    title: `Prepare offer for ${context.candidate_name || context.candidate_id}`,
-    assigneeRole: "Recruiter",
-    workflowInstanceId: instance.instanceId,
-    stageKey: "draft",
-    businessObjectType: "Offer",
-    businessObjectId: offerId,
-    metadata: { offeredCtc, variancePct }
-  }, req);
+    await taskService.createTask(client, {
+      module: "Offer Management",
+      taskType: "Prepare Offer",
+      title: `Prepare offer for ${context.candidate_name || context.candidate_id}`,
+      assigneeRole: "Recruiter",
+      workflowInstanceId: instance.instanceId,
+      stageKey: "draft",
+      businessObjectType: "Offer",
+      businessObjectId: offerId,
+      metadata: { offeredCtc, variancePct }
+    }, req);
 
-  await recordOfferHistory(pool, offerId, "OfferCreated", user.name, user.role, null, "Draft");
-  await writeEnterpriseAudit(pool, {
-    eventType: "OfferCreated",
-    module: "Offer Management",
-    entity: "Offer",
-    entityId: offerId,
-    action: `Offer draft created at ${offeredCtc}`,
-    userName: user.name,
-    userRole: user.role,
-    metadata: { ruleEvaluation: ruleEval, variancePct }
-  });
+    await recordOfferHistory(client, offerId, "OfferCreated", user.name, user.role, null, "Draft");
+    await writeEnterpriseAudit(client, {
+      eventType: "OfferCreated",
+      module: "Offer Management",
+      entity: "Offer",
+      entityId: offerId,
+      action: `Offer draft created at ${offeredCtc}`,
+      userName: user.name,
+      userRole: user.role,
+      metadata: { ruleEvaluation: ruleEval, variancePct }
+    });
+
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // preserve original
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 
   return {
     offer: await getOffer(pool, offerId),
