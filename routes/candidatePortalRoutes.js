@@ -15,6 +15,7 @@ function registerCandidatePortalRoutes(
   } = require("../services/candidatePortalProfileService");
 
   const recruitmentService = require("../services/recruitmentService");
+  const candidatePortalOfferService = require("../services/candidatePortalOfferService");
   const {
     assertPortalIntakeReviewQueueAccess
   } = require("../services/candidateAccessService");
@@ -194,6 +195,53 @@ function registerCandidatePortalRoutes(
         return res.status(500).json({
           success: false,
           message: "Failed to load candidate workspace"
+        });
+      }
+    }
+  );
+
+  app.get("/candidate-portal/offers", verifyCandidateToken, async (req, res) => {
+    try {
+      const data = await candidatePortalOfferService.listReleasedOffersForCandidate(
+        pool,
+        getCandidateId(req)
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Released offers loaded.",
+        data
+      });
+    } catch (error) {
+      console.error("[candidate-portal/offers]", error);
+      return res.status(error.status || 500).json({
+        success: false,
+        message: error.message || "Failed to load offers."
+      });
+    }
+  });
+
+  app.get(
+    "/candidate-portal/offers/:offerId",
+    verifyCandidateToken,
+    async (req, res) => {
+      try {
+        const data = await candidatePortalOfferService.getReleasedOfferForCandidate(
+          pool,
+          getCandidateId(req),
+          req.params.offerId
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: "Offer summary loaded.",
+          data
+        });
+      } catch (error) {
+        console.error("[candidate-portal/offers/:offerId]", error);
+        return res.status(error.status || 500).json({
+          success: false,
+          message: error.message || "Failed to load offer."
         });
       }
     }

@@ -597,6 +597,18 @@ async function getOfferBundle(pool, req) {
     }))
   );
 
+  if (isAdminUser(req) && offerIds.length) {
+    const {
+      findOfferIdsWithAdminTalentPoolRelease
+    } = require("./offerAdminTalentPoolReleaseService");
+    const releasedOfferIds = await findOfferIdsWithAdminTalentPoolRelease(pool, offerIds);
+    offers.forEach((offer) => {
+      if (releasedOfferIds.has(offer.offerId)) {
+        offer.adminTalentPoolReleased = true;
+      }
+    });
+  }
+
   return {
     offers,
     approvals: approvals.rows,
@@ -1360,9 +1372,20 @@ async function reviseOffer(pool, offerId, payload, req) {
   };
 }
 
-async function releaseOffer(pool, offerId, payload, req) {
+async function releaseOffer(pool, offerId, payload, req, options = {}) {
   const user = userContext(req);
-  await getOffer(pool, offerId, req);
+
+  if (options.skipReadAccessCheck) {
+    const exists = await pool.query(
+      "SELECT offer_id FROM om_offers WHERE offer_id = $1",
+      [offerId]
+    );
+    if (!exists.rows.length) {
+      throw httpError(`Offer not found: ${offerId}`, 404);
+    }
+  } else {
+    await getOffer(pool, offerId, req);
+  }
 
   const candidateOfferHoldService = require("./candidateOfferHoldService");
   let activatedHold = null;
@@ -1449,7 +1472,9 @@ async function releaseOffer(pool, offerId, payload, req) {
     });
   }
 
-  const offer = await getOffer(pool, offerId, req);
+  if (!options.skipReadAccessCheck) {
+    await getOffer(pool, offerId, req);
+  }
 
   if (payload.template_code) {
     await pool.query(
@@ -2462,6 +2487,7 @@ module.exports = {
   getDefaultSeedPayload,
   getOfferBundle,
   getOffer,
+  getOfferRowForApprovalResponse,
   listScopedOfferRows,
   assertOfferReadAccess,
   createOffer,

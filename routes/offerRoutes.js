@@ -1,5 +1,15 @@
 const offerManagementService = require("../services/offerManagementService");
+const {
+  adminReleaseOfferToTalentPool
+} = require("../services/offerAdminTalentPoolReleaseService");
+const {
+  searchPortalReleaseEligibleOffers,
+  releaseOfferToCandidatePortal
+} = require("../services/offerCandidatePortalReleaseService");
 const { requireOfferWorkspace } = require("../services/offerCapabilityAuth");
+const {
+  requireReleaseOfferToCandidatePortal
+} = require("../services/offerCandidatePortalReleaseAuth");
 
 function handleError(res, error) {
   console.error("Offer API Error:", error.message);
@@ -9,8 +19,13 @@ function handleError(res, error) {
   });
 }
 
-function registerOfferRoutes(app, pool, verifyToken) {
+function registerOfferRoutes(app, pool, verifyToken, verifyAdmin) {
   const offerGuard = [verifyToken, requireOfferWorkspace(pool)];
+  const releaseOfferPortalGuard = [
+    verifyToken,
+    requireReleaseOfferToCandidatePortal(pool)
+  ];
+  const adminGuard = [verifyToken, verifyAdmin];
 
   app.get("/api/v1/offers", offerGuard, async (req, res) => {
     try {
@@ -20,6 +35,26 @@ function registerOfferRoutes(app, pool, verifyToken) {
       handleError(res, error);
     }
   });
+
+  app.get(
+    "/api/v1/offers/portal-release/search",
+    releaseOfferPortalGuard,
+    async (req, res) => {
+      try {
+        const data = await searchPortalReleaseEligibleOffers(pool, req, {
+          search: req.query?.q || req.query?.search || ""
+        });
+
+        res.status(200).json({
+          success: true,
+          message: "Eligible offers retrieved successfully.",
+          data
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.get("/api/v1/offers/:offerId", offerGuard, async (req, res) => {
     try {
@@ -109,6 +144,28 @@ function registerOfferRoutes(app, pool, verifyToken) {
       handleError(res, error);
     }
   });
+
+  app.post(
+    "/api/v1/offers/:offerId/portal-release",
+    releaseOfferPortalGuard,
+    async (req, res) => {
+      try {
+        const result = await releaseOfferToCandidatePortal(
+          pool,
+          req.params.offerId,
+          req
+        );
+
+        res.status(200).json({
+          success: true,
+          message: result.toastMessage || "Offer released to candidate portal.",
+          data: result
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.post("/api/v1/offers/:offerId/accept", offerGuard, async (req, res) => {
     try {
@@ -202,6 +259,24 @@ function registerOfferRoutes(app, pool, verifyToken) {
       handleError(res, error);
     }
   });
+
+  app.post(
+    "/api/v1/offers/:offerId/admin-release-to-talent-pool",
+    adminGuard,
+    async (req, res) => {
+      try {
+        const result = await adminReleaseOfferToTalentPool(
+          pool,
+          req.params.offerId,
+          req.body?.reason || req.body?.comment || "",
+          req
+        );
+        res.json({ success: true, data: result, message: result.message });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 }
 
 module.exports = { registerOfferRoutes };

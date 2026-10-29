@@ -7685,7 +7685,7 @@ registerInterviewRoutes(app, pool, verifyToken, {
   createInterviewMeeting,
   sendInterviewEmail
 });
-registerOfferRoutes(app, pool, verifyToken);
+registerOfferRoutes(app, pool, verifyToken, verifyAdmin);
 registerOfferLetterRoutes(app, pool, verifyToken);
 registerCompensationRoutes(app, pool, verifyToken, verifyAdmin);
 registerDocumentTemplateRoutes(app, pool, verifyToken, verifyAdmin);
