@@ -296,7 +296,8 @@
       "TA Lead",
       "Recruiter",
       "Hiring Manager",
-      "Interviewer"
+      "Interviewer",
+      "Enterprise Talent Administrator"
     ],
     "modules": [
       { "key": "recruitment", "label": "Recruitment" },
@@ -367,6 +368,16 @@
         "ai": false,
         "notifications": true,
         "employee_referral": false,
+        "campus_hiring": false
+      },
+      "Enterprise Talent Administrator": {
+        "recruitment": true,
+        "offer_management": false,
+        "interview_management": true,
+        "vendor_portal": false,
+        "ai": true,
+        "notifications": true,
+        "employee_referral": true,
         "campus_hiring": false
       }
     }

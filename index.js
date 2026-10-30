@@ -7703,6 +7703,10 @@ registerTaLeadRoutes(app, pool, verifyToken);
 registerAdminCommandCenterRoutes(app, pool, verifyToken, verifyAdmin);
 registerAuditRoutes(app, pool, verifyToken, verifyAdmin);
 registerApplicationAuditRoutes(app, pool, verifyToken);
+const {
+  registerCandidateControlTowerRoutes
+} = require("./routes/candidateControlTowerRoutes");
+registerCandidateControlTowerRoutes(app, pool, verifyToken);
 registerEmployeeSessionRoutes(app, pool, verifyToken);
 registerSessionTakeoverRoutes(app, pool, verifyToken);
 registerReportBuilderRoutes(app, pool, verifyToken);
