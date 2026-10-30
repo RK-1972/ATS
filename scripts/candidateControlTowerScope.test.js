@@ -32,6 +32,41 @@ describe("candidateControlTowerScope recruiter visibility", () => {
   });
 });
 
+describe("candidateControlTowerService search filter", () => {
+  it("applies q across candidate code, name, email and candidate_id", async () => {
+    let countSql = "";
+    let countParams = [];
+
+    const pool = {
+      query: async (sql, params) => {
+        if (sql.includes("SELECT COUNT(*)::int AS total")) {
+          countSql = sql;
+          countParams = params;
+          return { rows: [{ total: 0 }] };
+        }
+
+        if (sql.includes("AS last_activity_sort")) {
+          return { rows: [] };
+        }
+
+        return { rows: [] };
+      }
+    };
+
+    await searchApplications(
+      pool,
+      { user: { role_name: "Admin", employee_code: "ADM-1" } },
+      { q: "alex@example.com", page: 1, pageSize: 10 }
+    );
+
+    assert.match(countSql, /cm\.email_id ILIKE/);
+    assert.match(countSql, /cm\.candidate_code ILIKE/);
+    assert.match(countSql, /CAST\(cm\.candidate_id AS text\) ILIKE/);
+    assert.match(countSql, /cm\.preferred_name ILIKE/);
+    assert.ok(countParams.includes("alex@example.com"));
+  });
+});
+
 describe("candidateControlTowerService detail and KPI", () => {
   it("returns scoped applications for recruiter without talent pool shortcut", async () => {
     let countSql = "";

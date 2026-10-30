@@ -81,6 +81,7 @@ function buildFilterClauses(filters, startIndex) {
       cm.candidate_code ILIKE '%' || $${idx} || '%'
       OR cm.first_name ILIKE '%' || $${idx} || '%'
       OR cm.last_name ILIKE '%' || $${idx} || '%'
+      OR cm.preferred_name ILIKE '%' || $${idx} || '%'
       OR TRIM(COALESCE(cm.first_name, '') || ' ' || COALESCE(cm.last_name, '')) ILIKE '%' || $${idx} || '%'
       OR cm.email_id ILIKE '%' || $${idx} || '%'
       OR CAST(cm.candidate_id AS text) ILIKE '%' || $${idx} || '%'
@@ -147,7 +148,9 @@ function applicationSelectFromSql() {
         NULLIF(TRIM(m.recruiter_id), '')
       )
     LEFT JOIN LATERAL (
-      SELECT i.interview_status, i.scheduled_on
+      SELECT
+        i.interview_status,
+        (i.interview_date + i.interview_time)::timestamp AS scheduled_on
       FROM im_interviews i
       WHERE (
         (m.map_id IS NOT NULL AND i.map_id = m.map_id)
@@ -159,7 +162,7 @@ function applicationSelectFromSql() {
           )
         )
       )
-      ORDER BY i.scheduled_on DESC NULLS LAST, i.created_on DESC NULLS LAST
+      ORDER BY (i.interview_date + i.interview_time) DESC NULLS LAST, i.created_on DESC NULLS LAST
       LIMIT 1
     ) latest_iv ON TRUE
     LEFT JOIN LATERAL (
@@ -177,10 +180,10 @@ function applicationSelectFromSql() {
       LIMIT 1
     ) latest_offer ON TRUE
     LEFT JOIN LATERAL (
-      SELECT h.changed_on
+      SELECT h.created_on
       FROM rm_pipeline_history h
       WHERE h.mapping_id = m.mapping_id
-      ORDER BY h.changed_on DESC NULLS LAST
+      ORDER BY h.created_on DESC NULLS LAST
       LIMIT 1
     ) latest_hist ON TRUE
   `;
@@ -275,12 +278,12 @@ async function searchApplications(pool, req, query = {}) {
        owner_u.full_name AS owner_name,
        COALESCE(latest_iv.interview_status, 'Not Scheduled') AS interview_status,
        COALESCE(latest_offer.offer_status, 'Not Initiated') AS offer_status,
-       COALESCE(latest_hist.changed_on, m.applied_on, cm.created_on) AS last_activity_sort,
+       COALESCE(latest_hist.created_on, m.applied_on, cm.created_on) AS last_activity_sort,
        GREATEST(
          0,
          EXTRACT(
            EPOCH FROM (
-             NOW() - COALESCE(latest_hist.changed_on, m.applied_on, cm.created_on)
+             NOW() - COALESCE(latest_hist.created_on, m.applied_on, cm.created_on)
            )
          ) / 86400.0
        )::int AS time_in_stage_days,
