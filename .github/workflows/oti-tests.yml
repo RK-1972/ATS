@@ -1,0 +1,31 @@
+name: OTI Tests
+
+on:
+  push:
+    paths:
+      - "services/oti/**"
+      - "routes/talentIntelligenceRoutes.js"
+      - "scripts/oti*.test.js"
+      - "package.json"
+      - ".github/workflows/oti-tests.yml"
+  pull_request:
+    paths:
+      - "services/oti/**"
+      - "routes/talentIntelligenceRoutes.js"
+      - "scripts/oti*.test.js"
+      - "package.json"
+      - ".github/workflows/oti-tests.yml"
+
+jobs:
+  test-oti:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run OTI test suite
+        run: npm run test:oti

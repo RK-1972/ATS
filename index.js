@@ -847,334 +847,11 @@ async function extractPdfText(buffer) {
 }
 
 
-function parseBasicCandidateInfo(extractedText) {
-
-  const text = (extractedText || "").trim();
-  const lines =
-    text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-
-  const emailRegex =
-    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i;
-
-  const mobileRegex =
-    /(?:\+91[\s-]*)?[6-9][\d\s-]{8,12}\d/;
-
-  const emailMatch = text.match(emailRegex);
-  const email = emailMatch ? emailMatch[0] : null;
-
-  const mobileMatch = text.match(mobileRegex);
-  const mobile = mobileMatch ? mobileMatch[0].trim() : null;
-
-  const resumeSectionHeadings = [
-    "Education",
-    "Experience",
-    "Work Experience",
-    "Professional Experience",
-    "Skills",
-    "Technical Skills",
-    "Projects",
-    "Projects Undertaken",
-    "Certifications",
-    "Summary",
-    "Professional Summary",
-    "Objective",
-    "Career Objective",
-    "Profile",
-    "Declaration",
-    "Achievements",
-    "Strengths",
-    "Internship",
-    "Internships",
-    "Languages",
-    "Interests",
-    "References",
-    "Contact",
-    "Personal Details",
-    "Personal Information",
-    "About Me",
-    "Work History",
-    "Employment History",
-    "Key Skills",
-    "Core Competencies",
-    "Hobbies",
-    "Extra Curricular Activities",
-    "Extracurricular Activities",
-    "Areas of Interest",
-    "Technical Proficiency",
-    "Qualifications",
-    "Academic Qualifications",
-    "Career Summary",
-    "Resume"
-  ];
-
-  const normalizeResumeHeadingLine = (line) =>
-    String(line || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[:|.\-–—]+$/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  const isResumeSectionHeading = (line) => {
-    const normalized = normalizeResumeHeadingLine(line);
-
-    if (!normalized) {
-
-      return false;
-
-    }
-
-    return resumeSectionHeadings.some((heading) => {
-
-      const headingNormalized = normalizeResumeHeadingLine(heading);
-
-      return (
-        normalized === headingNormalized ||
-        normalized.startsWith(`${headingNormalized} `)
-      );
-
-    });
-
-  };
-
-  const isIgnoredCandidateNameLine = (line) => {
-
-    const trimmedLine = line.trim();
-
-    if (!trimmedLine) {
-
-      return true;
-
-    }
-
-    if (/^\d+$/.test(trimmedLine)) {
-
-      return true;
-
-    }
-
-    if (/^Page/i.test(trimmedLine)) {
-
-      return true;
-
-    }
-
-    if (trimmedLine.startsWith("--")) {
-
-      return true;
-
-    }
-
-    if (trimmedLine.includes("@")) {
-
-      return true;
-
-    }
-
-    if (mobileRegex.test(trimmedLine)) {
-
-      return true;
-
-    }
-
-    if (/^http/i.test(trimmedLine)) {
-
-      return true;
-
-    }
-
-    if (/^www/i.test(trimmedLine)) {
-
-      return true;
-
-    }
-
-    if (isResumeSectionHeading(trimmedLine)) {
-
-      return true;
-
-    }
-
-    return false;
-
-  };
-
-  const looksLikeCandidateName = (line) => {
-
-    const normalized = line.replace(/\s+/g, " ").trim();
-
-    if (!normalized) {
-
-      return false;
-
-    }
-
-    if (normalized.includes(":") || normalized.includes("|")) {
-
-      return false;
-
-    }
-
-    if (isResumeSectionHeading(normalized)) {
-
-      return false;
-
-    }
-
-    if (!/^[A-Za-z][A-Za-z .'-]*$/.test(normalized)) {
-
-      return false;
-
-    }
-
-    const words = normalized.split(" ").filter(Boolean);
-
-    if (words.length < 2 || words.length > 4) {
-
-      return false;
-
-    }
-
-    if (
-      normalized === normalized.toUpperCase() &&
-      !words.every((word) => /^[A-Z][A-Z.'-]*$/.test(word) && word.length <= 15)
-    ) {
-
-      return false;
-
-    }
-
-    return true;
-
-  };
-
-  let candidate_name = null;
-
-  for (const line of lines) {
-
-    if (isIgnoredCandidateNameLine(line)) {
-
-      continue;
-
-    }
-
-    if (!looksLikeCandidateName(line)) {
-
-      continue;
-
-    }
-
-    candidate_name = line.replace(/\s+/g, " ").trim();
-    break;
-
-  }
-
-  const experienceRegex =
-    /\d+(?:\.\d+)?\+?\s*years?/i;
-
-  const experienceMatch = text.match(experienceRegex);
-  const experience =
-    experienceMatch ? experienceMatch[0].trim() : null;
-
-  const educationKeywords = [
-    "Bachelor",
-    "B.E",
-    "B.Tech",
-    "M.Tech",
-    "MCA",
-    "MBA",
-    "Diploma",
-    "Degree"
-  ];
-
-  let education = null;
-
-  for (const line of lines) {
-
-    const matchedKeyword = educationKeywords.find((keyword) =>
-      line.toLowerCase().includes(keyword.toLowerCase())
-    );
-
-    if (matchedKeyword) {
-
-      education = line.trim();
-      break;
-
-    }
-
-  }
-
-  const skillKeywords = [
-    "Playwright",
-    "Selenium",
-    "Python",
-    "Java",
-    "SQL",
-    "Pytest",
-    "Jenkins",
-    "Docker",
-    "Kubernetes",
-    "Postman",
-    "REST Assured",
-    "MySQL",
-    "Jira",
-    "Git",
-    "TypeScript",
-    "JavaScript",
-    "React",
-    "Node",
-    "API Testing",
-    "Regression Testing",
-    "Smoke Testing",
-    "Functional Testing"
-  ];
-
-  const lowerText = text.toLowerCase();
-  const skills = [];
-
-  for (const skill of skillKeywords) {
-
-    if (lowerText.includes(skill.toLowerCase())) {
-
-      skills.push(skill);
-
-    }
-
-  }
-
-  return {
-    candidate_name,
-    email,
-    mobile,
-    experience,
-    education,
-    skills
-  };
-
-}
+const { parseBasicCandidateInfo, splitCandidateFullName } = require("./utils/parseBasicCandidateInfo");
 
 
 function splitCandidateName(candidateName) {
-
-  const trimmed =
-    (candidateName || "").trim().replace(/\s+/g, " ");
-
-  if (!trimmed) {
-
-    return {
-      first_name: "",
-      last_name: ""
-    };
-
-  }
-
-  const parts = trimmed.split(" ");
-
-  return {
-    first_name: parts[0],
-    last_name: parts.slice(1).join(" ") || ""
-  };
-
+  return splitCandidateFullName(candidateName);
 }
 
 
@@ -2171,10 +1848,23 @@ app.put(
 
       }
 
-      const registrationOwnerEmployeeCode =
+      let registrationOwnerEmployeeCode =
         candidateContainer === "TALENT_POOL"
           ? null
           : registrationEmployeeCode;
+
+      if (
+        isDraftRegistration &&
+        candidateContainer === "PIPELINE" &&
+        req.user?.role_name === "Admin" &&
+        hasBodyField("owner_employee_code")
+      ) {
+        const requestedOwner = String(req.body.owner_employee_code || "").trim();
+
+        if (requestedOwner) {
+          registrationOwnerEmployeeCode = requestedOwner;
+        }
+      }
 
       let panForUpdate = existing.pan_number;
 
@@ -7678,6 +7368,17 @@ registerBusinessRulesRoutes(app, pool, verifyToken, verifyAdmin);
 registerWorkflowRoutes(app, pool, verifyToken, verifyAdmin);
 registerWorkforcePlanningRoutes(app, pool, verifyToken, verifyAdmin);
 registerRecruitmentRoutes(app, pool, verifyToken, verifyAdmin);
+
+const { registerTalentIntelligenceRoutes } = require("./routes/talentIntelligenceRoutes");
+registerTalentIntelligenceRoutes(app, pool, verifyToken, {
+  uploadResumeToStorage,
+  downloadResumeFromStorage,
+  extractPdfText,
+  parseBasicCandidateInfo,
+  splitCandidateName,
+  normalizeExperience,
+  markIntakeParsingFailed
+});
 registerTaskRoutes(app, pool, verifyToken);
 const { registerCopilotRoutes } = require("./routes/copilotRoutes");
 registerCopilotRoutes(app, pool, verifyToken);

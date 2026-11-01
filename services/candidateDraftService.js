@@ -110,7 +110,15 @@ async function insertRecruiterDraftFromParsed(
     normalizeExperience
   }
 ) {
-  const { first_name, last_name } = splitCandidateName(parsedCandidate.candidate_name);
+  const hasParsedNameParts =
+    String(parsedCandidate?.first_name || "").trim() ||
+    String(parsedCandidate?.last_name || "").trim();
+  const { first_name, last_name } = hasParsedNameParts
+    ? {
+        first_name: String(parsedCandidate.first_name || "").trim(),
+        last_name: String(parsedCandidate.last_name || "").trim()
+      }
+    : splitCandidateName(parsedCandidate.candidate_name);
 
   const skillsList = Array.isArray(parsedCandidate.skills)
     ? parsedCandidate.skills
@@ -185,9 +193,15 @@ async function applyParsedResumeToDraftCandidate(
   resumePath,
   { splitCandidateName, normalizeExperience }
 ) {
-  const { first_name, last_name } = splitCandidateName(
-    parsedCandidate.candidate_name
-  );
+  const hasParsedNameParts =
+    String(parsedCandidate?.first_name || "").trim() ||
+    String(parsedCandidate?.last_name || "").trim();
+  const { first_name, last_name } = hasParsedNameParts
+    ? {
+        first_name: String(parsedCandidate.first_name || "").trim(),
+        last_name: String(parsedCandidate.last_name || "").trim()
+      }
+    : splitCandidateName(parsedCandidate.candidate_name);
 
   const skillsList = Array.isArray(parsedCandidate.skills)
     ? parsedCandidate.skills

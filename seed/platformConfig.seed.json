@@ -252,6 +252,14 @@
       "max_tokens": 2500
     },
     {
+      "key": "talent_intelligence",
+      "title": "Talent Intelligence",
+      "description": "Internal candidate sourcing runs with deterministic matching",
+      "enabled": false,
+      "confidence_min": 0.7,
+      "max_tokens": 0
+    },
+    {
       "key": "candidate_ranking",
       "title": "Candidate Ranking",
       "description": "Per-requisition ranked lists",
