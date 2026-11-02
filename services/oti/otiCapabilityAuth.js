@@ -34,6 +34,18 @@ function isTaLeadRole(req) {
   return role === "TA Lead" || role === "TA Leader";
 }
 
+function isRecruiterRole(req) {
+  return String(req.user?.role_name || "").trim() === "Recruiter";
+}
+
+async function recruiterHasAssignedRequisitions(pool, employeeCode) {
+  const rows = await legacyOperationalAdapter.getMyRequisitions(
+    pool,
+    String(employeeCode || "").trim()
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 async function loadPlatformConfig(pool) {
   const result = await pool.query(
     "SELECT published_payload FROM pc_config_state WHERE id = 1"
@@ -141,13 +153,37 @@ async function assertCanAccessOtiWorkspace(pool, req) {
   );
   const workspace = resolveWorkspaceFlagsFromAssignments(assignments);
 
-  if (!workspace[WORKSPACE_FLAG]) {
-    throw authError(WORKSPACE_DENIED);
+  if (workspace[WORKSPACE_FLAG]) {
+    if (isTaLeadRole(req)) {
+      const { assertCanAssignRecruiters } = require("../requisitionCapabilityAuth");
+      await assertCanAssignRecruiters(pool, req);
+    }
+    return;
   }
 
-  if (isTaLeadRole(req)) {
-    const { assertCanAssignRecruiters } = require("../requisitionCapabilityAuth");
-    await assertCanAssignRecruiters(pool, req);
+  if (isRecruiterRole(req) && (await recruiterHasAssignedRequisitions(pool, employeeCode))) {
+    return;
+  }
+
+  throw authError(WORKSPACE_DENIED);
+}
+
+async function resolveOtiWorkspaceNavEligibility(pool, req) {
+  try {
+    await assertOtiFeatureEnabled(pool);
+  } catch {
+    return false;
+  }
+
+  if (isAdminUser(req)) {
+    return true;
+  }
+
+  try {
+    await assertCanAccessOtiWorkspace(pool, req);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -338,6 +374,68 @@ async function listTalentIntelligenceWorkspaceRequisitions(pool, req) {
   return legacyOperationalAdapter.getMyRequisitions(pool, employeeCode);
 }
 
+const OTI_EXTERNAL_LEAD_SOURCE_PREFIX = "oti-external-lead:";
+
+/**
+ * DRAFT access for OTI external-lead intakes — mirrors run access without run_id context:
+ * run initiator OR resume-match access on any requisition linked to the lead.
+ */
+async function canAccessOtiExternalLeadDraft(pool, req, externalLeadId) {
+  if (isAdminUser(req)) {
+    return true;
+  }
+
+  const numericLeadId = Number(externalLeadId);
+  if (!Number.isFinite(numericLeadId) || numericLeadId <= 0) {
+    return false;
+  }
+
+  try {
+    await assertOtiFeatureEnabled(pool);
+  } catch {
+    return false;
+  }
+
+  const employeeCode = String(req.user?.employee_code || "").trim();
+  if (!employeeCode) {
+    return false;
+  }
+
+  const initiatorResult = await pool.query(
+    `SELECT 1
+     FROM oti_external_run_lead rl
+     INNER JOIN oti_sourcing_run s ON s.run_id = rl.run_id
+     WHERE rl.external_lead_id = $1
+       AND TRIM(s.initiated_by) = $2
+     LIMIT 1`,
+    [numericLeadId, employeeCode]
+  );
+
+  if (initiatorResult.rowCount > 0) {
+    return true;
+  }
+
+  const requisitionResult = await pool.query(
+    `SELECT DISTINCT r.*
+     FROM oti_external_run_lead rl
+     INNER JOIN oti_sourcing_run s ON s.run_id = rl.run_id
+     INNER JOIN rm_requisitions r ON r.requisition_code = s.requisition_code
+     WHERE rl.external_lead_id = $1`,
+    [numericLeadId]
+  );
+
+  for (const requisition of requisitionResult.rows) {
+    try {
+      await resumeMatchService.assertResumeMatchAccess(pool, req, requisition);
+      return true;
+    } catch (_error) {
+      // try next linked requisition
+    }
+  }
+
+  return false;
+}
+
 module.exports = {
   FEATURE_KEY,
   WORKSPACE_FLAG,
@@ -353,6 +451,10 @@ module.exports = {
   assertExternalLeadAccessible,
   assertCanAccessOtiFeatureMetadata,
   listTalentIntelligenceWorkspaceRequisitions,
+  resolveOtiWorkspaceNavEligibility,
   isAdminUser,
-  isTaLeadRole
+  isTaLeadRole,
+  isRecruiterRole,
+  OTI_EXTERNAL_LEAD_SOURCE_PREFIX,
+  canAccessOtiExternalLeadDraft
 };

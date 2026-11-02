@@ -8,6 +8,10 @@
 const {
   isCandidateInIntakeReviewQueue
 } = require("./candidatePortalProfileService");
+const otiCapabilityAuth = require("./oti/otiCapabilityAuth");
+
+const OTI_EXTERNAL_LEAD_SOURCE_PREFIX =
+  otiCapabilityAuth.OTI_EXTERNAL_LEAD_SOURCE_PREFIX;
 
 function httpError(message, status = 403) {
   const error = new Error(message);
@@ -62,6 +66,33 @@ function canReadCandidateRow(row, req) {
   return false;
 }
 
+async function resolveOtiExternalLeadIdForDraft(pool, candidateId) {
+  const result = await pool.query(
+    `
+    SELECT source_reference
+    FROM rm_candidate_intake
+    WHERE created_draft_id = $1
+      AND source_reference LIKE $2
+    ORDER BY intake_id DESC
+    LIMIT 1
+    `,
+    [candidateId, `${OTI_EXTERNAL_LEAD_SOURCE_PREFIX}%`]
+  );
+
+  const sourceReference = result.rows[0]?.source_reference;
+
+  if (
+    typeof sourceReference !== "string" ||
+    !sourceReference.startsWith(OTI_EXTERNAL_LEAD_SOURCE_PREFIX)
+  ) {
+    return null;
+  }
+
+  const leadId = Number(sourceReference.slice(OTI_EXTERNAL_LEAD_SOURCE_PREFIX.length));
+
+  return Number.isFinite(leadId) && leadId > 0 ? leadId : null;
+}
+
 async function canReviewDraftCandidateRow(pool, row, req) {
   if (!row) {
     return false;
@@ -77,6 +108,19 @@ async function canReviewDraftCandidateRow(pool, row, req) {
 
   if (!isRecruiterUser(req)) {
     return false;
+  }
+
+  const otiExternalLeadId = await resolveOtiExternalLeadIdForDraft(
+    pool,
+    row.candidate_id
+  );
+
+  if (otiExternalLeadId !== null) {
+    return otiCapabilityAuth.canAccessOtiExternalLeadDraft(
+      pool,
+      req,
+      otiExternalLeadId
+    );
   }
 
   return await isCandidateInIntakeReviewQueue(pool, row.candidate_id);

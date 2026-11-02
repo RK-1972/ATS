@@ -178,6 +178,10 @@ async function listIntakeReviewQueue(pool) {
         AND i.created_draft_id IS NOT NULL
         AND i.review_status = 'PENDING'
         AND UPPER(c.candidate_status) = 'DRAFT'
+        AND (
+          i.source_reference IS NULL
+          OR i.source_reference NOT LIKE 'oti-external-lead:%'
+        )
       )
       OR (
         i.source_reference LIKE $1
@@ -231,6 +235,10 @@ async function isCandidateInIntakeReviewQueue(pool, candidateId) {
           i.parsing_status = 'COMPLETED'
           AND i.created_draft_id IS NOT NULL
           AND i.review_status = 'PENDING'
+          AND (
+            i.source_reference IS NULL
+            OR i.source_reference NOT LIKE 'oti-external-lead:%'
+          )
         )
       )
     LIMIT 1

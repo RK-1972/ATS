@@ -35,7 +35,8 @@ describe("oti workspace authorization", () => {
     );
   });
 
-  it("denies Recruiter without showTalentIntelligenceWorkspace", async () => {
+  it("denies Recruiter without showTalentIntelligenceWorkspace or assigned requisitions", async () => {
+    const legacyOperationalAdapter = require("../services/legacyOperationalAdapter");
     const pool = {
       query: async (sql) => {
         if (String(sql).includes("employee_work_assignment ewa")) {
@@ -45,6 +46,8 @@ describe("oti workspace authorization", () => {
       }
     };
 
+    mock.method(legacyOperationalAdapter, "getMyRequisitions", async () => []);
+
     await assert.rejects(
       () =>
         otiCapabilityAuth.assertCanAccessOtiWorkspace(pool, {
@@ -52,6 +55,26 @@ describe("oti workspace authorization", () => {
         }),
       (error) => error.status === 403
     );
+  });
+
+  it("allows Recruiter with assigned requisitions without TALENT_INTELLIGENCE assignment", async () => {
+    const legacyOperationalAdapter = require("../services/legacyOperationalAdapter");
+    const pool = {
+      query: async (sql) => {
+        if (String(sql).includes("employee_work_assignment ewa")) {
+          return { rows: [] };
+        }
+        return { rows: [] };
+      }
+    };
+
+    mock.method(legacyOperationalAdapter, "getMyRequisitions", async () => [
+      { req_code: "REQ-REC-1" }
+    ]);
+
+    await otiCapabilityAuth.assertCanAccessOtiWorkspace(pool, {
+      user: { role_name: "Recruiter", employee_code: "REC-1" }
+    });
   });
 
   it("allows Recruiter with TALENT_INTELLIGENCE workspace flag", async () => {

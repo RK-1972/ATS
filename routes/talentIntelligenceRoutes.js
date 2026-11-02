@@ -24,6 +24,10 @@ function registerTalentIntelligenceRoutes(app, pool, verifyToken, intakeDeps = n
     try {
       await otiCapabilityAuth.assertCanAccessOtiFeatureMetadata(pool, req, req.query || {});
       const data = await otiCapabilityAuth.getOtiAvailability(pool);
+      data.workspace_nav_eligible = await otiCapabilityAuth.resolveOtiWorkspaceNavEligibility(
+        pool,
+        req
+      );
       res.status(200).json({
         success: true,
         message: "Talent Intelligence availability retrieved.",
@@ -33,6 +37,23 @@ function registerTalentIntelligenceRoutes(app, pool, verifyToken, intakeDeps = n
       handleError(res, error);
     }
   });
+
+  app.get(
+    "/api/v1/recruitment/talent-intelligence/workspace/nav-eligibility",
+    guard,
+    async (req, res) => {
+      try {
+        const eligible = await otiCapabilityAuth.resolveOtiWorkspaceNavEligibility(pool, req);
+        res.status(200).json({
+          success: true,
+          message: "Talent Intelligence navigation eligibility retrieved.",
+          data: { eligible }
+        });
+      } catch (error) {
+        handleError(res, error);
+      }
+    }
+  );
 
   app.get(
     "/api/v1/recruitment/talent-intelligence/workspace/requisitions",

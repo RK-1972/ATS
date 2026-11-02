@@ -88,6 +88,29 @@ describe("oti workspace requisition list", () => {
     assert.deepEqual(rows, assignedRows);
   });
 
+  it("allows Recruiter workspace list with assigned requisitions only (no work assignment)", async () => {
+    const assignedRows = [{ req_code: "REQ-REC-2", job_title: "Assigned via routing" }];
+    const pool = buildPool([{ req_code: "REQ-ADMIN-ONLY" }]);
+
+    mock.method(workAssignmentService, "getEmployeeWorkAssignments", async () => []);
+
+    const getMyRequisitionsMock = mock.method(
+      legacyOperationalAdapter,
+      "getMyRequisitions",
+      async (_pool, recruiterCode) => {
+        assert.equal(recruiterCode, "REC-2");
+        return assignedRows;
+      }
+    );
+
+    const rows = await otiCapabilityAuth.listTalentIntelligenceWorkspaceRequisitions(pool, {
+      user: { employee_code: "REC-2", role_name: "Recruiter" }
+    });
+
+    assert.equal(getMyRequisitionsMock.mock.callCount(), 2);
+    assert.deepEqual(rows, assignedRows);
+  });
+
   it("returns assigned requisitions for TA Lead via my-requisitions adapter", async () => {
     const assignedRows = [{ req_code: "REQ-TA-1", job_title: "TA scoped" }];
     const pool = buildPool([{ req_code: "REQ-ADMIN-ONLY" }]);
